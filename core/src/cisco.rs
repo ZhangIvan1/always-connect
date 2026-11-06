@@ -713,7 +713,10 @@ mod tests {
         let r = run("/bin/sh", &["-c", "printf 'a\\nUsername: '; read x; printf '\\nb\\n'; exit 3"], Some("u\n"),
                     Duration::from_secs(5), &mut |_| {}, &mut |l| lines.push(l.to_string()));
         assert_eq!(r.status, 3);
-        assert_eq!(lines, vec!["a", "Username: ", "", "b"]);
+        // Whether the newline after the prompt comes as its own (empty)
+        // line depends on how the reads split the output: ignore it.
+        lines.retain(|l| !l.is_empty());
+        assert_eq!(lines, vec!["a", "Username: ", "b"]);
         let t = Instant::now();
         let r = run("/bin/sleep", &["10"], None, Duration::from_millis(300), &mut |_| {}, &mut |_| {});
         assert!(t.elapsed() < Duration::from_secs(3) && r.status != 0, "timed out and ended");

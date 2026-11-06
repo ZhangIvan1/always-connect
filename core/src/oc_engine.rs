@@ -1090,6 +1090,8 @@ impl Shared {
         // read (a re-prompt) sees EOF and the child exits instead of
         // hanging (measured 2026-10-31).
         if let Some(mut stdin) = child.stdin.take() {
+            // macOS only: elsewhere the Rust runtime already ignores SIGPIPE.
+            #[cfg(target_os = "macos")]
             unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETNOSIGPIPE, 1) };
             credential.push('\n');
             let _ = stdin.write_all(credential.as_bytes());
