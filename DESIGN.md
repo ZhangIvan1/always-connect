@@ -2168,8 +2168,8 @@ DNS 归 Cisco，我们不插手，§二十二）。
 - 换库后其他分支迁移：`git rebase --onto <新根提交> <旧 main 尖端> <分支>`；旧历史的任何引用都不能推到新仓库。
 - CI 显式 `permissions: contents: read`，同分支旧运行自动取消；只用 push 与 pull_request 触发（不用 pull_request_target），fork 的 PR
   拿不到写权限与 secrets。新增 `SECURITY.md`（私下报告）、Issue 模板（先脱敏）、`.github/dependabot.yml`（cargo 与 Actions，每月，最多 3 个）。
-- 仓库设置（公开后才可用或才免费的，由用户点头后再开）：私下漏洞报告、Secret scanning 与 push protection、Dependabot alerts、
-  main 规则集（禁止强推与删除）、fork PR 工作流需批准。Actions 只允许 GitHub 官方与已验证作者的 action。
+- 仓库设置（2026-11-07 公开后已开）：私下漏洞报告、Secret scanning 与 push protection、Dependabot alerts 与安全更新、
+  main 规则集（禁止强推与删除）、外部贡献者的 fork PR 工作流需批准、Actions 只允许 GitHub 官方与已验证作者的 action、令牌默认只读。
 
 ### 36.3 加固（代码改动）
 - **后台服务只认同一证书签名的 App**：原来比较双方团队标识，自签名与 ad-hoc 构建都没有团队标识，两边都空就放行，本机任何进程都能
