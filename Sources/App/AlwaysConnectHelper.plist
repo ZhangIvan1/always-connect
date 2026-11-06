@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.alwaysconnect.app.helper</string>
+  <key>BundleProgram</key>
+  <string>Contents/Library/LaunchDaemons/AlwaysConnectHelper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>AlwaysConnectHelper</string>
+    <string>daemon</string>
+  </array>
+  <key>MachServices</key>
+  <dict>
+    <key>com.alwaysconnect.app.helper</key>
+    <true/>
+  </dict>
+  <key>KeepAlive</key>
+  <dict>
+    <!-- Restart after a crash only; started on demand through
+         MachServices, never at boot (DESIGN.md §25.6): SuccessfulExit
+         implied RunAtLoad, and nothing of ours should run before the
+         App does. -->
+    <key>Crashed</key>
+    <true/>
+  </dict>
+</dict>
+</plist>

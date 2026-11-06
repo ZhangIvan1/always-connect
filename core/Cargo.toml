@@ -1,0 +1,26 @@
+[package]
+name = "alwaysconnect-core"
+version = "0.1.0"
+edition = "2021"
+description = "AlwaysConnect core: split-rule engine, DNS-driven routes, reconnect state machine (portable, no Apple frameworks)"
+license = "MIT"
+
+[lib]
+name = "alwaysconnect_core"
+crate-type = ["cdylib", "rlib", "staticlib"]
+
+[features]
+default = []
+# Enables the libopenconnect FFI binding (needs libopenconnect-dev at build time).
+openconnect = []
+
+[dependencies]
+# DNS forwarder and relay sockets (DESIGN.md §32.6): socket options std lacks
+# (interface binding, connect timeout before connect, SO_NOSIGPIPE).
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+# The split list's regexp: rules; small, no Unicode tables.
+regex-lite = "0.1"
+# The network gate's record (guard.json), compatible with the Swift-written one.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

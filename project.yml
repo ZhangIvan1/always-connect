@@ -1,0 +1,50 @@
+# XcodeGen project definition for AlwaysConnect.
+# Generate on macOS with: xcodegen generate
+name: AlwaysConnect
+options:
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+targets:
+  AlwaysConnect:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/App
+      - Sources/Shared
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.alwaysconnect.app
+      # The certificate relay's plaintext side and DTLS channel are Rust
+      # (DESIGN.md §32.7): ac_relay_* from the same staticlib.
+      OTHER_LDFLAGS: $(PROJECT_DIR)/core/target/release/libalwaysconnect_core.a
+    info:
+      path: Sources/App/Info.plist
+    entitlements:
+      path: Sources/App/AlwaysConnect.entitlements
+    dependencies:
+      - target: AlwaysConnectHelper
+    postBuildScripts:
+      - script: |
+          DEST="${TARGET_BUILD_DIR}/${FULL_PRODUCT_NAME}/Contents/Library/LaunchDaemons"
+          mkdir -p "$DEST"
+          cp -f "${BUILT_PRODUCTS_DIR}/AlwaysConnectHelper" "$DEST/AlwaysConnectHelper"
+          cp -f "${PROJECT_DIR}/Sources/App/AlwaysConnectHelper.plist" "$DEST/com.alwaysconnect.app.helper.plist"
+        name: Embed Helper daemon
+  AlwaysConnectHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/Helper
+      - Sources/Shared
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.alwaysconnect.app.helper
+      # Same staticlib link: the Helper's generate-pf command calls
+      # ac_pf_generate / ac_string_free.
+      OTHER_LDFLAGS: $(PROJECT_DIR)/core/target/release/libalwaysconnect_core.a
+
+schemes:
+  AlwaysConnect:
+    build:
+      targets:
+        AlwaysConnect: all
+        AlwaysConnectHelper: all

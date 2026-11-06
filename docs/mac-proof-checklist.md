@@ -1,0 +1,198 @@
+# Mac 实测清单（本地 agent 用）
+
+CI 证明不了的项都在这里。每一项跑完后，把实测结论写回 DESIGN.md
+对应章节（验证级别从"需 Mac 实测"改为实测结论），不要只口头汇报。
+前置条件：可信 Mac、公司网关账号（服务器 VPN-A、Group Staff）、能收登录确认的手机、
+家里 192.168 局域网。NE 透明代理另需 Apple Developer Program 权限与签名，
+普通 TUN PoC 只需管理员授权。
+
+## 0. 无开发者团队时的准备（DESIGN.md §20.11）
+
+- `scripts/build-local.sh --tests` 构建并跑本机断言；`open .local-build/AlwaysConnect.app`，
+  在向导或面板点 [安装后台服务] 输入电脑密码（等价于 `sudo scripts/dev-helper.sh install`）。出岔子先 `sudo scripts/dev-helper.sh recover`
+  恢复本地网络，用完 `sudo scripts/dev-helper.sh uninstall`。日志：`scripts/dev-helper.sh log`
+  （dev 安装会记脱敏后的子进程输出，A3/F3 的真实文案从这里取，记入 DESIGN 前再核一遍无隐私）。
+
+## H. Cisco 引擎（DESIGN.md §二十一，本机网关要求钥匙串证书时的主路径）
+
+- [x] H1 退出 Cisco GUI，`sudo scripts/dev-helper.sh install`，打开 App 填凭据（服务器 VPN-A）→
+  手机批准 → 面板绿色已连接；`scripts/dev-helper.sh log` 见 killswitch connected。
+- [x] H2 断线（2026-11-03 drop-test：无泄漏、DNS/局域网可用、25 秒重连，见 DESIGN §21.17）：终端 `/opt/cisco/secureclient/bin/vpn disconnect`（App 视为会话丢失）→ 面板红色重连中、
+  外网不通、家里/办公网解析仍可用 → 自动重新登录 → 手机批准 → 恢复已连接。
+- [ ] H3 手动断开：面板关开关确认 → 本地网络恢复，`dev-helper.sh status` 无持有文件。
+- [ ] H4 App 崩溃后断线（§21.5 起退出 = 不开 VPN，原"退出后看门狗封网"作废；DESIGN §25.2）：Cisco 连着时
+  `kill -9` App → 后台服务几秒内把 App 重新打开；若再 `vpn disconnect`，看门狗约 2 秒内封网，App 回来后面板可一键恢复。
+- [x] H5 批准超时（不点批准）时网关的真实表现：`>> Login failed.`（错密码为 `>> Login error.`），重试策略见 DESIGN §21.19。
+
+- [x] H6 Cisco 会话流量（2026-11-03）：真实已连接会话打开诊断页显示下行/上行，
+  与 `vpn stats` 同口径（DESIGN §21.18），无需 Helper 的 OpenConnect 引擎。
+- [x] H7 更新后台服务后重新运行泄漏自检（2026-11-03）：安装产物与 App 内嵌后台服务
+  哈希一致；默认路由、pf 锚点、pf 开启、当前网关物理口四项均绿，原备用网关红项消失。
+  DNS 是灰色信息项，不作通过判定。实机截图在 .local-build/proof/diagnostics-fixed.png（不提交）。
+
+## I. 自建连接（DESIGN.md §二十三，分流接入第 1 批，全部走 VPN）
+
+需要：macOS 15、`brew install openconnect`、安装/更新后台服务、钥匙串里的公司证书。
+设置 → 通用 → 连接方式选"自建连接"，证书选公司证书。替换运行中的 App 前先告诉用户。
+
+- [x] I1 连接（2026-11-04：第三、四次运行连通 92 秒 / 95 秒约 15 MB，按 IP/域名探测全部成功，见 DESIGN §23.5–§23.9；诊断页自检未做）：面板"登录中…" → 手机批准 → 已连接；钥匙串只在第一次问是否允许使用证书（选"始终允许"）；
+  诊断页自检四项判定通过，网关为真实地址而非 127.0.0.1。
+- [x] I2 断线不漏（2026-11-04：SIGKILL 后 8 秒自动连回、不需手机批准，零泄漏、局域网可达，DESIGN §23.9）：自建连接连上后 `sudo scripts/own-drop-test.sh | tee /tmp/ac-own-drop.txt`（SIGKILL openconnect，
+  后台服务视为掉线）→ 逐次探测零泄漏、局域网可达、Cookie 重连不需要手机批准；脚本打印装载的 pf 规则，超时自行恢复直连。
+- [x] I3 退出（2026-11-04：App 1 秒退出、openconnect 2 秒内干净退出、转接停止、直连恢复、无残留；面板"断开"按钮未单独测）——手动断开与退出：恢复直连、pf 卸载、转接停止（127.0.0.1 上不再监听）、后台服务空闲自退。
+- [ ] I4 来回切换（2026-11-04 自建 → Cisco 已切回并连上，但切换是改设置项完成的，未经界面点选）：Cisco → 自建 → Cisco，每次切换先断开，切回 Cisco 后行为与 H 节一致。
+- [ ] I5 批准超时：不点批准，记录 openconnect 原生认证下网关的真实表现，再决定是否像 §21.19 一样自动重发。
+- [ ] I6 退出彻底干净（DESIGN §23.11）：分别在已连接、等手机批准时点"退出" → 几秒后
+  `ps axo pid,ppid,command | grep -iE 'AlwaysConnect|openconnect|secureclient/bin/vpn '` 无本项目进程（含后台服务），
+  Cisco 窗口程序已关；`vpnagentd` 与 Cisco 网络扩展仍在；重新打开 App 不要管理员密码即可连接。
+- [ ] I7 连着 VPN 重启电脑（DESIGN §23.12）：开机后不开 App，网页直接能上；`sudo pfctl -s info` 不因本项目开启，
+  `sudo pfctl -a com.apple/300.AlwaysConnect -sr` 为空；后台服务几十秒内自退（`pgrep -f alwaysconnect.app.helper` 无输出）。
+
+- [ ] I8 生命周期（DESIGN §二十五，2026-11-05 改造后需整体复测；先装新后台服务，面板"更新"或 `sudo scripts/dev-helper.sh install`）：
+  1. 切换后断开（F1）：自建连上 → 断开 → 切经 Cisco 连上 → 点"断开 VPN" → 网页直连、`sudo pfctl -a com.apple/300.AlwaysConnect -sr` 为空。
+  2. 掉线时强制退出（F2）：经 Cisco 连上，`kill -9` App，再 `vpn disconnect` → 网被封、App 几秒内被重新打开（菜单栏图标回来）；
+     若在 App 回来前再强制退出它（10 分钟内超过 3 次不再拉起），2 分钟后网络自动直连，下次打开 App 有"上次意外退出"通知。
+  3. 封网覆盖所有网卡（F3）：掉线封网期间拔网线换 Wi-Fi 或连手机热点 → 网页仍打不开、局域网可达；恢复直连后正常。
+  4. 通知（§25.5）：掉线即有"网络已暂停"通知，点"恢复直连"网络恢复；10 分钟后仍暂停有提醒。
+  5. 强制恢复（F9）：`sudo launchctl kill SIGSTOP system/com.alwaysconnect.app.helper` 冻住后台服务后点恢复 → 5 秒后出现
+     "强制恢复网络（需电脑密码）"，输入密码后网络直连；之后 `sudo launchctl kill SIGCONT …` 解冻。
+  6. Cisco 边界（F8）：在 Cisco 自己的窗口连上 → 打开/关闭 AlwaysConnect 面板、退出 AlwaysConnect → Cisco 连接不受影响、不封网。
+  7. 单实例（F13）：已开着时再 `open` 一次 App → 不出现第二个图标，原连接不断。
+  8. 后台服务不再开机自启：重启后 `pgrep -f alwaysconnect.app.helper` 无输出，打开 App 后才出现。
+- [ ] I9 自建连接走 DTLS（DESIGN §26.10）：自建连接连上后 `~/Library/Logs/AlwaysConnect/relay.log` 有
+  "udp channel to gateway ready"，断开后该对的关闭行里 UDP 包数明显大于 0；正常浏览 3 分钟不卡（对照 §26.9）。
+  （I9 部分结果，2026-11-05 第三次实测：udp channel ready；44 秒 UDP 收发约 1.7 万包、10 MB，TLS 只 3 个控制包；用户反馈不断网、能正常用；只用了约 1 分钟，3 分钟浏览待补。）
+- [ ] I11 分流开关（DESIGN §26.12）：未连接时面板拨开关立即切换；连着时拨开关出现确认、确认后自动断开并用新方式重连；
+  连着时打开名单里的网站，面板几秒内显示"生效中：xxx 直连"；设置分流页增删网站立即生效。
+- （2026-11-05 晚第一次集中实测，`scripts/accept-check.sh`，只读：自建连接在跑、默认路由进隧道、系统先问 127.0.0.1、UDP 通道在用；
+  名单 两个 geosite 清单下的三个示例网站 都走 en0 且能打开，
+  名单外的 www.wikipedia.org、www.baidu.com、www.google.com 走隧道；本地路由器经 en0 可达。geoip:cn 未在名单里，待测。）
+- （2026-11-05 21:50 第二次集中实测：装上通用化这批后，后台服务从 `/Library/PrivilegedHelperTools/AlwaysConnect-openconnect`（root 所有）
+  运行 App 自带的 openconnect，真实网关登录、UDP 通道、分流（名单内网站走 en0、名单外网站走隧道）、本地路由器全部通过
+  （accept-check 8/8）；用户确认诊断自检全部正常（含"隧道 DNS 已生效"）、未发现其他 VPN。DESIGN §27.3 的"打包版连真实网关"已实测。）
+- [ ] I12 名单写法（DESIGN §26.13）：名单加 geoip:cn 后打开一个国内网站，`route -n get <它的地址>` 走 en 网卡、面板显示它直连；
+  名单内的 geosite 网站走 en 网卡；加一个非本机所在的网段，连着时 `route -n get` 该段走物理网关；"本地局域网直连"显示当前网段，
+  换网络后断线期间新网段仍可访问。连着时点面板"更新"后台服务：自动断开、装好、自动重连（§26.14）。
+- [ ] I13 换网络与睡眠（DESIGN §二十八）：自建连接连着时 ① 合盖 1 分钟再打开 ② 从 Wi-Fi 切到手机热点再切回 ③ 下班回家
+  （公司网络 → 家里网络）。每次：面板先显示"重连中"，十几秒内回到"已连接"，网页能开；转接日志有"gateway path gone"或
+  "another network took over"，随后新的一对连接带"udp channel ready"。（2026-11-05 下班实测出的问题即此项的原型：修正前约 3 分钟不通、
+  面板一直"已连接"。）
+  （2026-11-06 14:27 实测 ②的一半——关 Wi-Fi 再开：断开瞬间"重连中"，Wi-Fi 回来约 2 秒后"已连接"，无需手机批准；网络稳定时又闪断 1 秒自动恢复；
+  全程从 en0 强制直连的探针都被挡住（000），掉线记录为"已恢复"。
+  同日 16:42 实测切换到手机热点再切回：两次都自动连上、路由跟到新路由器、无漏网；因出口地址变化，网关不认原会话，两次都要手机重新批准；
+  切回时多等 20 秒的问题已修（DESIGN §30.10）。合盖、下班回家仍待测。）
+- [ ] I15 更新与重启（DESIGN §三十）：① 新版 App 首次启动：弹一次"已更新，要同时更新后台服务"的密码框，输完自动连上；
+  ② 连着时在终端 `sudo launchctl kickstart -k system/com.alwaysconnect.app.helper`（模拟后台服务崩溃重启）多做几次：每次面板红色
+  "重连中"、十几秒内回到"已连接"、不弹手机批准，掉线记录是"已恢复"而不是"没恢复"；`sudo pfctl -a com.apple/300.AlwaysConnect -sr`
+  里放行的网关地址等于转接日志这次用的地址；③ 桌面"恢复网络"后 App 不会自己连回去。（2026-11-06 用户点"更新"后卡在"正在连接"、
+  整机断网即此项的原型：网关域名有两个轮换地址，接管的封网只放行旧地址。）
+- [x] I16 自建连接等批准（DESIGN §30.9）（2026-11-06 实测：密码发出 3 秒后显示等批准，16.4 秒后批准、连上；故意不点时网关 100.6 秒后过期，
+  29 秒后自动重新发起，第二次批准后连上）：连接时先别点手机批准 → 面板与菜单栏气泡显示"等手机批准"；点了以后连上。
+  `grep "login:\|app state" ~/Library/Logs/AlwaysConnect/relay.log | tail` 应见"POST with the password sent"、几秒后"app state: authenticating ->
+  awaitingApproval"、批准后"POST (password) answered after N s: 200 auth=…"。可选：一直不点直到过期，应显示"手机上的批准已超时，N 秒后重新发起"而不是"账号或密码被拒绝"。
+- [ ] I17 干净卸载（DESIGN §三十一；2026-11-06 第一次真实卸载：两项都保留，文件、后台服务、网络全部符合；还缺：不保留时钥匙串被删、通知送达，见 §31.5）：会断开 VPN 并删掉 App，测完要重新安装（`scripts/build-local.sh && scripts/install-app.sh --open`，
+  按向导装后台服务、填账号）。先 `bash /Applications/AlwaysConnect.app/Contents/Resources/uninstall.sh --dry-run` 存一份清单；连着时
+  设置 → 通用 → 卸载…（两项都不保留）→ 输开机密码。期望：App 退出、几秒后通知"已卸载，网络已恢复直连"、网页能开；清单里每个路径都不存在；
+  `security find-generic-password -s com.alwaysconnect.app` 找不到；`sudo pfctl -a com.apple/300.AlwaysConnect -sr` 为空；
+  `launchctl print system/com.alwaysconnect.app.helper` 报不存在；`ls /private/tmp | grep alwaysconnect-uninstall` 为空；Cisco 照常能用。
+  顺带看系统设置的"通知"和"登录项"里是否还有 AlwaysConnect。
+- [ ] I18 Rust 迁移后的整机复测（DESIGN §32.6–32.13，引擎、网络闸门、Cisco 引擎都已换成 Rust）：经 Cisco 连接、掉线封网与重连、手动断开放行；装新版（后台服务一并更新）后连自建连接、开分流：名单内网站直连、名单外走隧道
+  （DNS 转发器已是 Rust）；relay.log 有 `udp channel to gateway ready (en0)` 一类行且大流量网页流畅（DTLS 经 Rust 转发、绑物理网卡）；
+  Wi-Fi 换网后几秒内恢复；对比改前基线（§32 表）：App 的 `footprint`、`top -stats cpu,idlew` 在同样流量下不高于改前。
+  （2026-11-06 19:37–19:45 实测，公司 Wi-Fi，自建连接 + 分流：新版装上后后台服务随启动更新（一次管理员密码）；首次登录识别"等手机批准"，
+  批准后连上，DTLS 经 Rust 转发、绑 en0；名单内网站走 en0，GitHub/Apple 走隧道，系统首选 DNS 为 127.0.0.1（Rust 转发器）；
+  手动断开再连：断开即直连，重连需手机批准（断开会注销会话，§26.17，符合设计）；关开 Wi-Fi 两次：每次 15 秒左右自动恢复，
+  但都要重新批准——与旧版今天 16:42 在同一网络的日志完全一样（openconnect 原地重连被网关直接断开，随后全新登录），不是这次迁移引起；
+  另有一次网络切换在 4 秒内原地恢复、无需批准。开销：App 内存占用 25 MB（测后 40 MB），空闲每秒唤醒约 27 次（旧版约 5000 次），
+  转发每 MB 约 38 ms CPU（旧版约 150–230 ms），后台服务 15 MB、CPU 0。未测：Cisco 模式（用户跳过）、断线期间是否零泄漏（需 root 看 pf）。）
+- [ ] I19 检查更新（DESIGN §三十三；仓库公开后才能测）：设置 → 通用 → 版本 点"检查更新"，GitHub 上有更高版本（含预发布）时面板出现
+  "有新版本 x.y.z" [跳过] [查看]，[查看] 在浏览器里打开该版本的 Release 页；[跳过] 后提示消失；没有更高版本时显示"已是最新版本"；
+  断网时显示"检查失败"。另看：App 启动后不会每次开面板都发请求（`log stream --predicate 'process == "AlwaysConnect"'` 或抓包，一天一次）。
+- [ ] I20 一行命令安装与更新（DESIGN §三十五；仓库公开、有 Release 后才能测）：① 没装过的 Mac（或先卸载）执行 README 的 curl 命令：
+  下载、校验、装进"应用程序"并打开，首次打开不被系统拦下；② App 连着 VPN 时再执行一次：先问"继续吗"，App 正常退出（面板消失、
+  网络恢复直连，不是断网两分钟），换成新版后自动打开、自动重连；③ 开着设置窗口时执行，同样能退出并替换；④ 非管理员账户会要求输入密码；⑤ 有更高版本时面板 [更新] → [继续更新]：
+  转圈后 App 自己退出（不是断网两分钟），几秒后新版打开并自动连上；设置 → 通用 → 版本 [立即更新] 同样；断网时点更新，面板显示失败原因、旧版照常可用；⑥ 从一个发布版本更新到下一个后连接，钥匙串不再弹"始终允许"（两版都用固定身份签名，DESIGN §35.5）。
+- [ ] I21 后台服务只认同一证书签名的 App（DESIGN §36.3；装新版时测）：① 装上新版、更新后台服务后照常连接、断开、
+  设置窗口能读状态；② `sudo log stream` 或 helper.log 里没有"refused client"；③ 用别的身份（或 ad-hoc）签的一个小程序调用后台服务
+  被拒，helper.log 出现"refused client pid …"；④ 一行命令更新时，用别的证书签的安装包被拒（install-test 已覆盖脚本逻辑）。
+- [ ] I14 长时间运行（DESIGN §28.4）：自建连接连着时在终端跑 `scripts/soak-check.sh`（只读）几个小时，网页一直能开、
+  三个进程的内存不持续上涨。
+- [ ] I10 自检保险（DESIGN §26.11）：连上后若不通，30 秒左右自动断开、网页直连、面板橙色说明与通知出现；
+  连上且正常时两分钟内不误断。
+- [ ] I13 断线保护关（DESIGN §26.19）：分流开启、连着时在面板关掉"断线保护"→ `sudo pfctl -a com.apple/300.AlwaysConnect -sr` 为空；
+  掉线（或 drop-test）后网页立即直连可用、面板写"断线保护已关，流量走本地网络"、`route -n get default` 走 en 网卡；重连上后
+  默认路由回到 utun、名单网站照常直连；再打开开关 → 规则立即装回。
+
+## P. 分流可行性验证（DESIGN §22.3–22.14，不代替 D1）
+
+- [x] 一次性 PoC（脚本与报告未进公开仓库），结论摘要见 DESIGN §22.3–22.14：证书转接双向 TLS、真实账号认证与手机确认、
+  原生认证模式下真实隧道与 Cookie 重连、CSTP 包重组、DNS 换服务器与 TCP 回退。按应用、按连接分流的路线已放弃（方案二）。
+
+## A. 真实网关连接与认证
+
+- [ ] A1 首次连接：填账号密码 → 手机上点批准 → 面板绿实心"已连接"，
+  Cookie 落盘（0600），下次启动复用 Cookie 不再输密码。
+  通过标准：一次批准后连接成功；DESIGN §十六 Cookie 流转与实测一致。
+- [ ] A2 手机批准全流程：等批准时面板黄三角 + 通知；120 秒超时自动再发起
+  并再推一条批准通知，面板显示次数；手机点批准后自动继续，不用回 Mac 操作。
+  通过标准：超时再发起与通知次数与 DESIGN §十六一致。
+- [ ] A3 批准输出形状记录：把真实网关 --dump-http-traffic 里批准等待的标记文本
+  记入 approvalPatterns（目前为空），回归等批准感知。
+  通过标准：等批准态由输出标记触发，不再只靠超时推断。
+- [ ] A4 凭据被拒：错密码 → 被拒通知 + 面板错误行"账号或密码被拒绝" + 驱动停住
+  不无限重试（防账号锁定）。通过标准：一次被拒即停，不循环。
+
+## B. 断线与故障关闭
+
+- [ ] B1 真实断线：断网或网关断开 → 外网不通（流量黑洞）、家里局域网按放行表可达、
+  面板重连行显示"第 N 次"、恢复后推"已恢复"。通过标准：断线期间无一包走本地直出。
+- [ ] B2 手动断开：面板内联确认 → 恢复本地网络、pf 卸载、标志文件清理。
+  通过标准：断开后本地网络恢复，且下次连接不再读到残留标志。
+- [ ] B3 自定义放行网段运行时重装：连接中在网络页改网段 → pf 集变化、无需重连；
+  空列表时掉线期连局域网也不放行。通过标准：pfctl 锚点内容随改动变化。
+
+## C. Helper 与 pf 实装
+
+- [ ] C1 SMAppService 安装：Helper 装进 LaunchDaemons、plist 被正确解析、
+  重启后自启。通过标准：重启后 Helper 在位且 App 能连上。
+- [ ] C2 pf 真实装载：pfctl 锚点规则与 DESIGN §十七一致；pf 加载失败时面板红字
+  "pf 兜底未生效，故障关闭只有第一道"。通过标准：锚点规则逐条对上。
+- [ ] C3 XPC 端到端：新方法实测（updateAllowNetworks、getSessionInfo、规则测试、
+  流量统计、泄漏自检）+ 老 Helper 3 秒超时回落不挂起。
+  通过标准：新方法有回包；老 Helper 下 App 显示"版本过旧"而不卡死。
+
+## D. 数据泵运行时
+
+- [ ] D1 直连流出物理口：分流模式下直连应用 / 域名 / 网段走物理口，
+  VPN 流量走隧道。通过标准：分流表内外流量出口与规则一致。
+- [ ] D2 DNS verdict：隧道 DNS 在系统解析器中 → 泄漏自检 DNS 项通过；
+  网关未下发 → informational，不误判。通过标准：两种情况各测一次。
+- [ ] D3 流量统计真实性：统计页上下行与系统 getifaddrs 数一致。
+- [ ] D4 通知实际送达、全局快捷键实际触发（需辅助功能权限）。
+- [ ] D5 启动不弹设置窗口：退出 App 后连续执行三次 `open` 启动 → 只有菜单栏图标、无设置窗口；
+  等 5 秒以上再打开一次 → 弹出设置窗口（DESIGN §21.20）。
+- [ ] D7 等批准提醒气泡（DESIGN §29.1）：经 Cisco 连接触发一次批准 → 菜单栏图标下弹出气泡、正在打字的窗口不丢焦点、
+  全屏 App 上可见；批准后变"已连接"并自己收回；× 后本次不再出现、批准超时重新发起时再出现；锁屏时仍收到系统通知。
+- [ ] D6 掉线记录：诊断页标题显示"已存 N 次，最多存 10 次"；真实掉线一次后新记录写对断了多久、重新登录次数、
+  是否等过手机批准与结果（已恢复 / 没恢复 / 你断开了）；删单条后列表与面板"上次掉线"同步更新；
+  "清空"经确认后列表为空、面板不再显示上次掉线；重启 App 后保持（DESIGN §21.21、§21.22）。
+
+## E. 签名与分发
+
+- [ ] E1 签名公证：签名构建 + 公证通过；团队标识校验生效
+  （Helper 拒绝非同队客户端）。通过标准：公证构建能装、能跑、能连。
+
+## F. 仍需真实网关才动手的东西（先跑 A，再动手）
+
+- [ ] F1 §16.10 子进程看门狗：约束是超时必须长于 120 秒等批准超时，
+  且 hook 到达后立即解除（隧道建立后子进程跑几小时是正常态）。
+- [ ] F2 库路径 NeedsApproval：真实网关的表单形状确认后才接。
+- [ ] F3 退出码表补全：真实网关的退出文案与 ocserv 的差异
+  （如 "Login failed." 之外的拒绝文案）以实测补表。
+
+## G. 验收后
+
+- [ ] G1 把每项实测结论写回 DESIGN.md 对应章节，清单打勾只是过程记录，
+  DESIGN 才是最终状态。
+- [ ] G2 UI 可视化稿 v2 仍待用户评价；仓库 About 描述需用户在网页上改，
+  这两件不要代用户定。

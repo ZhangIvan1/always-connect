@@ -1,0 +1,86 @@
+import AppKit
+import Foundation
+import ServiceManagement
+
+/// Settings → 通用 → "卸载 AlwaysConnect" (DESIGN.md §31): takes the App
+/// off this Mac and leaves nothing behind.
+///
+/// Order, so that a cancelled password dialog changes nothing:
+///   1 the bundled uninstall.sh as root, behind the administrator password
+///     dialog. It only stages a root-only copy of itself and returns; the
+///     copy waits for this App to quit, then restores the direct network
+///     and removes every file (system and the user's), the App included.
+///   2 only after that succeeded: the keychain password (unless kept) and
+///     the login item, which need this App's own identity
+///   3 a normal quit: it ends the VPN and releases the network the usual
+///     way (DESIGN.md §21.5) before the script takes over.
+enum Uninstaller {
+    enum Outcome {
+        case started
+        case failed(String)
+        case cancelled
+    }
+
+    static func start(keepPassword: Bool, keepSettings: Bool,
+                      completion: @escaping (Outcome) -> Void) {
+        guard let script = Bundle.main.path(forResource: "uninstall", ofType: "sh") else {
+            completion(.failed("App 包里缺少卸载脚本"))
+            return
+        }
+        var arguments = [
+            "--from-app",
+            "--user", NSUserName(),
+            // The menu-bar App's: from the settings process, its parent (§32.15).
+            "--app-pid", String(AppRole.isSettings ? getppid() : ProcessInfo.processInfo.processIdentifier),
+            "--app", Bundle.main.bundlePath,
+        ]
+        if keepSettings { arguments.append("--keep-settings") }
+        let command = (["/bin/bash", script] + arguments).map(shellQuoted).joined(separator: " ")
+        let source = "do shell script \(appleScriptString(command)) "
+            + "with prompt \"AlwaysConnect 要卸载自己：断开 VPN、恢复直连，删除后台服务、随附组件和它留下的文件。\" "
+            + "with administrator privileges"
+        DispatchQueue.global().async {
+            var error: NSDictionary?
+            _ = NSAppleScript(source: source)?.executeAndReturnError(&error)
+            DispatchQueue.main.async {
+                if let error {
+                    let code = error[NSAppleScript.errorNumber] as? Int ?? 0
+                    if code == -128 {
+                        completion(.cancelled)
+                    } else {
+                        let message = error[NSAppleScript.errorMessage] as? String ?? ""
+                        completion(.failed(message.isEmpty ? "卸载没有开始" : message))
+                    }
+                    return
+                }
+                if !keepPassword {
+                    KeychainStore.deleteAll()
+                }
+                // Harmless when it was never registered (or cannot be,
+                // in builds without a developer team).
+                try? SMAppService.mainApp.unregister()
+                completion(.started)
+                // Let the window show "正在卸载…" for a moment, then the
+                // normal quit (VPN off, network released).
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    if AppRole.isSettings {
+                        SettingsLink.shared.send("quit")
+                    } else {
+                        NSApp.terminate(nil)
+                    }
+                }
+            }
+        }
+    }
+
+    /// POSIX single-quoting for the shell.
+    private static func shellQuoted(_ text: String) -> String {
+        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// An AppleScript string literal.
+    private static func appleScriptString(_ text: String) -> String {
+        "\"" + text.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+}

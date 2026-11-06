@@ -1,0 +1,147 @@
+# 交接说明（给本地 agent）
+
+AlwaysConnect：个人自用的 Mac 菜单栏 VPN 助手，连接单位授权的企业 VPN（兼容 Cisco Secure Client 网关；与 Cisco 无关联）。
+核心诉求：保存账号密码、打开 App 自动登录；断线无限自动重连，
+断线期间不回落本地网络（防工作流量因出口 IP 变化触发风控）；
+VPN 开启时仍能访问本地局域网（自动识别当前网段）；可按网站分流（自建连接）。
+
+## 当前状态
+
+- **2026-11-07 公开前安全审查与加固**（DESIGN §三十六）：后台服务只认同一证书签名的 App；install.sh 固定签名者、只走 https；
+  诊断包隐去服务器与 Group；后台服务默认不记 openconnect 输出；发布附第三方源码包；删掉 Cisco 包研究记录、一次性分流 PoC、
+  视频站与具体 AI 应用的示例；CI 只读权限、SECURITY.md、Issue 模板、Dependabot。仓库换成干净的新库（旧库改名为私有存档）。
+  待实测：mac-proof I21（装新版时，需用户说"装"）。
+- **2026-11-06 合规整理**（DESIGN §三十四）：用户决定暂不开源，并要求把风险尽量规避。已做：第三方声明
+  （THIRD_PARTY_NOTICES.md，随 App 分发）、openconnect 各库的 LGPL 全文 / 源码清单 / 替换说明、下载对应源码的脚本、Rust crate
+  声明（Cargo.lock 进仓库）、README 定位与商标声明、RESPONSIBLE-USE.md、设置 → 通用 → 关于、分流示例改中性。
+  图标保持原风格、圈内换成原创的倾斜经纬线（用户选定，§34.4），AppIcon.icns 与 README 截图已重做；新图标与"关于"卡尚未装机实看
+  （装机需用户说"装"并先问 Coordinator）。单位政策是否允许、代码归属由用户自己向单位确认。
+- **2026-11-06 免开发者账号的安装与更新**（DESIGN §三十五）：没有签名与公证，浏览器下载的 App 会被 Gatekeeper 拦下。
+  README 改为一行命令安装 `curl -fsSL …/install.sh | bash`（curl 不加隔离标记；下载最新 Release、校验、正常退出旧版、替换、打开，
+  失败放回旧版），手动下载 + "仍要打开"作备选。面板"有新版本"加了 [更新]：确认后同一脚本下载校验，App 正常退出，脱离的另一半换版并打开新版。
+  发布包改用固定的自签名身份"AlwaysConnect Local Dev"（不再 ad-hoc），钥匙串"始终允许"跨版本有效；所有发布都要用这一个身份。
+  harness `scripts/install-test.sh` 已进 local-checks 与 CI；真实 GitHub 下载与真机换版待仓库公开后实测（mac-proof I20）。
+- **2026-11-06 检查更新**（DESIGN §三十三）：App 查 GitHub 发布列表（含预发布），有更高版本时面板提示 [查看]（开 Release 页）[跳过]，
+  设置 → 通用 → 版本 可手动"检查更新"；自动检查不下载，用户点 [更新] 才下载安装（§35.4）。判断在 Rust（update_check.rs），一天最多一次请求、无计时器。
+  仓库公开后才真正生效（私有时 API 回 404）。发版：先改 Info.plist 版本，再 `scripts/package-release.sh v<版本>`，标签必须与之一致。
+  待实测：公开后真实 GitHub 回答与面板外观（mac-proof I19）。
+- **2026-11-06 开销审查**（DESIGN §三十二）：App 常驻 44 MB、连着时 CPU 12–20 %。看不见的提醒气泡与面板一直在重画、轮询，
+  已改为关上即释放；helper.log 加了上限。最大的 CPU 来源是证书转接逐包转发（Swift），与"常驻逻辑用 Rust"的约定不符，
+  用户决定能迁的都迁（AGENTS.md 已写成硬规则）：DNS 转发器、证书转接的明文处理与 DTLS、连接页、转接日志、路由台账、
+  Cisco 引擎、网络闸门与 Cisco 断线保护、openconnect 编排都已改 Rust（§32.6–32.13，Swift 只剩外壳）；还可再评估的见 §32.8。
+  用户选择迁完再一起实测：装新版后按 mac-proof I18 测（含 Cisco H 节复测）。
+- **2026-11-06 干净卸载**（DESIGN §三十一）：设置 → 通用 → 卸载…（默认不留任何东西，可选保留密码/设置），终端版
+  `uninstall.sh`。先恢复直连、再删系统与用户文件、最后删 App；Cisco 不动。脚本级 harness 已进 CI；真实卸载待实测（mac-proof I17）。
+- **2026-11-06（最新）**：用户点"更新"后台服务后卡在"正在连接"、整机断网——网关域名有两个轮换地址，后台服务重启后接管的封网只放行旧地址，
+  App 重连拿到另一个就进不去。以此为起点把核心流程的边界场景全部过了一遍（两路独立走查），修了约 20 处，记在 DESIGN §三十
+  （29.7 是"场景 → 期望 → 机制 → 验证"总表）：新引擎接管已有封网并放行自己的网关地址、替换引擎时封网不断且不注销会话、
+  换网络时去网关的路由在任何时候都跟着走、直连网段不再占用系统局域网路由、App 启动时先更新旧的后台服务再连接（一次密码）、
+  网关地址沿用与不通时换址、自检只用于第一次连上、紧急恢复后不会自己连回去。待实测：mac-proof I13–I16。
+  同日补上自建连接的等批准识别（§30.9）：密码提交后网关几秒不回即"等手机批准"，批准过期自动重新发起；转接日志记录登录形状作自证。
+- **2026-11-05 晚**：方案二的 B 批已上线并在真实网关试用：一个开关"按网站分流"（开 = 自建连接 + 名单直连，关 = 经 Cisco），
+  数据走 UDP（DTLS 经证书转接，§26.10），名单支持网址 / geosite / geoip:cn / 网段，本地局域网自动识别（§26.12–26.16）；
+  连上后自检、更新后台服务免批准（§26.11、§26.17）。随后按用户要求做通用化（§二十七）：去掉公司特有默认值与公司聊天工具字样、
+  识别 Clash/sing-box 等并提示、openconnect 打包进 App（用户机器无需 Homebrew）。下一步：一次集中实测（mac-proof I9–I12）与
+  C 批（睡眠唤醒、换网络、IPv6、长时间稳定）。只读实测证据脚本：`scripts/accept-check.sh`。
+- **2026-11-05 方向调整（先读这条）**：两次断网后做了架构审查（docs/architecture-review-2026-11-05.md），
+  用户选定方案二（docs/split-plan-v2.md，DESIGN §二十六）：只保留 openconnect 一条隧道，按域名分流用"本机 DNS 转发 +
+  主机路由"，不再叠用户态分流核心；断线保护只拦走 VPN 的流量。A 批已完成并推送（CI 绿）：删掉 mihomo 分流核心、
+  透明代理扩展与数据泵；route-state 改为先记账再动手的台账，后台服务启动时撤销本次开机遗留的路由与 DNS。
+  pf 归网络闸门（NetworkGuard，另一个 Thread），它会提供直连地址表等接口给 B 批。
+  应急恢复：面板"恢复网络"、桌面"AlwaysConnect 恢复网络.command"、`scripts/reset-network.sh`；App 装在 /Applications。
+
+- Phase 1（Helper + openconnect CLI 编排、vpnc-script、pf 兜底、认证映射）、
+  Phase 2（透明代理数据泵）、Phase 3（菜单栏、六页设置、首次向导、规则实时生效、
+  诊断 XPC）、Phase 4（自定义放行网段、DNS 回传、规则 JSON 导入导出、
+  终态原因码与重连次数）全部完成并推上 main，CI 两路绿。
+- 2026-11-03 本机（真实 Mac，无 Xcode、无开发者证书）走查：修了 Helper 安装链、
+  App 退出拆隧道、vpnc-script 路由/DNS、pf 锚点从未生效与 pf 未开启、已连接时 pf 放开、
+  物理口写死 en0、掉线不报 Reconnecting、App 不取状态、"网络仍拦截"无出口、
+  SIGPIPE、VPN-A 不是主机名等，全部记在 DESIGN §二十（每条写明验证级别）。
+  本机构建 `scripts/build-local.sh`，dev 安装与救急 `scripts/dev-helper.sh`。
+- 实测：网关强制钥匙串证书且私钥不可导出（DESIGN §20.13）。用户选方案 A：Cisco 引擎
+  （DESIGN §二十一）——App 经 Cisco CLI 登录/监视/重连，Helper 只管 pf 封网（setKillSwitch）。
+  逻辑由假 Cisco CLI 的 harness 验证；真实连接与断线实测见 mac-proof 清单 H 节。
+- 分流接入按用户确认的分批计划推进（后由方案二取代，docs/split-plan-v2.md；
+  用户已向公司 IT 核实允许自建连接）。第 1 批"自建连接"已完成代码（DESIGN §二十三）：设置里可选
+  "经 Cisco（默认）/ 自建连接（实验）"，App 内证书转接 + 后台服务 openconnect，全部走 VPN、还没有分流。
+  验证：CI harness（scripts/relay-test.sh）+ 本机实测（连通、掉线 8 秒自动连回零泄漏、退出干净，DESIGN §23.9）。
+  实测中修了 4 个真实问题：vpnc-script 调用方式（§23.5）、pf 掐断装规则前建立的连接（§23.6）、
+  openconnect 收尾残留（§23.7）、退出无反馈（§23.8）。待测：面板断开按钮、界面切换、批准超时。
+  退出彻底干净（§23.11）：App 退出前结束自己的全部子进程、关 Cisco 窗口程序，后台服务在 App 走后几秒内自退
+  并清前任遗留的 openconnect；脚本级断言已过，真实退出待测（mac-proof I6）。
+  重启后整机断网（§23.12，用户实际受害）：开机时后台服务把上次残留的 pf-state 当崩溃恢复装上封网集；
+  已改为只认本次开机内的状态，早于开机的直接作废。真实重启待测（mac-proof I7）。
+- 生命周期审查与网络闸门（DESIGN §二十五，2026-11-05）：用户要求起无上下文的审查员通读代码，发现 18 条（致命 2 条：
+  切换连接方式后"断开"失效、App 崩溃后封网无时限）。已改：pf 只归 NetworkGuard（开机会话号、token 落盘、换引擎不误放）；
+  封网要有 App 在，App 消失后尝试拉起、最多封 2 分钟；封网覆盖所有网卡；退出先放开；只管 App 自己连的 Cisco 会话；单实例；
+  通知带"恢复直连"、后台服务无响应时可凭电脑密码强制恢复；后台服务不再开机自启。离线 harness（scripts/session-test.sh）
+  13 个场景通过；真机需整体复测（mac-proof I6–I8、H4，用户约定到公司后一起测）。审查原文在用户本地，不进仓库。
+  下一批：后台服务管理 mihomo 全机接管 + 全机故障关闭（规则仍全部走 VPN）。
+
+- 诊断页流量空白已修（DESIGN §21.18）：Cisco 模式直接读取 `vpn stats` 的
+  本次收发计数，不再访问空的 OpenConnect 引擎；真实会话 UI 已显示数值。
+  本机无 Xcode，swiftc 四目标构建、41 项 Rust 测试、local-checks（含新增流量解析）全过。
+  自检网关误报沿用 §21.17 修复；用户更新后台服务后，已核对安装产物一致，
+  真实会话重新自检：默认路由、pf 锚点、pf 开启、当前网关物理口四项均绿；
+  DNS 仍为灰色信息项，不作通过判定。流量和自检实机截图留在 .local-build/proof/。
+  本批远端 CI 结果以 GitHub Actions 对应提交的 Linux / macOS 两路结果为准。
+- 审批超时自动重发（DESIGN §21.19）：实测不点批准等它过期，Cisco 打印 `Login failed`，
+  错密码是 `Login error`。前者按 30 秒/1/2/5 分钟重新发起，连续 1 小时没人批准后 15 分钟一次；
+  后者照旧立即停住防锁号。文案为本机实测，重试逻辑由 Cisco 引擎 harness 覆盖。
+
+## 文档索引
+
+- DESIGN.md：全部契约。§十五分叉决议（Helper + CLI，弃 NE 包泵）、
+  §十六 Phase 1、§十七 Phase 2、§十八 Phase 3（含 §18.8 defer 清单与 §18.9 收口状态）、
+  §十九 Phase 4。
+- UI-DESIGN.md：菜单栏面板、主窗口六页、首次向导四步、状态映射、关键流程、文案规范。
+- ui-mockup.html：可视化原型 v2（仅原型，待用户评价，不要催）。
+- README.md：定位语 "Replacement of AnyConnect VPN"。
+
+## 本地 agent 要干的（必须有 Mac，runner 验不了）
+
+- 真实网关：服务器 VPN-A、Group Staff、用户名客户端预填、密码每次现输、
+  手机上的认证 App 点批准（批准不可自动化；断线后很快重连不需要批准，
+  会话保持；需批准时用户会去点）。
+- 真实断线不漏网、Helper 安装与 pf 真实装载、数据泵运行时、签名公证、
+  XPC 端到端、真实网关 --dump-http-traffic 输出形状。
+- 等真实网关行为、不编造的三项：§16.10 子进程看门狗、approvalPatterns、
+  库路径 NeedsApproval。
+
+## 后续方向
+
+- 分流可行性验证（2026-11-03 至 11-04）的结论摘要见 DESIGN §22.3–22.14；一次性 PoC 脚本与报告未进公开仓库。
+- 自定义"哪些域名不走 VPN"：Cisco 引擎下做不到（Cisco 过滤器执行公司名单，绕过即破坏公司管控，不做）；
+  合规途径是请 IT 配置按域名排除。若要自己掌握分流，走方案 B（证书转接 + 回到 openconnect 引擎 +
+  DNS 驱动路由），见 DESIGN §二十二；用户已确认公司 IT 允许，按分批计划接入中。
+- NE 透明代理、正式签名公证与 SMAppService 仍依赖相应签名条件；普通 TUN 分流验证不以购买账号为前提。
+
+## 有意不做的
+
+- （已改）pf 关闭开关：用户 2026-11-03 明确要求，现为面板与设置 → 通用的"断线保护"开关，默认开；2026-11-05 起经 Cisco 与
+  自建连接都能关（DESIGN §21.6、§26.19）。自建连接关着掉线时恢复直连的真实效果待实测。
+- 菜单栏图标关闭开关：菜单栏是 LSUIElement 应用的唯一入口，关了无处重开。
+- 日志级别控件：无日志管线，不放假控件。
+
+## 等用户的（不要催）
+
+- UI 可视化稿 v2 的评价。
+- 仓库公开后在 GitHub 上打开的设置（DESIGN §36.2），公开本身由用户决定。
+
+## 硬规则
+
+- 故障关闭优先：掉线不拆路由不撤 pf，只有手动断开才恢复本地网络。
+- 结论以 git HEAD 为准，不以工作树为准（曾有未提交修改被误读为已修好的教训）。
+- Cookie 捕获唯一通道：--dump-http-traffic 里 CSTP CONNECT 请求头的
+  `Cookie: webvpn=` 行；openconnect 在所有输出模式里把 Set-Cookie 值印成
+  字面量 `<elided>`，解析 Set-Cookie 永远只能抓到 "<elided>"。
+  dump 同时印出 `<password>` 明文，掩码必须同时盖住它。
+- 凭据走 Keychain，永不写进仓库；不把用户隐私、密码、儿童图片写进仓库。
+- 公开仓库，不放 Cisco 闭源程序包；原始程序包需用户另行提供。
+
+## 验证
+
+- push 后 CI 两路：Linux Rust 测试 + macOS 构建与测试（含 mock 网关引擎整环、
+  vpnc-script 分支断言、PumpTest）。
+- 本地 Rust 核心测试：`core/` 下 `cargo test`。

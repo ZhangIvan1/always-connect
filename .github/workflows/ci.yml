@@ -1,0 +1,359 @@
+# CI: Rust tests on Linux (full, incl. libopenconnect auth against a
+# local ocserv gateway) and macOS (core tests + staticlib + Xcode build
+# with signing off). The macOS job is the no-local-Mac verification loop:
+# it proves the Swift shell compiles and links against the Rust core,
+# and runs the Helper's pf generation as a smoke check.
+# It does NOT prove a real gateway connection, phone approval, or
+# live traffic routing — those still need a trusted Mac (Phase 0).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: CI only checks out and runs tests, it never writes
+# to the repository. Fork pull requests run with this token and no
+# secrets (pull_request, never pull_request_target).
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libopenconnect-dev ocserv openconnect
+      - name: Start test gateway
+        # ocserv refuses to run without root ("This server requires root
+        # access to operate"); Actions runners have passwordless sudo.
+        run: sudo core/scripts/ocserv-test.sh start
+      - name: Rust tests (incl. libopenconnect auth)
+        working-directory: core
+        env:
+          AC_TEST_URL: https://127.0.0.1:4443
+          AC_TEST_CA: /tmp/ocserv-test/ca-cert.pem
+          AC_TEST_USER: testuser
+          AC_TEST_PASS: testpass
+        run: cargo test --features openconnect
+      - name: CLI behavior contract (wrong password / bogus cookie)
+        # Tun-independent only: the correct-password case needs a tun
+        # device, which this sandbox may deny (see DESIGN.md §16.3.1).
+        # Runs as root because the gateway's CA file is root-owned.
+        env:
+          AC_TEST_URL: https://127.0.0.1:4443
+          AC_TEST_CA: /tmp/ocserv-test/ca-cert.pem
+          AC_TEST_USER: testuser
+        run: sudo -E core/scripts/cli-behavior-test.sh
+      - name: Stop test gateway
+        if: always()
+        run: sudo core/scripts/ocserv-test.sh stop
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust tests (macOS, default features)
+        working-directory: core
+        run: cargo test
+      - name: Build Rust staticlib for the Swift shell
+        working-directory: core
+        run: cargo build --release
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build (signing off — compile + link check only)
+        run: >-
+          xcodebuild -project AlwaysConnect.xcodeproj
+          -scheme AlwaysConnect -destination 'platform=macOS'
+          build CODE_SIGNING_ALLOWED=NO
+      - name: Run Helper engine smoke test (no server)
+        # Exercises spawn + stdin feed + Transient classification +
+        # backoff + max-attempts, with no gateway and no tun device.
+        # No pf or routes are touched (no connect hook can fire).
+        timeout-minutes: 5
+        run: |
+          brew install openconnect
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          rm -rf /tmp/ac-engine-test && mkdir -p /tmp/ac-engine-test
+          # run-once exits 3 on attempts-exhausted BY DESIGN; the step
+          # shell runs with set -e, so capture without aborting and
+          # assert the exit code explicitly.
+          set +e
+          OUT=$(printf 'x\n' | "$HELPER" run-once --server https://127.0.0.1:9 --user nobody --max-attempts 2 --no-routes --cookie-store /tmp/ac-engine-test/session.json --support-dir /tmp/ac-engine-test 2>&1)
+          RUN_EXIT=$?
+          set -e
+          echo "$OUT"
+          test "$RUN_EXIT" -eq 3
+          echo "$OUT" | grep -q "STATE authenticating"
+          echo "$OUT" | grep -q "TERMINAL attempts-exhausted"
+      - name: Run Helper engine test (mock gateway auth + cookie reuse)
+        # Full loop short of a real tunnel: the mock AnyConnect server
+        # replays ocserv's real auth-form XML, issues a fixed test
+        # cookie, and answers CSTP CONNECT with 401. Password auth
+        # must capture the cookie, the tun failure (the runner user
+        # cannot create utun) classifies Transient, and later attempts
+        # must reuse the cookie. No brew ocserv exists for macOS, so
+        # the mock (stdlib Python only) is the gateway here.
+        # --no-routes keeps the runner's routing untouched; pf loads
+        # only on a connect hook, which cannot fire without a tun.
+        # The mock and the test live in one step so no background
+        # process has to survive across steps.
+        timeout-minutes: 10
+        run: |
+          brew install openconnect
+          mkdir -p /tmp/ac-mock
+          openssl req -x509 -newkey rsa:2048 -keyout /tmp/ac-mock/ca-key.pem -out /tmp/ac-mock/ca-cert.pem -days 2 -nodes -subj "/CN=Mock Test CA" 2>/dev/null
+          openssl req -newkey rsa:2048 -keyout /tmp/ac-mock/server-key.pem -out /tmp/ac-mock/server.csr -nodes -subj "/CN=localhost" 2>/dev/null
+          printf "subjectAltName=IP:127.0.0.1,DNS:localhost" > /tmp/ac-mock/server.ext
+          openssl x509 -req -in /tmp/ac-mock/server.csr -CA /tmp/ac-mock/ca-cert.pem -CAkey /tmp/ac-mock/ca-key.pem -CAcreateserial -out /tmp/ac-mock/server-cert.pem -days 2 -extfile /tmp/ac-mock/server.ext 2>/dev/null
+          nohup python3 core/scripts/mock-anyconnect.py 4444 /tmp/ac-mock/server-cert.pem /tmp/ac-mock/server-key.pem /tmp/ac-mock/ca-cert.pem >/tmp/ac-mock/mock.log 2>&1 &
+          echo $! > /tmp/ac-mock/mock.pid
+          for _ in $(seq 1 20); do
+            if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.5); sys.exit(0 if s.connect_ex(('127.0.0.1',4444))==0 else 1)" 2>/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          rm -rf /tmp/ac-engine-test && mkdir -p /tmp/ac-engine-test
+          # run-once runs as a plain background job (no subshell) so
+          # its exit code comes back via `wait` directly: the earlier
+          # subshell+exit.txt form lost exit.txt on the runner for an
+          # undetermined job-control reason (TERMINAL printed, file
+          # missing), and a lost exit code must never fail the test.
+          # A watchdog kills it after 120s so a hang still yields
+          # the mock log and partial output instead of a step timeout.
+          printf 'testpass\n' | "$HELPER" run-once --server https://127.0.0.1:4444 --user testuser --cafile /tmp/ac-mock/ca-cert.pem --max-attempts 3 --no-routes --debug-child-output --cookie-store /tmp/ac-engine-test/session.json --support-dir /tmp/ac-engine-test > /tmp/ac-engine-test/out.txt 2>&1 &
+          RUN_PID=$!
+          ( sleep 120; kill "$RUN_PID" 2>/dev/null ) &
+          WATCH_PID=$!
+          set +e
+          wait "$RUN_PID"
+          RUN_EXIT=$?
+          set -e
+          kill "$WATCH_PID" 2>/dev/null || true
+          kill "$(cat /tmp/ac-mock/mock.pid)" || true
+          echo "--- mock requests ---"
+          cat /tmp/ac-mock/mock.log
+          echo "--- run-once output ---"
+          cat /tmp/ac-engine-test/out.txt
+          echo "RUN_EXIT=$RUN_EXIT"
+          test "$RUN_EXIT" = "3"
+          grep -q "credential password" /tmp/ac-engine-test/out.txt
+          grep -q "credential cookie" /tmp/ac-engine-test/out.txt
+          grep -q "TERMINAL attempts-exhausted" /tmp/ac-engine-test/out.txt
+          echo "--- cookie store (test fixture value, safe to print) ---"
+          ls -la /tmp/ac-engine-test/
+          cat /tmp/ac-engine-test/session.json || echo "session.json missing"
+          grep -q mockcookie123 /tmp/ac-engine-test/session.json
+      - name: Run Helper engine test (established tunnel, drop, reconnect)
+        # core/scripts/fake-openconnect.sh stands in for the CLI: it
+        # runs the engine's own vpnc-script connect (test mode), stays
+        # up 1s, then drops. The engine must report connected, then
+        # reconnecting (not authenticating) for the drop episode, and
+        # reuse the captured cookie on the respawn (DESIGN.md §20.8).
+        timeout-minutes: 5
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          rm -rf /tmp/ac-drop && mkdir -p /tmp/ac-drop
+          set +e
+          OUT=$(printf 'pw\n' | "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 3 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-drop/session.json --support-dir /tmp/ac-drop 2>&1)
+          RUN_EXIT=$?
+          set -e
+          echo "$OUT" | grep -E '^(STATE|TERMINAL)' || true
+          test "$RUN_EXIT" -eq 3
+          echo "$OUT" | grep -q '^STATE connected tunnel up'
+          echo "$OUT" | grep -q '^STATE reconnecting dropped, retrying'
+          echo "$OUT" | grep -q '^STATE reconnecting spawning openconnect (attempt 2, credential cookie)'
+          grep -q fakecookie42 /tmp/ac-drop/session.json
+          # An internal reconnect (network change, DESIGN.md §28.1) is
+          # reported as reconnecting, then connected again.
+          OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1 || true)
+          echo "$OUT" | grep -E '^STATE' || true
+          echo "$OUT" | grep -q '^STATE reconnecting 隧道断了，正在重连'
+          echo "$OUT" | grep -E '^STATE' | grep -A1 '隧道断了，正在重连' | grep -q '^STATE connected tunnel up'
+      - name: Run Helper (pf anchor smoke check)
+        # The scheme also builds AlwaysConnectHelper (a plain tool, no
+        # entitlements needed to run). Verify generation output, and
+        # that a missing gateway fails instead of silently passing.
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          "$HELPER" generate-pf --phys en0 --tun utun5 --gateway 203.0.113.10 --allow 192.168.0.0/16 | grep -q "block drop out quick all"
+          "$HELPER" generate-pf --phys en0 --tun utun5 --gateway 203.0.113.10 --allow 192.168.0.0/16 --connected | grep -q "pass out quick on en0 all"
+          if "$HELPER" generate-pf --phys en0 --tun utun5 --allow 192.168.0.0/16 2>/dev/null; then
+            echo "expected failure without --gateway" >&2
+            exit 1
+          fi
+          # pfctl is the final validator (DESIGN.md §20.5): parse both
+          # sets under the real anchor path, no load (-n needs no root).
+          for C in "" --connected --allow-dns "--dns 192.168.1.1,fd00::1 --direct-table"; do
+            "$HELPER" generate-pf --phys en0 --tun utun5 --gateway 203.0.113.10 --allow 192.168.0.0/16 $C > /tmp/ac-pf.conf
+            pfctl -n -a com.apple/300.AlwaysConnect -f /tmp/ac-pf.conf
+          done
+          "$HELPER" generate-pf --phys en0 --tun utun5 --gateway 203.0.113.10 --allow-dns | grep -q "proto { udp tcp } to any port 53"
+      - name: Real pf keeps pre-existing loopback connections (split set)
+        # DESIGN.md §26.8: the split set ends in a block; a stateful
+        # lo0 pass cut openconnect's link to the relay on a real Mac.
+        # Loads the generated rules with the block narrowed to lo0, so
+        # the runner's network is untouched; includes a negative control.
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          sudo scripts/pf-loopback-test.sh "$HELPER"
+      - name: Test vpnc-script branches (manual flag path)
+        # The flag-path contract (DESIGN.md §16.4): disconnect
+        # restores the local network ONLY when the engine's flag file
+        # exists at the spawn-time path; otherwise it holds routes
+        # and pf (fail closed). dump-script prints the exact bytes
+        # the engine installs, so this exercises the real script,
+        # not a re-parsed copy. NO_ROUTES skips the Mac-only
+        # route/scutil commands; the AC_HOOK lines on stdout are
+        # the observable contract.
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          SCRIPT=/tmp/ac-vpnc-script.sh
+          "$HELPER" dump-script > "$SCRIPT"
+          chmod +x "$SCRIPT"
+          head -1 "$SCRIPT" | grep -q '#!/bin/sh'
+          export TUNDEV=utun9 VPNGATEWAY=10.0.0.1 ALWAYSCONNECT_NO_ROUTES=1
+          OUT=$(env -u ALWAYSCONNECT_MANUAL_FLAG_PATH "$SCRIPT" disconnect)
+          echo "$OUT" | grep -q 'AC_HOOK disconnect-held'
+          OUT=$(ALWAYSCONNECT_MANUAL_FLAG_PATH=/tmp/ac-manual-flag-missing "$SCRIPT" disconnect)
+          echo "$OUT" | grep -q 'AC_HOOK disconnect-held'
+          touch /tmp/ac-manual-flag-present
+          OUT=$(ALWAYSCONNECT_MANUAL_FLAG_PATH=/tmp/ac-manual-flag-present "$SCRIPT" disconnect)
+          echo "$OUT" | grep -q 'AC_HOOK disconnect-manual'
+          rm -f /tmp/ac-manual-flag-present
+          OUT=$("$SCRIPT" connect)
+          echo "$OUT" | grep -q 'AC_HOOK connect tun=utun9 gateway=10.0.0.1'
+          OUT=$(INTERNAL_IP4_DNS="8.8.8.8 1.1.1.1" "$SCRIPT" connect)
+          echo "$OUT" | grep -q 'AC_HOOK connect tun=utun9 gateway=10.0.0.1 dns=8.8.8.8,1.1.1.1'
+          OUT=$(ALWAYSCONNECT_GATEWAY_IP=198.51.100.7 VPNGATEWAY=127.0.0.1 "$SCRIPT" connect)
+          echo "$OUT" | grep -q 'gateway=198.51.100.7'
+          "$SCRIPT" pre-init
+          "$SCRIPT" attempt-reconnect
+          "$SCRIPT" bogus-reason
+      - name: Test vpnc-script route plan (stubbed system commands)
+        # Routes ON, but route/ifconfig/scutil are PATH stubs that only
+        # log (DESIGN.md §20.4): fresh connect, held drop, reconnect on
+        # a new utun with no default route, manual restore, idempotent
+        # second restore, configd-installed default kept, no-gateway
+        # failure without the hook. Plan only; effect is Mac proof B1/B2.
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          "$HELPER" dump-script > /tmp/ac-vpnc-plan.sh
+          chmod +x /tmp/ac-vpnc-plan.sh
+          core/scripts/vpnc-route-plan-test.sh /tmp/ac-vpnc-plan.sh
+      - name: Cisco engine harness (fake Cisco CLI)
+        # Sources/App/CiscoEngine.swift against core/scripts/
+        # fake-cisco-vpn.sh (DESIGN.md §21.4): connect, drop + re-login,
+        # manual disconnect, rejected login without retry, transient
+        # retry, adopting a live session. Logic only; Cisco itself is
+        # Mac proof.
+        run: scripts/cisco-engine-test.sh
+      - name: Cisco session traffic parser
+        run: scripts/cisco-traffic-test.sh
+      - name: Quit cleanup (descendant processes, SIGTERM then SIGKILL)
+        # Sources/Shared/ProcessSweep.swift against real local child
+        # processes (DESIGN.md §23.11). The App's and the background
+        # service's actual quit is Mac proof.
+        run: scripts/process-sweep-test.sh
+      - name: Diagnostics file names no VPN (DESIGN.md §36.3)
+        run: scripts/diagnostics-redaction-test.sh
+      - name: Background-service client check (same certificate only, DESIGN.md §36.3)
+        run: scripts/helper-client-test.sh
+      - name: Boot staleness (no blocking set from an earlier boot)
+        # Sources/Helper/BootSession.swift (DESIGN.md §23.12). The
+        # real reboot is Mac proof.
+        run: scripts/boot-session-test.sh
+      - name: Background-service lifecycle (session harness, pfctl stand-in)
+        # HelperSession + kill switch + engine with a logging pfctl
+        # stub and fake-openconnect (DESIGN.md §二十五): every
+        # disconnect/release path gives pf back. Real pf is Mac proof.
+        run: scripts/session-test.sh
+      - name: Drop history (episodes, outcomes, retries, old records)
+        # Sources/App/DropHistory.swift (DESIGN.md §21.22). What a real
+        # drop records in the running App is Mac proof.
+        run: scripts/drop-history-test.sh
+      - name: Approval card (when it shows, updates, finishes, hides)
+        # Sources/App/ApprovalPromptTracker.swift (DESIGN.md §29). The
+        # window on a real screen is Mac proof.
+        run: scripts/approval-prompt-test.sh
+      - name: Split list rules (domains, geosite, geoip, networks; bundled data)
+        # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
+        run: scripts/list-rules-test.sh
+      - name: Other VPN / proxy notices (classification only)
+        # Sources/App/NetworkNeighbors.swift (DESIGN.md §27.2).
+        run: scripts/neighbors-test.sh
+      - name: Connections page classification and route lookup
+        # Sources/Helper/Connections.swift (DESIGN.md §28.7).
+        run: scripts/connections-test.sh
+      - name: Clean uninstall (fake file system, commands logged)
+        # scripts/uninstall.sh (DESIGN.md §31): what goes, what stays
+        # (Cisco, foreign bundles), the from-App detach and wait. The real
+        # removal and network restore on a Mac are Mac proof.
+        run: scripts/uninstall-test.sh
+      - name: Third-party notices match Cargo.lock
+        # THIRD_PARTY_NOTICES.md, third_party/rust-crates.txt (DESIGN.md §三十四).
+        run: scripts/make-rust-notices.sh --check
+      - name: Own-connection self-check rule (give up after 30 s of silence)
+        # Sources/App/ConnectionCheck.swift (DESIGN.md §26.11). The probes
+        # and the automatic disconnect in the running App are Mac proof.
+        run: scripts/connection-check-test.sh
+      - name: Update check (GitHub releases list, local fake server)
+        # Sources/App/UpdateChecker.swift + core update_check (DESIGN.md
+        # §三十三). The real GitHub answer and the panel notice are Mac proof.
+        run: scripts/update-check-test.sh
+      - name: One-line installer (install.sh, local fake releases)
+        # DESIGN.md §三十五: release choice, checksum, refusals, replace,
+        # stage-then-install, quarantine cleared. Quitting a real running
+        # App and the real GitHub download are Mac proof.
+        run: scripts/install-test.sh
+      - name: DNS forwarder harness (domain split, loopback fake upstreams)
+        # DESIGN.md §26.4: direct names asked of the local DNS and routed
+        # before the answer, IPv4 only; other names to the tunnel's DNS
+        # with server switching and TCP fallback. Real DNS is Mac proof.
+        run: scripts/dns-forwarder-test.sh
+      - name: Certificate relay harness (mock gateway demanding a client certificate)
+        # Sources/App/CertificateRelay.swift with test certificates only
+        # (DESIGN.md §二十三): CSTP reassembly, one TLS record per packet
+        # both ways, local mutual TLS refusing foreign clients, and the
+        # Helper's openconnect engine logging in through the relay to a
+        # mock gateway that demands a client certificate. Real gateway
+        # and keychain identity are Mac proof.
+        timeout-minutes: 8
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          scripts/relay-test.sh "$HELPER"
+      - name: Own-connection phone-approval wait (real openconnect, mock gateway)
+        # DESIGN.md §30.9: the mock holds its answer to the password as
+        # the company gateway does while it waits for the phone; the
+        # engine shows the wait, asks again after an expiry and still
+        # stops at once on a wrong password. The real gateway is Mac proof.
+        timeout-minutes: 6
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          scripts/approval-wait-test.sh "$HELPER"
+      - name: Bundled openconnect is self-contained and works through the relay
+        # DESIGN.md §27.3: the App ships openconnect with its libraries,
+        # relinked to load only from the bundle (the script fails on any
+        # Homebrew path left); then the engine test runs with that copy.
+        timeout-minutes: 8
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          scripts/bundle-openconnect.sh /tmp/oc-bundle
+          /tmp/oc-bundle/bin/openconnect --version | head -1
+          ALWAYSCONNECT_TEST_OPENCONNECT=/tmp/oc-bundle/bin/openconnect scripts/relay-test.sh "$HELPER"
