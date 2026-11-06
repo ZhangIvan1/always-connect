@@ -5,7 +5,7 @@ AlwaysConnect 带一个以 root 运行的后台服务，并会改动本机的路
 **请不要开公开 Issue**，改用 GitHub 的私下报告：
 
 - 仓库页面 → **Security** → **Report a vulnerability**
-  （<https://github.com/weiazm/AlwaysConnect/security/advisories/new>）
+  （<https://github.com/weiazm/always-connect/security/advisories/new>）
 
 请写明：macOS 版本、AlwaysConnect 版本（设置 → 通用 → 版本）、复现步骤和你看到的影响。
 **不要附上**真实的 VPN 服务器地址、账号、密码、证书或未脱敏的诊断包。

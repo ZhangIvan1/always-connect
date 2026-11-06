@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install or update AlwaysConnect from GitHub Releases (DESIGN.md §三十五):
 #
-#   curl -fsSL https://raw.githubusercontent.com/weiazm/AlwaysConnect/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/weiazm/always-connect/main/install.sh | bash
 #
 # Why a script: the builds carry no Apple developer signature and are
 # not notarized, so a zip downloaded by a browser is quarantined and
@@ -43,7 +43,7 @@
 {
 set -euo pipefail
 
-API=${ALWAYSCONNECT_RELEASES_API:-https://api.github.com/repos/weiazm/AlwaysConnect/releases?per_page=20}
+API=${ALWAYSCONNECT_RELEASES_API:-https://api.github.com/repos/weiazm/always-connect/releases?per_page=20}
 DOWNLOAD_PREFIX=${ALWAYSCONNECT_DOWNLOAD_PREFIX:-https://github.com/}
 BUNDLE_ID=com.alwaysconnect.app
 # SHA-1 of the leaf certificate every release is signed with: the

@@ -1995,7 +1995,7 @@ DNS 归 Cisco，我们不插手，§二十二）。
 - 设置 → 通用 → 版本 里的"检查更新"立即查一次（这一次在设置进程里执行，§32.15）。结果写进 App 自己的偏好
   （updateLastAttempt / updateLastSuccess / updateLastFailed / updateFound / updateSkippedVersion），菜单栏 App 下次开面板时读到，
   两个进程之间不需要新的消息。
-- 请求：`GET https://api.github.com/repos/weiazm/AlwaysConnect/releases?per_page=20`（地址在 Info.plist 的 `AlwaysConnectReleasesAPI`，
+- 请求：`GET https://api.github.com/repos/weiazm/always-connect/releases?per_page=20`（地址在 Info.plist 的 `AlwaysConnectReleasesAPI`，
   fork 改这一处即可；`ALWAYSCONNECT_UPDATE_URL` 环境变量只给 harness 用）。临时会话（ephemeral，无缓存、无 cookie），
   一次回答后即作废，不留连接池；只保存找到的那一个版本的标签、页面地址、是否预发布三项，不缓存发布列表与说明。
 - 未登录访问 GitHub API 每个 IP 每小时 60 次，远够用。断线保护封网期间请求失败，按失败处理，一小时后再试。
@@ -2091,7 +2091,7 @@ DNS 归 Cisco，我们不插手，§二十二）。
 - 没有隔离标记的 App 不经 Gatekeeper 评估，只要签名完整（ad-hoc 或自签都可以）就能运行。curl 下载不加隔离标记。
 
 ### 35.2 一行命令安装（install.sh，仓库根目录）
-- `curl -fsSL https://raw.githubusercontent.com/weiazm/AlwaysConnect/main/install.sh | bash`；首次安装与更新是同一条命令。
+- `curl -fsSL https://raw.githubusercontent.com/weiazm/always-connect/main/install.sh | bash`；首次安装与更新是同一条命令。
   地址按仓库公开后设计，私有期间 raw 与 API 都回 404，脚本报"没有返回发布列表"后停止，不动已装的 App。
 - 选版本：GitHub 发布列表（新的在前）里第一个不是草稿、且带本机架构 zip 与其 .sha256 的发布；预发布也算，与检查更新一致。
   `--version v<版本>` 指定。架构按硬件判断（Rosetta 下的 shell 也装 arm64）。只用每台 Mac 都有的工具：
@@ -2161,7 +2161,10 @@ DNS 归 Cisco，我们不插手，§二十二）。
 
 ### 36.2 仓库与历史（2026-11-07，用户选定"新建干净仓库"）
 - GitHub 会长期保留改写前的提交（按提交号仍能打开，短提交号也能试出来），PR 引用也会留住旧对象；只有删库或换库才彻底清掉。
-  做法：原仓库改名为私有存档（完整历史只在那里），同名新建 `weiazm/AlwaysConnect`，只放一个干净的初始提交。安装地址与更新地址不变。
+  做法：新建仓库，只放一个干净的初始提交；旧仓库（含全部历史）随后删除（用户 2026-11-07："之前的都删掉"）。
+  仓库名改为小写中划线 `weiazm/always-connect`（用户同日要求），安装、更新、发布列表地址随之改为新名字；
+  GitHub 会把旧名字 weiazm/AlwaysConnect 重定向到新仓库（已装的旧版 App 查更新仍能找到），但新版只写新名字。
+- 2026-11-07 用户要求公开并发布：仓库改为公开，首个公开版本 v0.2.0（预发布：多项本机实测仍待做，见 mac-proof）。
 - 换库后其他分支迁移：`git rebase --onto <新根提交> <旧 main 尖端> <分支>`；旧历史的任何引用都不能推到新仓库。
 - CI 显式 `permissions: contents: read`，同分支旧运行自动取消；只用 push 与 pull_request 触发（不用 pull_request_target），fork 的 PR
   拿不到写权限与 secrets。新增 `SECURITY.md`（私下报告）、Issue 模板（先脱敏）、`.github/dependabot.yml`（cargo 与 Actions，每月，最多 3 个）。

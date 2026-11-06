@@ -9,7 +9,7 @@ VPN 开启时仍能访问本地局域网（自动识别当前网段）；可按�
 
 - **2026-11-07 公开前安全审查与加固**（DESIGN §三十六）：后台服务只认同一证书签名的 App；install.sh 固定签名者、只走 https；
   诊断包隐去服务器与 Group；后台服务默认不记 openconnect 输出；发布附第三方源码包；删掉 Cisco 包研究记录、一次性分流 PoC、
-  视频站与具体 AI 应用的示例；CI 只读权限、SECURITY.md、Issue 模板、Dependabot。仓库换成干净的新库（旧库改名为私有存档）。
+  视频站与具体 AI 应用的示例；CI 只读权限、SECURITY.md、Issue 模板、Dependabot。仓库换成干净的新库 weiazm/always-connect（旧库已删除），已公开，首个公开版本 v0.2.0（预发布）。
   待实测：mac-proof I21（装新版时，需用户说"装"）。
 - **2026-11-06 合规整理**（DESIGN §三十四）：用户决定暂不开源，并要求把风险尽量规避。已做：第三方声明
   （THIRD_PARTY_NOTICES.md，随 App 分发）、openconnect 各库的 LGPL 全文 / 源码清单 / 替换说明、下载对应源码的脚本、Rust crate
@@ -127,7 +127,6 @@ VPN 开启时仍能访问本地局域网（自动识别当前网段）；可按�
 ## 等用户的（不要催）
 
 - UI 可视化稿 v2 的评价。
-- 仓库公开后在 GitHub 上打开的设置（DESIGN §36.2），公开本身由用户决定。
 
 ## 硬规则
 

@@ -66,7 +66,7 @@ final class UpdateChecker: ObservableObject {
 
     /// The one-line install, which also updates (README, install.sh).
     static let installCommand =
-        "curl -fsSL https://raw.githubusercontent.com/weiazm/AlwaysConnect/main/install.sh | bash"
+        "curl -fsSL https://raw.githubusercontent.com/weiazm/always-connect/main/install.sh | bash"
 
     private enum Key {
         static let lastAttempt = "updateLastAttempt"

@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/weiazm/AlwaysConnect/actions/workflows/ci.yml"><img src="https://github.com/weiazm/AlwaysConnect/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/weiazm/always-connect/actions/workflows/ci.yml"><img src="https://github.com/weiazm/always-connect/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/macOS-13%2B-black?logo=apple" alt="macOS 13+">
   <img src="https://img.shields.io/badge/Apple%20Silicon-native-black" alt="Apple Silicon">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT"></a>
@@ -91,7 +91,7 @@
 在「终端」里粘贴下面这一行，回车：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/weiazm/AlwaysConnect/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/weiazm/always-connect/main/install.sh | bash
 ```
 
 它会下载最新的发布版本、核对校验值、放进「应用程序」并打开。以后想更新，再执行一次同样的命令就行；
@@ -108,7 +108,7 @@ curl -fsSL https://raw.githubusercontent.com/weiazm/AlwaysConnect/main/install.s
 
 这是没有经过苹果公证的个人构建，用浏览器下载的 App 第一次打开会被系统拦下，提示「无法验证开发者」或「Apple 无法检查其是否包含恶意软件」。
 
-1. 从 [Releases](https://github.com/weiazm/AlwaysConnect/releases) 下载 `AlwaysConnect-版本号-macos-arm64.zip`，解压后把 `AlwaysConnect.app` 拖进「应用程序」。
+1. 从 [Releases](https://github.com/weiazm/always-connect/releases) 下载 `AlwaysConnect-版本号-macos-arm64.zip`，解压后把 `AlwaysConnect.app` 拖进「应用程序」。
 2. 双击打开一次，看到拦截提示后点「完成」或「取消」。
 3. 打开「系统设置 → 隐私与安全性」，拉到「安全性」，点 AlwaysConnect 旁边的 **仍要打开**，输入开机密码，再点「打开」。只需要做一次。
 
