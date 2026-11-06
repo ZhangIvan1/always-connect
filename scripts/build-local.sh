@@ -33,6 +33,12 @@ echo "== Rust staticlib"
 # A Homebrew Rust ships its std built for the host macOS, so the link
 # warns "built for newer macOS": fine for running on this Mac, not for
 # shipping to older ones (release builds go through CI's toolchain).
+# Panic locations embed source paths; under the builder's home they name
+# the user (DESIGN.md §36.5). Map the home directory and the crate
+# registry to neutral prefixes (the more specific mapping last: rustc
+# applies the last one that matches).
+CARGO_DIR=${CARGO_HOME:-$HOME/.cargo}
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=/build --remap-path-prefix=$CARGO_DIR/registry/src=/cargo/registry/src"
 (cd "$ROOT/core" && cargo build --release --quiet)
 
 # swiftc, minus the Homebrew-std "built for newer macOS" link noise.

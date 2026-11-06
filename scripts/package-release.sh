@@ -59,6 +59,15 @@ if [ "$IDENTITY" != - ]; then
         exit 1
     }
 fi
+# Nothing in the shipped files may name the builder (DESIGN.md §36.5):
+# no home directory or user name in any string of any file.
+LEAK=$(find "$APP" -type f -print0 | xargs -0 strings -a 2>/dev/null \
+    | grep -F -e "$HOME" -e "/Users/$(id -un)" | sort -u | head -5 || true)
+if [ -n "$LEAK" ]; then
+    echo "the App contains the builder's paths; not packaging:" >&2
+    echo "$LEAK" >&2
+    exit 1
+fi
 BUILT=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")
 [ "$BUILT" = "$PLIST_VERSION" ] || { echo "built App reports $BUILT, expected $PLIST_VERSION" >&2; exit 1; }
 ARCH=$(uname -m)

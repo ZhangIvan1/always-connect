@@ -2191,3 +2191,9 @@ DNS 归 Cisco，我们不插手，§二十二）。
 - 每次发布由 `package-release.sh` 一并生成 `AlwaysConnect-<版本>-third-party-sources.tar.gz`（按 SOURCES 下载并校验），
   与安装包放在同一个 Release 里，满足 LGPL"在同一位置提供对应源码"。
 - 复核：THIRD_PARTY_NOTICES 与实际打包的 13 个库一一对应；自带的 vpnc-script 是独立实现（与 GPL 版只有两行普通判断相同）。
+
+### 36.5 发布包里不能有构建机的路径（2026-11-07，发布前扫描发现）
+- Rust 的 panic 位置字符串带源码路径，crate 缓存在构建者家目录下（`~/.cargo/registry`），于是二进制里出现了构建机的用户名。
+  build-local.sh 给 cargo 加 `--remap-path-prefix`（家目录 → `/build`，crate 缓存 → `/cargo/registry/src`）；
+  package-release.sh 打包前扫描 App 里所有文件的字符串，出现家目录或 `/Users/<当前用户>` 就拒绝打包。
+- 验证级别：本机打包 v0.2.0 后解包扫描：关键词清单与用户路径零命中。
