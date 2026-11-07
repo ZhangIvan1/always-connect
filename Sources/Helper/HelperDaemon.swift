@@ -472,6 +472,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 case .stoppedManual: self.lastReasonCode = 1
                 case .authFailure: self.lastReasonCode = 2
                 case .attemptsExhausted: self.lastReasonCode = 3
+                case .componentMissing: self.lastReasonCode = 4
                 }
                 self.lastRetryCount = retries
                 // Terminal state is already reflected by the last pushed

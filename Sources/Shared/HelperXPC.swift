@@ -68,7 +68,8 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     func updateAllowNetworks(_ networks: [String], withReply reply: @escaping (Bool) -> Void)
     /// Session info for the panel and notifications (DESIGN.md
     /// §十九): terminal reason code (0 = none/ongoing, 1 = manual
-    /// stop, 2 = credentials rejected, 3 = attempts exhausted) and
+    /// stop, 2 = credentials rejected, 3 = attempts exhausted,
+    /// 4 = trusted bundled component missing) and
     /// retries in the current drop episode (0 when connected or
     /// never dropped). The App queries this after a push lands on
     /// Reconnecting or on a terminal Disconnected, so the panel's
