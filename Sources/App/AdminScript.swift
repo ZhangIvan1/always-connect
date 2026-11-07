@@ -59,6 +59,10 @@ enum AdminScript {
 
     /// The child: one script from stdin, one answer, exit.
     static func serveAndExit() -> Never {
+        guard AppIdentity.hasAppParent() else {
+            fputs("AlwaysConnect: 已拒绝非 App 父进程的管理员脚本请求\n", stderr)
+            exit(77)
+        }
         let source = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
         let result = runHere(source)
         var json: [String: Any] = ["output": result.output]

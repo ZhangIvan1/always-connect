@@ -274,6 +274,8 @@ jobs:
         run: scripts/diagnostics-redaction-test.sh
       - name: Background-service client check (same certificate only, DESIGN.md §36.3)
         run: scripts/helper-client-test.sh
+      - name: Administrator child authenticates its parent
+        run: scripts/admin-parent-test.sh
       - name: Boot staleness (no blocking set from an earlier boot)
         # Sources/Helper/BootSession.swift (DESIGN.md §23.12). The
         # real reboot is Mac proof.

@@ -75,6 +75,7 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 # 4d3 boot staleness: no blocking set from an earlier boot (§23.12)
 # 4d3a who may drive the root background service (§36.3)
 "$REPO/scripts/helper-client-test.sh" > /tmp/ac-helper-client.log 2>&1 && pass helper-client || { fail helper-client; grep -E "FAIL" /tmp/ac-helper-client.log || tail -5 /tmp/ac-helper-client.log; }
+"$REPO/scripts/admin-parent-test.sh" && pass admin-parent || fail admin-parent
 "$REPO/scripts/diagnostics-redaction-test.sh" > /tmp/ac-diag-redaction.log 2>&1 && pass diagnostics-redaction || { fail diagnostics-redaction; grep FAIL /tmp/ac-diag-redaction.log || true; }
 "$REPO/scripts/boot-session-test.sh" > /tmp/ac-boot-session.log 2>&1 && pass boot-session || { fail boot-session; grep FAIL /tmp/ac-boot-session.log || true; }
 # 4d4 drop history: episodes, outcomes, retries, old records (§21.22)

@@ -2301,3 +2301,7 @@ DNS 归 Cisco，我们不插手，§二十二）。
 ### 39.2 F3：root 不回落到用户的 openconnect
 后台服务默认只运行受信的内置组件，缺失时停止重试，返回「内置连接组件缺失或不可信，请重新安装后台服务」。校验包含文件和直到根目录的所有祖先：root 属主、没有组/他人写权限、没有符号链接。显式 openconnectPath 和测试 seam 保留；普通用户仍可用 Homebrew/PATH，run-once harness 不变。新增组件缺失终态（session reason 4）并显示面板红字，不把组件故障说成账号错误；封网仍需用户显式恢复。
 验证级别：Rust 单测覆盖 root 默认路径不回落与非 root 默认选择；CI harness 覆盖现有显式路径。真实缺失组件的面板提示、断开出口需实测（I24）。
+
+### 39.3 F5：管理员脚本子进程校验父进程
+`--admin-script` 在读取 stdin 前通过 Security.framework 校验父进程的运行代码、同一叶子证书和可执行文件真实路径，校验前后确认 ppid 没变；动态代码校验和路径校验一起限制 PID 复用与替换路径。ad-hoc 开发构建要求相同 designated requirement（代码哈希）及相同路径。外部进程启动此入口会立即以 77 退出，不执行脚本。校验仍是系统 API 薄壳，没有新增常驻计时器。
+验证级别：本机编译；`admin-parent-test.sh --adhoc-only` 验证同一父程序成功、外部父进程拒绝（仅执行返回字符串的 AppleScript，无提权）。完整证书 harness 已尝试，本机临时证书不受信任，codesign 报找不到身份，证书分支未验证；需 CI harness 和 I25 实测。
