@@ -41,7 +41,7 @@ final class CLIOrchestrator {
     }
 
     enum FedCredential { case password, cookie }
-    enum TerminalReason { case stoppedManual, authFailure, attemptsExhausted }
+    enum TerminalReason { case stoppedManual, authFailure, attemptsExhausted, componentMissing }
 
     var onState: ((SessionDriverClient.State, String) -> Void)? {
         get { box.onState }
@@ -109,7 +109,7 @@ final class CLIOrchestrator {
             terminal: { ctx, reason in
                 guard let ctx else { return }
                 let box = Unmanaged<Box>.fromOpaque(ctx).takeUnretainedValue()
-                let value: TerminalReason = reason == 0 ? .stoppedManual : reason == 1 ? .authFailure : .attemptsExhausted
+                let value: TerminalReason = reason == 0 ? .stoppedManual : reason == 1 ? .authFailure : reason == 3 ? .componentMissing : .attemptsExhausted
                 box.lock.lock(); let handler = box.onTerminal; box.lock.unlock()
                 handler?(value)
             },
@@ -192,7 +192,7 @@ final class CLIOrchestrator {
     var lastError: String? { info?.lastError }
     var pfError: String? { info?.pfError }
     var lastTerminalReason: TerminalReason? {
-        info?.lastTerminal.map { $0 == 0 ? .stoppedManual : $0 == 1 ? .authFailure : .attemptsExhausted }
+        info?.lastTerminal.map { $0 == 0 ? .stoppedManual : $0 == 1 ? .authFailure : $0 == 3 ? .componentMissing : .attemptsExhausted }
     }
     var tunnelInterface: String? { info?.tunnelIf }
     var gatewayAddresses: [String] { info?.gatewayIps ?? [] }

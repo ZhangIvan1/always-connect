@@ -18,13 +18,13 @@
 //!
 //! pfctl runs as before: `-E` once for a reference-counted enable (its
 //! token kept and released with `-X`), `-a com.apple/300.AlwaysConnect
-//! -f <file>`, `-F rules` / `-F Tables`, `-t ac_direct -T add|delete|flush`.
+//! -f -` (rules on stdin), `-F rules` / `-F Tables`, `-t ac_direct -T add|delete|flush`.
 
 use crate::pf;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -124,9 +124,31 @@ struct Pfctl {
 impl Pfctl {
     /// stderr on success, Err(stderr) on failure.
     fn run(&self, args: &[&str]) -> Result<String, String> {
+        self.run_input(args, None)
+    }
+
+    fn run_input(&self, args: &[&str], input: Option<&str>) -> Result<String, String> {
         let Some(path) = &self.path else { return Err("pfctl not available on this host".into()) };
-        let out = Command::new(path).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).output()
+        let mut child = Command::new(path).args(args)
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
             .map_err(|e| e.to_string())?;
+        // Drain output while feeding rules, even if pfctl rejects early or
+        // produces more diagnostics than a pipe can hold. Always reap it.
+        let stdin = child.stdin.take();
+        let out = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || -> std::io::Result<()> {
+                if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                    stdin.write_all(input.as_bytes())?;
+                }
+                Ok(())
+            });
+            let out = child.wait_with_output().map_err(|e| e.to_string());
+            let written = writer.join().map_err(|_| "pfctl input writer failed".to_string())?;
+            let out = out?;
+            if out.status.success() { written.map_err(|e| e.to_string())?; }
+            Ok::<_, String>(out)
+        })?;
         let err = String::from_utf8_lossy(&out.stderr).into_owned();
         if out.status.success() { Ok(err) } else { Err(err.trim().to_string()) }
     }
@@ -157,18 +179,8 @@ impl Pfctl {
     }
 
     fn load(&mut self, anchor_text: &str) -> Result<(), String> {
-        let tmp = std::env::temp_dir().join(format!("alwaysconnect-anchor-{}.pf", std::process::id()));
-        let result = (|| {
-            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)
-                .map_err(|e| e.to_string())?;
-            f.write_all(anchor_text.as_bytes()).map_err(|e| e.to_string())?;
-            drop(f);
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-            self.acquire_enable()?;
-            self.run(&["-a", ANCHOR, "-f", &tmp.to_string_lossy()]).map(|_| ())
-        })();
-        let _ = std::fs::remove_file(&tmp);
-        result
+        self.acquire_enable()?;
+        self.run_input(&["-a", ANCHOR, "-f", "-"], Some(anchor_text)).map(|_| ())
     }
 
     fn unload(&mut self) -> Result<(), String> {

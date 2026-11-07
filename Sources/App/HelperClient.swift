@@ -1133,6 +1133,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             fetchSessionInfo { [weak self] info in
                 guard let self, let (reason, retries) = info else { return }
                 self.terminalReasonCode = reason
+                if reason == 4 { self.lastError = "内置连接组件缺失或不可信，请重新安装后台服务" }
                 self.dropRetryCount = retries
             }
         }
@@ -1140,6 +1141,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             fetchSessionInfo { [weak self] info in
                 guard let self, let (reason, retries) = info else { return }
                 self.terminalReasonCode = reason
+                if reason == 4 { self.lastError = "内置连接组件缺失或不可信，请重新安装后台服务" }
                 self.dropRetryCount = retries
                 self.applyTerminalToDrop(reason, retries: retries)
                 Notifier.shared.notifyTerminal(reasonCode: reason)

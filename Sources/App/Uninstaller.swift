@@ -23,10 +23,6 @@ enum Uninstaller {
 
     static func start(keepPassword: Bool, keepSettings: Bool,
                       completion: @escaping (Outcome) -> Void) {
-        guard let script = Bundle.main.path(forResource: "uninstall", ofType: "sh") else {
-            completion(.failed("App 包里缺少卸载脚本"))
-            return
-        }
         var arguments = [
             "--from-app",
             "--user", NSUserName(),
@@ -35,21 +31,13 @@ enum Uninstaller {
             "--app", Bundle.main.bundlePath,
         ]
         if keepSettings { arguments.append("--keep-settings") }
-        let command = (["/bin/bash", script] + arguments).map(shellQuoted).joined(separator: " ")
-        let source = "do shell script \(appleScriptString(command)) "
-            + "with prompt \"AlwaysConnect 要卸载自己：断开 VPN、恢复直连，删除后台服务、随附组件和它留下的文件。\" "
-            + "with administrator privileges"
-        DispatchQueue.global().async {
-            var error: NSDictionary?
-            _ = NSAppleScript(source: source)?.executeAndReturnError(&error)
-            DispatchQueue.main.async {
-                if let error {
-                    let code = error[NSAppleScript.errorNumber] as? Int ?? 0
+        PrivilegedBundle.run(resource: "uninstall.sh", arguments: arguments,
+                             prompt: "AlwaysConnect 要卸载自己：断开 VPN、恢复直连，删除后台服务、随附组件和它留下的文件。") { result in
+                if let code = result.errorNumber {
                     if code == -128 {
                         completion(.cancelled)
                     } else {
-                        let message = error[NSAppleScript.errorMessage] as? String ?? ""
-                        completion(.failed(message.isEmpty ? "卸载没有开始" : message))
+                        completion(.failed(result.errorMessage ?? "卸载没有开始"))
                     }
                     return
                 }
@@ -69,18 +57,7 @@ enum Uninstaller {
                         AppQuit.request()
                     }
                 }
-            }
         }
     }
 
-    /// POSIX single-quoting for the shell.
-    private static func shellQuoted(_ text: String) -> String {
-        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
-    /// An AppleScript string literal.
-    private static func appleScriptString(_ text: String) -> String {
-        "\"" + text.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-    }
 }

@@ -2060,8 +2060,11 @@ DNS 归 Cisco，我们不插手，§二十二）。
   失败时回落到 ftp.gnu.org，单个下载有超时。把 App 交给别人的人附上这些源码包或在同一位置提供下载。
 - 补齐许可证正文：Homebrew 对 gnutls、nettle、gettext、libtasn1 只装了 GPL 正文或缺 LGPL 正文，现在 `openconnect/licenses/`
   另放 LGPL-2.1、LGPL-3.0、GPL-2.0、GPL-3.0 全文（仓库 `third_party/licenses/`）。
-- 可替换：App 不链接这些库，只把 `bin/openconnect` 当独立程序运行，它经 `@loader_path` 加载 `lib/`；App 与后台服务都不校验其哈希。
-  `openconnect/README-LGPL.txt` 写明替换步骤（换文件 → `codesign --force --sign -` → 安装/更新后台服务）。替换后实际能否运行需实测。
+- 可替换：App 不链接这些库，只把 `bin/openconnect` 当独立程序运行，它经 `@loader_path` 加载 `lib/`。替换同名兼容组件并在组件目录执行
+  `codesign --force --sign - lib/*.dylib bin/openconnect` 后，先退出 App（VPN 断开），再由用户主动在终端安装：
+  `APP=/Applications/AlwaysConnect.app`，然后执行 `sudo /bin/bash "$APP/Contents/Resources/dev-helper.sh" install "$APP/Contents/Library/LaunchDaemons/AlwaysConnectHelper"`。
+  脚本从所给 Helper 同一 App 的 Resources/openconnect 复制组件到 root 专属位置。App 内管理按钮只接受原证书签名且完整未改动的 App；组件替换破坏整包封印，ad-hoc 签名不能恢复原证书，自动提权必须拒绝（§39.4）。
+  `openconnect/README-LGPL.txt` 随包给出该手动流程；用户明确执行的终端路径不放宽自动验签。替换后实际能否运行需实测。
 - 更正 README 旧说法："OpenConnect CLI 是 GPL"不对，openconnect 整个项目是 LGPL-2.1。
 
 ### 34.3 定位与示例（界面改动，见 UI-DESIGN；验证级别：编译 + ListRulesTest）
@@ -2191,6 +2194,7 @@ DNS 归 Cisco，我们不插手，§二十二）。
 - 每次发布由 `package-release.sh` 一并生成 `AlwaysConnect-<版本>-third-party-sources.tar.gz`（按 SOURCES 下载并校验），
   与安装包放在同一个 Release 里，满足 LGPL"在同一位置提供对应源码"。
 - 复核：THIRD_PARTY_NOTICES 与实际打包的 13 个库一一对应；自带的 vpnc-script 是独立实现（与 GPL 版只有两行普通判断相同）。
+- 组件替换按 §34.2 的主动终端安装流程；§39.4 的 App 内管理按钮不接受修改后或 ad-hoc 重签的 App，防止用户可写包变成 root 执行入口。
 
 ### 36.5 发布包里不能有构建机的路径（2026-11-07，发布前扫描发现）
 - Rust 的 panic 位置字符串带源码路径，crate 缓存在构建者家目录下（`~/.cargo/registry`），于是二进制里出现了构建机的用户名。
@@ -2291,3 +2295,41 @@ DNS 归 Cisco，我们不插手，§二十二）。
 ### 38.6 Group 说明
 - Group 是网关上的登录组（Cisco 窗口里的 "Group" 下拉）。留空 = 网关默认的组，自建连接时不带 `--authgroup`；经 Cisco 连接时 AlwaysConnect 不传组，用 Cisco 自己的设置。
   只有单位让你选非默认的组时才需要填。账号页的 Group 框加了"一般留空"提示，脚注一句话说明。验证级别：本机编译；用户实测留空可以连上。
+
+## 三十九、公开后安全加固（2026-11-07）
+
+### 39.1 F2：pf 规则不再落临时文件
+旧实现用可预测文件名写入 root 的规则，可能跟随其他用户预先创建的链接。现在 NetworkGuard 通过匿名管道把规则交给 `pfctl -a … -f -`；写入与输出读取并行，子进程退出后回收，不留下规则文件。session harness 的桩也只接受 stdin。检查其余 Rust 临时文件使用点：另外两处只在单元测试内；持久化状态仍在后台服务专属目录。
+验证级别：Rust 单测、CI harness（session-test）；真实 pf 装载需实测（I23）。未运行 App，改前/改后 footprint、CPU、每秒唤醒均需实测；只增加装规则时短暂的管道写入线程，没有新增轮询。
+
+### 39.2 F3：root 不回落到用户的 openconnect
+后台服务默认只运行受信的内置组件，缺失时停止重试，返回「内置连接组件缺失或不可信，请重新安装后台服务」。校验包含文件和直到根目录的所有祖先：root 属主、没有组/他人写权限、没有符号链接。显式 openconnectPath 和测试 seam 保留；普通用户仍可用 Homebrew/PATH，run-once harness 不变。新增组件缺失终态（session reason 4）并显示面板红字，不把组件故障说成账号错误；封网仍需用户显式恢复。
+验证级别：Rust 单测覆盖 root 默认路径不回落与非 root 默认选择；CI harness 覆盖现有显式路径。真实缺失组件的面板提示、断开出口需实测（I24）。
+
+### 39.3 F5：管理员脚本子进程校验父进程
+`--admin-script` 在读取 stdin 前通过 Security.framework 校验父进程的运行代码、同一叶子证书和可执行文件真实路径，校验前后确认 ppid 没变；动态代码校验和路径校验一起限制 PID 复用与替换路径。ad-hoc 开发构建要求相同 designated requirement（代码哈希）及相同路径。外部进程启动此入口会立即以 77 退出，不执行脚本。校验仍是系统 API 薄壳，没有新增常驻计时器。
+验证级别：本机编译；`admin-parent-test.sh --adhoc-only` 验证同一父程序成功、外部父进程拒绝（仅执行返回字符串的 AppleScript，无提权）。完整证书 harness 已尝试，本机临时证书不受信任，codesign 报找不到身份，证书分支未验证；需 CI harness 和 I25 实测。
+
+### 39.4 F1：提权后只执行验签的私有副本
+安装/更新后台服务、强制恢复、恢复网络、卸载全部经 `PrivilegedBundle`：运行中的 App 取得自己的叶子证书哈希并核对运行代码；固定的 root shell 以 umask 077 创建 root 专用临时目录，复制整个 App，拒绝绝对或跨父目录的符号链接，改为 root 所有且不可由组/他人写，再以 `codesign --verify --strict --deep -R` 固定 App 标识和叶子证书校验副本。校验失败给中文错误并退出，成功才运行副本内脚本及后台服务；用完清理副本。卸载脚本的异步后半程仍使用其自己的 root 私有副本。shell 和 AppleScript 分别转义。
+无证书的 ad-hoc 构建可以继续构建和测试，但管理按钮明确拒绝提权并说明使用已有开发证书；终端手动 `sudo …/dev-helper.sh install`、`sudo …/reset-network.sh` 保留，属于用户知情执行，后台服务原有拒绝 ad-hoc 客户端的规则不变。不自动建立长期身份。
+LGPL 组件替换也使用 §34.2、§36.4 和随包 README-LGPL.txt 的主动终端流程，不能再通过 App 管理按钮安装修改后的包（R1 文档修正）。验证级别：说明生成和脚本级断言；实际替换安装需实测。
+验证级别：本机编译；`privileged-bundle-test.sh` 为脚本级断言（执行顺序、两层转义、AppleScript 编译、bash 语法），并用真实 codesign 验证 ad-hoc 不满足证书 pin、改过的资源验签失败；未执行 root bootstrap。管理员安装/恢复/卸载及有效签名通过路径需实测（I26）。无新增常驻逻辑；改前/后 footprint、CPU、唤醒需实测。
+
+### 39.5 F4：设置进程使用匿名私有通道
+删除 DistributedNotificationCenter 的状态、动作、请求与回复广播和环境 token。父进程创建匿名 socketpair，只将子端继承为设置进程的 stdin/stdout；子进程先校验同签名、同路径的父 App。状态镜像、动作、回复和打开指定页均经过该通道，原动作及三秒超时不变。同会话的其他进程没有可监听或连接的名字，也不再能从广播取到权限凭据。
+`SettingsTransport` 只做系统 IPC 薄壳：非阻塞描述符、DispatchSource 读写就绪、JSON 行的边界与一 MB 缓冲上限；不增加轮询，空闲不注册写就绪，错误/EOF 关闭并回收描述符。设置窗口退出释放通道；父进程退出触发 EOF，设置子进程随之退出。连接业务决策仍在原 Rust 核心与 App 外壳中。
+验证级别：本机编译、CI harness（`settings-transport-test.sh`：双向请求/回复、换行转义、非法消息关闭、缓冲上限、EOF；检查无广播入口）。窗口交互与资源回收、改前/后 footprint/CPU/每秒唤醒需实测（I27）；未运行真实 App。
+
+### 39.6 F6：安装包版本与发布绑定，默认拒绝降级
+下载模式要求 CFBundleShortVersionString 与所选 tag 去掉 v 后完全一致；`--from` 必须传 `--expected-version`，App 的两阶段更新会传入所选版本。新包低于已安装版本时拒绝，只有终端显式 `--allow-downgrade` 可放行；即使放行降级，版本匹配和签名检查仍必须通过。版本比较分别处理数字段、预发布标识和构建元数据，稳定版高于相同核心版本的预发布版，数字比较不发生整数溢出；无效版本拒绝。App 沿用安装脚本的中文错误展示。
+验证级别：`install-policy-test.sh` 脚本级断言（签名桩：拒绝降级、显式放行、版本不符、缺少期望版本、预发布数字排序、稳定版排序、无效版本）；`install-test.sh` 增加真实签名的降级、tag/包版本不符与放行用例，已尝试但本机测试证书不受信任，真实签名整环未验证，交后续 CI harness。真实更新及错误文案需实测（I28）。
+
+### 39.7 F8：复制后仍固定同一签名者
+`check_app` 首次确定的叶子证书 requirement 保留到整个安装结束。等待旧进程退出后再检查源包，复制到最终目标后使用同一 `-R` 复检，同时确认最终副本仍是期望版本，防止复制期间换入同证书旧包；不会因为旧 App 已移走而退回其他签名者。最终检查失败会删除新副本并由清理流程恢复旧版，ad-hoc 的完整签名不再能代替发布证书。
+验证级别：`install-policy-test.sh` 脚本级断言模拟最终签名者不符，验证固定 requirement 和回滚；`install-test.sh` 增加 ditto 复制时替换为 ad-hoc 包的真实签名用例，但本机测试签名环境不可用，需 CI harness；真实换版/回滚需实测（I29）。
+
+### 39.8 F10：后台服务限定一个 uid
+采用首个通过签名校验的 XPC 客户端 uid 归属方案；uid 来自 NSXPCConnection 的系统凭据，不能由消息参数指定。NSLock 原子地登记归属，设置子进程、同用户重连与崩溃后的 App 可继续连接；其他 uid 在导出对象、订阅状态或读取全机连接列表前拒绝。归属保留到本次后台服务进程退出，包含两分钟崩溃宽限期，不会因临时 XPC 断开被其他用户抢走。
+取舍：快速用户切换不会让新用户接管旧用户的 VPN，也不主动拆旧会话；新用户需等旧用户正常退出 App、后台服务按现有空闲机制退出后再连。已有 App 仍附着时不把“VPN 暂未连接”当作可以换主人的时机。此策略不引入控制台用户观察器或轮询，保留现有 App 拉起与宽限期生命周期；后台服务重启后由首个通过认证的 uid 重新建立归属。
+验证级别：本机编译；`helper-uid-test.sh` 脚本级断言覆盖同 uid、不同 uid、并发竞争和新服务实例；session CI harness 覆盖退出、宽限期、恢复生命周期。真实多用户 XPC 与快速切换需实测（I30）；改前/后 footprint、CPU、唤醒需实测。

@@ -111,6 +111,7 @@ pub enum Terminal {
     StoppedManual = 0,
     AuthFailure = 1,
     AttemptsExhausted = 2,
+    ComponentMissing = 3,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,20 +188,17 @@ fn is_ipv4(s: &str) -> bool {
 pub const BUNDLED_DIR: &str = "/Library/PrivilegedHelperTools/AlwaysConnect-openconnect";
 
 /// The bundled openconnect, run as root only when root owns it and
-/// nobody else can write it or any directory up to the bundle root.
+/// nobody else can write it or any ancestor. Symlinks are refused.
 pub fn bundled_is_trusted(file: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let mut cursor = PathBuf::from(file);
-    while cursor.starts_with(BUNDLED_DIR) {
-        let Ok(meta) = std::fs::metadata(&cursor) else { return false };
-        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+    let path = Path::new(file);
+    if !path.is_absolute() || !path.starts_with(BUNDLED_DIR) {
+        return false;
+    }
+    for cursor in path.ancestors() {
+        let Ok(meta) = std::fs::symlink_metadata(cursor) else { return false };
+        if meta.file_type().is_symlink() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
             return false;
-        }
-        if cursor == Path::new(BUNDLED_DIR) {
-            break;
-        }
-        if !cursor.pop() {
-            break;
         }
     }
     is_executable(file)
@@ -700,6 +698,10 @@ impl Shared {
         c.driver.start();
         self.take_over_held_set(c);
         self.report(c, "starting");
+        if Self::executable(c).is_none() {
+            self.spawn_next(c);
+            return;
+        }
         self.start_forwarder(c);
         self.watch_physical_network(c);
         self.spawn_next(c);
@@ -963,23 +965,29 @@ impl Shared {
 
     // MARK: Spawn
 
-    fn executable(c: &Core) -> String {
+    fn executable(c: &Core) -> Option<String> {
         if let Some(p) = c.config.openconnect_path.as_ref().filter(|p| !p.is_empty()) {
-            return p.clone();
+            return Some(p.clone());
         }
         if c.config.test_active {
-            return c.config.test_openconnect.clone().unwrap_or_else(|| "/usr/bin/false".into());
+            return Some(c.config.test_openconnect.clone().unwrap_or_else(|| "/usr/bin/false".into()));
         }
+        Self::default_executable(unsafe { libc::geteuid() } == 0)
+    }
+
+    fn default_executable(root: bool) -> Option<String> {
         let bundled = format!("{BUNDLED_DIR}/bin/openconnect");
         if bundled_is_trusted(&bundled) {
-            return bundled;
+            return Some(bundled);
         }
+        // The daemon never executes a user's Homebrew or PATH entry.
+        if root { return None; }
         for candidate in ["/opt/homebrew/bin/openconnect", "/usr/local/bin/openconnect", "/usr/sbin/openconnect", "/usr/bin/openconnect"] {
             if is_executable(candidate) {
-                return candidate.into();
+                return Some(candidate.into());
             }
         }
-        "/usr/bin/env".into()
+        Some("/usr/bin/env".into())
     }
 
     fn spawn_next(self: &Arc<Self>, c: &mut Core) {
@@ -998,7 +1006,14 @@ impl Shared {
             c.episode_retries += 1;
         }
         let cookie = cookie_load(&c.config.cookie_store_path, &c.config.server);
-        let executable = Self::executable(c);
+        let Some(executable) = Self::executable(c) else {
+            let detail = "内置连接组件缺失或不可信，请重新安装后台服务";
+            self.stop_split(c);
+            c.last_error = Some(detail.into());
+            c.driver.on_manual_disconnect();
+            self.finish_terminal(c, Terminal::ComponentMissing, detail);
+            return;
+        };
         let mut args: Vec<String> = Vec::new();
         if executable == "/usr/bin/env" {
             args.push("openconnect".into());
@@ -1517,6 +1532,21 @@ fn wipe(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_default_never_falls_back_to_user_tools() {
+        let selected = Shared::default_executable(true);
+        match selected {
+            Some(path) => {
+                assert_eq!(path, format!("{BUNDLED_DIR}/bin/openconnect"));
+                assert!(bundled_is_trusted(&path));
+            }
+            None => assert!(!bundled_is_trusted(&format!("{BUNDLED_DIR}/bin/openconnect"))),
+        }
+        assert!(!bundled_is_trusted("/usr/bin/true"));
+        assert!(!bundled_is_trusted("relative/bin/openconnect"));
+        assert!(Shared::default_executable(false).is_some());
+    }
 
     #[test]
     fn redaction_masks_and_terminates() {

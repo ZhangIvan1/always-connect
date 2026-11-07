@@ -128,8 +128,18 @@ libraries in lib/ through @loader_path. To use your own build, replace
 any of these files with a compatible one (same library name), then sign
 the folder ad hoc so macOS will load it:
     codesign --force --sign - lib/*.dylib bin/openconnect
-and click "安装/更新后台服务" (install / update background service) in the
-App settings, which copies
-this folder to /Library/PrivilegedHelperTools/AlwaysConnect-openconnect.
+Quit AlwaysConnect first (this disconnects the VPN). Then deliberately
+install your modified components from Terminal, adjusting APP if needed:
+    APP=/Applications/AlwaysConnect.app
+    sudo /bin/bash "$APP/Contents/Resources/dev-helper.sh" install "$APP/Contents/Library/LaunchDaemons/AlwaysConnectHelper"
+The script copies the component folder next to that Helper into
+/Library/PrivilegedHelperTools/AlwaysConnect-openconnect.
+
+App management buttons accept only a complete, unmodified App signed
+with its original certificate. Replacing a component breaks the bundle
+seal; ad-hoc signing does not restore that certificate. Automatic root
+execution rejects modified bundles to prevent user-writable files from
+becoming administrator code. The explicit Terminal command above is a
+user-authorized replacement path; it does not weaken automatic verification.
 EOF
 echo "bundled $(ls "$OUT/lib" | wc -l | tr -d ' ') libraries into $OUT ($(du -sh "$OUT" | cut -f1))"

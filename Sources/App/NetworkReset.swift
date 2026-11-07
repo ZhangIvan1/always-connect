@@ -13,16 +13,8 @@ enum NetworkReset {
     }
 
     static func run(completion: @escaping (Outcome) -> Void) {
-        guard let script = Bundle.main.path(forResource: "reset-network", ofType: "sh") else {
-            completion(.failed("App 包里缺少恢复脚本"))
-            return
-        }
-        let quoted = "quoted form of \"" + script.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-        let source = "do shell script \"/bin/bash \" & (\(quoted)) & \" --from-app\" "
-            + "with prompt \"AlwaysConnect 要把网络恢复到直连：断开 VPN，清除它改过的路由、DNS 和防火墙设置。\" "
-            + "with administrator privileges"
-        AdminScript.run(source) { result in
+        PrivilegedBundle.run(resource: "reset-network.sh", arguments: ["--from-app"],
+                             prompt: "AlwaysConnect 要把网络恢复到直连：断开 VPN，清除它改过的路由、DNS 和防火墙设置。") { result in
             if let code = result.errorNumber {
                 if code == -128 {
                     completion(.cancelled)

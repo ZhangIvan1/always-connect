@@ -24,6 +24,8 @@
 #   --app PATH      install to PATH (default /Applications/AlwaysConnect.app)
 #   --yes           do not ask before quitting a running copy
 #   --no-open       do not open the App afterwards
+#   --allow-downgrade  explicitly permit replacing a newer installed version
+#   --expected-version VERSION  required with --from (checked bundle version)
 # Used by the App's own "更新" button (Sources/App/UpdateChecker.swift):
 #   --stage DIR     download and check only; print "STAGED <app>" and stop
 #   --from APP      install this already checked App instead of downloading
@@ -54,7 +56,7 @@ case "$DOWNLOAD_PREFIX" in
     *) PROTO="=https" ;;
 esac
 DEST=/Applications/AlwaysConnect.app
-TAG="" YES=0 OPEN=${ALWAYSCONNECT_INSTALL_NO_OPEN:+0} STAGE="" FROM="" WAIT_PID=""
+TAG="" YES=0 OPEN=${ALWAYSCONNECT_INSTALL_NO_OPEN:+0} STAGE="" FROM="" WAIT_PID="" EXPECTED_VERSION="" ALLOW_DOWNGRADE=0
 OPEN=${OPEN:-1}
 
 say() { printf '%s\n' "$*"; }
@@ -69,6 +71,8 @@ while [ $# -gt 0 ]; do
         --stage) STAGE=${2:?}; shift 2 ;;
         --from) FROM=${2:?}; shift 2 ;;
         --wait-pid) WAIT_PID=${2:?}; shift 2 ;;
+        --expected-version) EXPECTED_VERSION=${2:?}; shift 2 ;;
+        --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
         -h|--help) sed -n '2,30p' "$0" 2>/dev/null || true; exit 0 ;;  # before the trap below
         *) die "不认识的参数 $1" ;;
     esac
@@ -84,6 +88,7 @@ SUDO=""
 OLD=""          # where the previous copy waits until the new one is in
 RUNNING=0       # a copy was running and has been quit by us
 DONE=0
+VERIFY_REQUIREMENT=""
 cleanup() {
     local status=$?
     # bash 3.2 reports an unbound-variable abort as status 0 here: only a
@@ -208,6 +213,7 @@ download_and_check() { # -> sets NEW to the checked App in $WORK
     mkdir -p "$WORK/x"
     ditto -x -k "$WORK/app.zip" "$WORK/x" || die "解压失败"
     NEW="$WORK/x/AlwaysConnect.app"
+    EXPECTED_VERSION=${tag#v}
     check_app "$NEW"
 }
 
@@ -230,16 +236,62 @@ expected_signer() {
     echo "${installed:-$RELEASE_SIGNER}"
 }
 
+# Compare dotted versions and SemVer prereleases without numeric overflow.
+# Keep the OS comparison separate: stripping prerelease text would allow a
+# stable release to be replaced by an older prerelease of the same version.
+version_order() {
+    cat >"$WORK/version.js" <<'JS'
+function run(argv) {
+    function parse(s) {
+        if (!/^[0-9]+(\.[0-9]+)*(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/.test(s)) return null;
+        var p = s.split('+')[0].split('-');
+        return {core:p.shift().split('.'), pre:p.length ? p.join('-').split('.') : []};
+    }
+    function numeric(a, b) {
+        a = a.replace(/^0+/, '') || '0'; b = b.replace(/^0+/, '') || '0';
+        return a.length !== b.length ? (a.length < b.length ? -1 : 1) : (a === b ? 0 : (a < b ? -1 : 1));
+    }
+    var a = parse(argv[0]), b = parse(argv[1]);
+    if (!a || !b) return 'INVALID';
+    for (var i=0; i<Math.max(a.core.length,b.core.length); i++) {
+        var c = numeric(a.core[i] || '0', b.core[i] || '0'); if (c) return String(c);
+    }
+    if (!a.pre.length || !b.pre.length) return a.pre.length === b.pre.length ? '0' : (a.pre.length ? '-1' : '1');
+    for (var j=0; j<Math.min(a.pre.length,b.pre.length); j++) {
+        var x=a.pre[j], y=b.pre[j], xn=/^[0-9]+$/.test(x), yn=/^[0-9]+$/.test(y);
+        var d = xn && yn ? numeric(x,y) : (xn !== yn ? (xn ? -1 : 1) : (x === y ? 0 : (x < y ? -1 : 1)));
+        if (d) return String(d);
+    }
+    return a.pre.length === b.pre.length ? '0' : (a.pre.length < b.pre.length ? '-1' : '1');
+}
+JS
+    osascript -l JavaScript "$WORK/version.js" "$1" "$2" 2>/dev/null || echo INVALID
+}
+
 check_app() { # app
-    local app=$1 id min os signer
+    local app=$1 id min os signer version installed order
     [ -d "$app/Contents/MacOS" ] || die "安装包里没有 AlwaysConnect.app"
     id=$(plist "$app" CFBundleIdentifier)
     [ "$id" = "$BUNDLE_ID" ] || die "安装包里的不是 AlwaysConnect（${id}）"
     codesign --verify --strict "$app" 2>/dev/null || die "安装包的签名校验不通过，已停止"
-    signer=$(expected_signer)
-    codesign --verify --strict \
-        -R="identifier \"$BUNDLE_ID\" and certificate leaf = H\"$signer\"" "$app" 2>/dev/null \
+    if [ -z "$VERIFY_REQUIREMENT" ]; then
+        signer=$(expected_signer)
+        VERIFY_REQUIREMENT="identifier \"$BUNDLE_ID\" and certificate leaf = H\"$signer\""
+    fi
+    codesign --verify --strict -R="$VERIFY_REQUIREMENT" "$app" 2>/dev/null \
         || die "安装包不是用 AlwaysConnect 的发布证书签名的（可能被替换过），已停止"
+    version=$(plist "$app" CFBundleShortVersionString)
+    [ -n "$EXPECTED_VERSION" ] || die "缺少期望版本：--from 必须同时提供 --expected-version"
+    [ "$version" = "$EXPECTED_VERSION" ] || die "安装包版本与发布版本不符（期望 ${EXPECTED_VERSION}，实际 ${version}），已停止"
+    [ "$(version_order "$version" "$version")" = 0 ] || die "安装包版本号无效，已停止"
+    if [ -e "$DEST" ]; then
+        installed=$(plist "$DEST" CFBundleShortVersionString)
+        order=$(version_order "$version" "$installed")
+        [ "$order" != INVALID ] || die "无法比较已安装版本，已停止"
+        if [ "$order" = -1 ] && [ "$ALLOW_DOWNGRADE" != 1 ]; then
+            die "拒绝降级：已安装 ${installed}，新包 ${version}。确需降级请显式使用 --allow-downgrade"
+        fi
+    fi
     min=$(plist "$app" LSMinimumSystemVersion)
     os=$(sw_vers -productVersion)
     if [ -n "$min" ] && ! version_le "$min" "$os"; then
@@ -303,7 +355,8 @@ replace() { # new-app
     # Downloads by curl carry no quarantine flag; clear one anyway (a zip
     # opened in Finder first, a copy made by a browser).
     $SUDO xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
-    if ! codesign --verify --strict "$DEST" 2>/dev/null; then
+    if ! codesign --verify --strict -R="$VERIFY_REQUIREMENT" "$DEST" 2>/dev/null \
+        || [ "$(plist "$DEST" CFBundleShortVersionString)" != "$EXPECTED_VERSION" ]; then
         $SUDO rm -rf "$DEST" || true
         die "新版本复制后校验不通过，已恢复原来的版本"
     fi
@@ -329,6 +382,8 @@ if [ -n "$STAGE" ]; then
 fi
 
 quit_running
+# Recheck after the wait, with the signer captured before the old App moves.
+check_app "$NEW"
 replace "$NEW"
 VERSION=$(plist "$DEST" CFBundleShortVersionString)
 say "已安装 AlwaysConnect $VERSION 到 $DEST"

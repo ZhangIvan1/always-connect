@@ -75,6 +75,7 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 # 4d3 boot staleness: no blocking set from an earlier boot (§23.12)
 # 4d3a who may drive the root background service (§36.3)
 "$REPO/scripts/helper-client-test.sh" > /tmp/ac-helper-client.log 2>&1 && pass helper-client || { fail helper-client; grep -E "FAIL" /tmp/ac-helper-client.log || tail -5 /tmp/ac-helper-client.log; }
+"$REPO/scripts/admin-parent-test.sh" && pass admin-parent || fail admin-parent
 "$REPO/scripts/diagnostics-redaction-test.sh" > /tmp/ac-diag-redaction.log 2>&1 && pass diagnostics-redaction || { fail diagnostics-redaction; grep FAIL /tmp/ac-diag-redaction.log || true; }
 "$REPO/scripts/boot-session-test.sh" > /tmp/ac-boot-session.log 2>&1 && pass boot-session || { fail boot-session; grep FAIL /tmp/ac-boot-session.log || true; }
 # 4d4 drop history: episodes, outcomes, retries, old records (§21.22)
@@ -85,12 +86,16 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 "$REPO/scripts/neighbors-test.sh" > /tmp/ac-neighbors.log 2>&1 && pass neighbors || { fail neighbors; grep FAIL /tmp/ac-neighbors.log || true; }
 "$REPO/scripts/connections-test.sh" > /tmp/ac-connections.log 2>&1 && pass connections || { fail connections; grep FAIL /tmp/ac-connections.log || true; }
 "$REPO/scripts/uninstall-test.sh" > /tmp/ac-uninstall.log 2>&1 && pass uninstall || { fail uninstall; grep FAIL /tmp/ac-uninstall.log || true; }
+"$REPO/scripts/privileged-bundle-test.sh" && pass privileged-bundle || fail privileged-bundle
 "$REPO/scripts/connection-check-test.sh" > /tmp/ac-connection-check.log 2>&1 && pass connection-check || { fail connection-check; grep FAIL /tmp/ac-connection-check.log || true; }
 "$REPO/scripts/quit-test.sh" > /tmp/ac-quit.log 2>&1 && pass quit || { fail quit; grep FAIL /tmp/ac-quit.log || true; }
+"$REPO/scripts/settings-transport-test.sh" && pass settings-transport || fail settings-transport
 "$REPO/scripts/update-check-test.sh" > /tmp/ac-update-check.log 2>&1 && pass update-check || { fail update-check; grep FAIL /tmp/ac-update-check.log || true; }
 "$REPO/scripts/install-test.sh" > /tmp/ac-install.log 2>&1 && pass install-script || { fail install-script; grep FAIL /tmp/ac-install.log || true; }
+"$REPO/scripts/install-policy-test.sh" && pass install-policy || fail install-policy
 # 4d4 background-service lifecycle: disconnect / release paths (§二十五)
 "$REPO/scripts/session-test.sh" > /tmp/ac-session.log 2>&1 && pass session || { fail session; grep -E "^FAIL|^==" /tmp/ac-session.log || true; }
+"$REPO/scripts/helper-uid-test.sh" && pass helper-uid || fail helper-uid
 # 4f DNS forwarder for the domain split (DESIGN.md §26.4), loopback fake upstreams
 "$REPO/scripts/dns-forwarder-test.sh" > /tmp/ac-dns-forwarder.log 2>&1 && pass dns-forwarder || { fail dns-forwarder; grep -E "^FAIL" /tmp/ac-dns-forwarder.log; }
 # 4e certificate relay: framing, local mutual TLS, engine through the relay
@@ -108,6 +113,11 @@ if [ -x "$RES/openconnect/bin/openconnect" ]; then
     [ -s "$RES/openconnect/$f" ] || { echo "  missing openconnect/$f"; NOK=0; }; done
   # Every bundled library has a source line.
   grep -q "^openconnect .* https://" "$RES/openconnect/SOURCES" || { echo "  no openconnect source line"; NOK=0; }
+  # Replaced LGPL components require deliberate Terminal installation;
+  # automatic management correctly refuses a broken bundle seal.
+  grep -Fq 'sudo /bin/bash "$APP/Contents/Resources/dev-helper.sh" install' "$RES/openconnect/README-LGPL.txt" \
+    && ! grep -Eq 'and click|App settings, which copies' "$RES/openconnect/README-LGPL.txt" \
+    || { echo "  obsolete LGPL component installation guidance"; NOK=0; }
 fi
 [ $NOK = 1 ] && pass app-notices || fail app-notices
 grep -q "^SKIP" /tmp/ac-relay.log && echo "  (relay skipped: $(grep ^SKIP /tmp/ac-relay.log))" || true

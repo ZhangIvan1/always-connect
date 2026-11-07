@@ -110,11 +110,30 @@ if [ "$ST" = 0 ] && [ "$(version_of "$DEST")" = 0.3.0-beta.1 ] && codesign --ver
     pass fresh-install-newest
 else fail "fresh-install-newest ($ST) $OUT"; fi
 
-# 2 a chosen version over the installed one; nothing left beside it
+# Downgrades, including stable -> prerelease, need a deliberate override.
 run releases.json --version v0.1.0
+if [ "$ST" != 0 ] && echo "$OUT" | grep -q "拒绝降级" && [ "$(version_of "$DEST")" = 0.3.0-beta.1 ]; then
+    pass downgrade-refused
+else fail "downgrade-refused ($ST) $OUT"; fi
+make_app "$WORK/stable" 0.3.0 13.0
+ditto "$WORK/stable/AlwaysConnect.app" "$DEST"
+run releases.json --version v0.3.0-beta.1
+if [ "$ST" != 0 ] && echo "$OUT" | grep -q "拒绝降级"; then pass prerelease-downgrade-refused
+else fail "prerelease-downgrade-refused ($ST) $OUT"; fi
+# A legitimate old binary advertised under a newer tag must be refused.
+echo "[$(rel v99.0.0 false false 0.2.0)]" >"$WWW/mismatch.json"
+run mismatch.json
+if [ "$ST" != 0 ] && echo "$OUT" | grep -q "版本与发布版本不符"; then pass tag-version-mismatch
+else fail "tag-version-mismatch ($ST) $OUT"; fi
+run releases.json --from "$WORK/stable/AlwaysConnect.app" --expected-version 99.0.0
+if [ "$ST" != 0 ] && echo "$OUT" | grep -q "版本与发布版本不符"; then pass from-version-mismatch
+else fail "from-version-mismatch ($ST) $OUT"; fi
+
+# 2 a chosen version over the installed one; nothing left beside it
+run releases.json --version v0.1.0 --allow-downgrade
 if [ "$ST" = 0 ] && [ "$(version_of "$DEST")" = 0.1.0 ] && [ "$(ls -A "$WORK/Applications")" = AlwaysConnect.app ]; then
-    pass replace-with-version
-else fail "replace-with-version ($ST) $OUT"; fi
+    pass allow-downgrade
+else fail "allow-downgrade ($ST) $OUT"; fi
 
 # 3 refusals leave the installed copy alone
 check_refused() { # name expected-text
@@ -175,7 +194,7 @@ else fail "stage-progress-line: $DL"; fi
 xattr -w com.apple.quarantine "0081;00000000;Safari;" "$STAGED"
 sleep 2 & PID=$!
 START=$(date +%s)
-run releases.json --from "$STAGED" --wait-pid "$PID" --yes
+run releases.json --from "$STAGED" --expected-version 0.2.0 --wait-pid "$PID" --yes
 ELAPSED=$(( $(date +%s) - START ))
 if [ "$ST" = 0 ] && [ "$(version_of "$DEST")" = 0.2.0 ] && [ "$ELAPSED" -ge 1 ] && [ ! -e "$STAGE" ] \
     && ! xattr -r "$DEST" 2>/dev/null | grep -q com.apple.quarantine; then
@@ -184,12 +203,12 @@ else fail "from-stage-after-pid ($ST, ${ELAPSED}s) $OUT"; fi
 
 # 5 a broken staged App: refused, installed copy untouched
 mkdir -p "$WORK/broken/AlwaysConnect.app/Contents/MacOS"
-run releases.json --from "$WORK/broken/AlwaysConnect.app" --yes
+run releases.json --from "$WORK/broken/AlwaysConnect.app" --expected-version 0.2.0 --yes
 if [ "$ST" != 0 ] && [ "$(version_of "$DEST")" = 0.2.0 ]; then pass broken-from; else fail "broken-from ($ST) $OUT"; fi
 
 # 6 the one-liner shape: the script read from stdin, nothing else on it
 set +e
-OUT=$(ALWAYSCONNECT_RELEASES_API="$BASE/releases.json" /bin/bash -s -- --app "$DEST" --no-open --version v0.1.0 <"$ROOT/install.sh" 2>&1)
+OUT=$(ALWAYSCONNECT_RELEASES_API="$BASE/releases.json" /bin/bash -s -- --app "$DEST" --no-open --version v0.1.0 --allow-downgrade <"$ROOT/install.sh" 2>&1)
 ST=$?
 set -e
 if [ "$ST" = 0 ] && [ "$(version_of "$DEST")" = 0.1.0 ]; then pass piped-script; else fail "piped-script ($ST) $OUT"; fi
@@ -219,7 +238,7 @@ fi
 (cd "$ROOT/core" && cargo build --release --quiet)
 swiftc -O -parse-as-library "$ROOT/Sources/App/UpdateChecker.swift" "$ROOT/Sources/App/AppQuit.swift" "$ROOT/core/scripts/UpdateInstallTest.swift" \
     "$ROOT/core/target/release/libalwaysconnect_core.a" -o "$WORK/apptest" 2>&1 | grep -v "built for newer" || true
-run releases.json --version v0.1.0
+run releases.json --version v0.1.0 --allow-downgrade
 set +e
 OUT=$("$WORK/apptest" "$BASE/" "$ROOT/install.sh" "$DEST" "$WORK/update.log" fail 2>&1); ST=$?
 set -e
@@ -238,6 +257,34 @@ if [ "$ST" = 0 ] && [ "$(version_of "$DEST")" = 0.2.0 ] && grep -q "已安装 Al
     && [ -z "$(ls -A "$HOME/Library/Caches/com.alwaysconnect.app" 2>/dev/null | grep '^update-' || true)" ]; then
     pass app-update-installed-after-quit
 else fail "app-update-installed-after-quit ($ST) $OUT $(cat "$WORK/update.log" 2>/dev/null)"; fi
+
+# Copy-time replacement by an ad-hoc signed App must fail final signer
+# validation and restore the old App. Only the harness's ditto is wrapped.
+make_app "$WORK/swap" 0.2.0 13.0 "" -
+mkdir -p "$WORK/stubs"
+cat >"$WORK/stubs/ditto" <<'STUB'
+#!/bin/bash
+/usr/bin/ditto "$@" || exit $?
+last=""
+for last in "$@"; do :; done
+if [ "$last" = "$AC_SWAP_DEST" ]; then
+    /bin/rm -rf "$last"
+    /usr/bin/ditto "$AC_SWAP_APP" "$last"
+fi
+STUB
+chmod +x "$WORK/stubs/ditto"
+PATH="$WORK/stubs:$PATH" AC_SWAP_DEST="$DEST" AC_SWAP_APP="$WORK/swap/AlwaysConnect.app" \
+    run releases.json --version v0.2.0
+if [ "$ST" != 0 ] && echo "$OUT" | grep -q "复制后校验不通过" && [ "$(version_of "$DEST")" = 0.2.0 ] \
+    && codesign --verify --strict -R="certificate leaf = H\"$TEST_SIGN_SHA1\"" "$DEST" 2>/dev/null; then
+    pass final-copy-signer-refused-and-rollback
+else fail "final-copy-signer-refused-and-rollback ($ST) $OUT"; fi
+make_app "$WORK/swap-old" 0.1.0 13.0
+PATH="$WORK/stubs:$PATH" AC_SWAP_DEST="$DEST" AC_SWAP_APP="$WORK/swap-old/AlwaysConnect.app" \
+    run releases.json --version v0.2.0
+if [ "$ST" != 0 ] && echo "$OUT" | grep -q "复制后校验不通过" && [ "$(version_of "$DEST")" = 0.2.0 ]; then
+    pass final-copy-old-signed-version-refused
+else fail "final-copy-old-signed-version-refused ($ST) $OUT"; fi
 
 # 9 the scratch directory is gone every time
 if ls -d "${TMPDIR:-/tmp}"/alwaysconnect-install.* >/dev/null 2>&1; then

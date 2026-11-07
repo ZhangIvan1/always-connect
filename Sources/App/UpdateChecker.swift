@@ -227,7 +227,7 @@ final class UpdateChecker: ObservableObject {
                 }
                 return
             }
-            let started = Self.detach(script, ["--from", String(staged), "--app", appPath,
+            let started = Self.detach(script, ["--from", String(staged), "--expected-version", String(update.tag.drop(while: { $0 == "v" })), "--app", appPath,
                                                "--wait-pid", String(getpid()), "--yes"])
             DispatchQueue.main.async {
                 guard started else {

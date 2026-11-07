@@ -274,6 +274,8 @@ jobs:
         run: scripts/diagnostics-redaction-test.sh
       - name: Background-service client check (same certificate only, DESIGN.md §36.3)
         run: scripts/helper-client-test.sh
+      - name: Administrator child authenticates its parent
+        run: scripts/admin-parent-test.sh
       - name: Boot staleness (no blocking set from an earlier boot)
         # Sources/Helper/BootSession.swift (DESIGN.md §23.12). The
         # real reboot is Mac proof.
@@ -283,6 +285,8 @@ jobs:
         # stub and fake-openconnect (DESIGN.md §二十五): every
         # disconnect/release path gives pf back. Real pf is Mac proof.
         run: scripts/session-test.sh
+      - name: Background-service uid ownership
+        run: scripts/helper-uid-test.sh
       - name: Drop history (episodes, outcomes, retries, old records)
         # Sources/App/DropHistory.swift (DESIGN.md §21.22). What a real
         # drop records in the running App is Mac proof.
@@ -305,6 +309,8 @@ jobs:
         # (Cisco, foreign bundles), the from-App detach and wait. The real
         # removal and network restore on a Mac are Mac proof.
         run: scripts/uninstall-test.sh
+      - name: Privileged bundle verification and quoting (no administrator operation)
+        run: scripts/privileged-bundle-test.sh
       - name: Third-party notices match Cargo.lock
         # THIRD_PARTY_NOTICES.md, third_party/rust-crates.txt (DESIGN.md §三十四).
         run: scripts/make-rust-notices.sh --check
@@ -317,6 +323,8 @@ jobs:
         # Settings and the one-click update quit from inside main-queue
         # blocks. The real quit on a Mac is Mac proof.
         run: scripts/quit-test.sh
+      - name: Private settings IPC and process lifetime
+        run: scripts/settings-transport-test.sh
       - name: Update check (GitHub releases list, local fake server)
         # Sources/App/UpdateChecker.swift + core update_check (DESIGN.md
         # §三十三). The real GitHub answer and the panel notice are Mac proof.
@@ -326,6 +334,8 @@ jobs:
         # stage-then-install, quarantine cleared. Quitting a real running
         # App and the real GitHub download are Mac proof.
         run: scripts/install-test.sh
+      - name: Installer version and final-copy policy (signature stub)
+        run: scripts/install-policy-test.sh
       - name: DNS forwarder harness (domain split, loopback fake upstreams)
         # DESIGN.md §26.4: direct names asked of the local DNS and routed
         # before the answer, IPv4 only; other names to the tunnel's DNS
