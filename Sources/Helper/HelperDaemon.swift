@@ -24,6 +24,7 @@ import Security
 final class HelperDaemon: NSObject, NSXPCListenerDelegate {
     private let listener: NSXPCListener
     private let session = HelperSession()
+    private let clientUID = ClientUIDPolicy()
 
     init(machServiceName: String = AlwaysConnectHelperMachService) {
         listener = NSXPCListener(machServiceName: machServiceName)
@@ -180,6 +181,12 @@ final class HelperDaemon: NSObject, NSXPCListenerDelegate {
             return false
         }
         connection.setCodeSigningRequirement(requirement)
+        // The uid is supplied by XPC, never by the caller's payload. Claim
+        // ownership only after signing validation; retain it through grace.
+        guard clientUID.accept(connection.effectiveUserIdentifier) else {
+            fputs("HelperDaemon: refused client from another login session\n", stderr)
+            return false
+        }
         connection.exportedInterface = NSXPCInterface(with: AlwaysConnectHelperProtocol.self)
         connection.exportedObject = session
         connection.remoteObjectInterface = NSXPCInterface(

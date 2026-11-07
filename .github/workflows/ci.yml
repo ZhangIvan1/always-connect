@@ -285,6 +285,8 @@ jobs:
         # stub and fake-openconnect (DESIGN.md §二十五): every
         # disconnect/release path gives pf back. Real pf is Mac proof.
         run: scripts/session-test.sh
+      - name: Background-service uid ownership
+        run: scripts/helper-uid-test.sh
       - name: Drop history (episodes, outcomes, retries, old records)
         # Sources/App/DropHistory.swift (DESIGN.md §21.22). What a real
         # drop records in the running App is Mac proof.
