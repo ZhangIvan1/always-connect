@@ -134,7 +134,7 @@ fetch() { # url file
 # Pick the Release and its two assets from GitHub's list (newest first).
 # JavaScript for Automation reads the JSON: present on every Mac, unlike
 # python3 or jq.
-pick_release() { # list.json tag arch -> "tag<TAB>zip-url<TAB>sha-url" or "ERR <why>"
+pick_release() { # list.json tag arch -> "tag<TAB>zip-url<TAB>sha-url<TAB>zip-bytes" or "ERR <why>"
     cat >"$WORK/pick.js" <<'JS'
 ObjC.import('Foundation');
 function run(argv) {
@@ -157,7 +157,8 @@ function run(argv) {
                 if (assets[k].name === zip.name + '.sha256') sha = assets[k];
             }
         }
-        if (zip && sha) return r.tag_name + '\t' + zip.browser_download_url + '\t' + sha.browser_download_url;
+        if (zip && sha) return r.tag_name + '\t' + zip.browser_download_url + '\t' + sha.browser_download_url
+            + '\t' + (typeof zip.size === 'number' ? zip.size : 0);
         if (want) return 'ERR noasset';
     }
     return seen ? 'ERR noasset' : (want ? 'ERR notag' : 'ERR none');
@@ -167,7 +168,7 @@ JS
 }
 
 download_and_check() { # -> sets NEW to the checked App in $WORK
-    local a list picked tag zip_url sha_url expected actual
+    local a list picked tag zip_url sha_url zip_size expected actual
     a=$(arch)
     say "正在查找 AlwaysConnect 的最新发布…"
     fetch "$API" "$WORK/releases.json" || die "连不上 GitHub，请检查网络后再试"
@@ -179,7 +180,7 @@ download_and_check() { # -> sets NEW to the checked App in $WORK
         "ERR noasset") die "这个发布里没有适合本机（${a}）的安装包" ;;
         ERR*) die "读不懂发布列表" ;;
     esac
-    IFS=$'\t' read -r tag zip_url sha_url <<<"$picked"
+    IFS=$'\t' read -r tag zip_url sha_url zip_size <<<"$picked"
     for url in "$zip_url" "$sha_url"; do
         case "$url" in
             "$DOWNLOAD_PREFIX"*) ;;
@@ -187,7 +188,19 @@ download_and_check() { # -> sets NEW to the checked App in $WORK
         esac
     done
     say "正在下载 ${tag}…"
-    fetch "$zip_url" "$WORK/app.zip" || die "下载失败，请检查网络后再试"
+    if [ -n "$STAGE" ]; then
+        # For the App's progress line (DESIGN.md §38.5): it watches the
+        # file grow towards the size GitHub lists.
+        say "DOWNLOAD $WORK/app.zip ${zip_size:-0}"
+        fetch "$zip_url" "$WORK/app.zip" || die "下载失败，请检查网络后再试"
+    elif [ -t 2 ]; then
+        # In a terminal: curl's progress bar, so a slow link shows as slow.
+        curl -fL -# --proto "$PROTO" --proto-redir "$PROTO" --connect-timeout 15 --max-time 900 --retry 2 \
+            -H "User-Agent: AlwaysConnect-install" "$zip_url" -o "$WORK/app.zip" || die "下载失败，请检查网络后再试"
+    else
+        fetch "$zip_url" "$WORK/app.zip" || die "下载失败，请检查网络后再试"
+    fi
+    say "正在校验…"
     fetch "$sha_url" "$WORK/app.zip.sha256" || die "下载校验文件失败"
     expected=$(awk '{print tolower($1); exit}' "$WORK/app.zip.sha256")
     actual=$(shasum -a 256 "$WORK/app.zip" | awk '{print $1}')

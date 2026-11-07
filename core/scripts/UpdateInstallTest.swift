@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 // Harness for the one-click update (DESIGN.md §35.4): the App's
@@ -40,6 +41,10 @@ struct UpdateInstallTest {
             print("FAIL app-found-update \(String(describing: outcome))")
             exit(1)
         }
+        // Every step the App showed, in order (DESIGN.md §38.5).
+        var steps: [UpdateChecker.InstallStep] = []
+        let watch = UpdateChecker.shared.$installStep.sink { if let step = $0 { steps.append(step) } }
+        defer { watch.cancel() }
         UpdateChecker.shared.install(update)
         print(UpdateChecker.shared.installing ? "PASS app-installing-shown" : "FAIL app-installing-shown")
         spin(until: { quit || !UpdateChecker.shared.installing }, seconds: 60)
@@ -47,6 +52,13 @@ struct UpdateInstallTest {
             // Downloaded and checked; the detached half waits for this
             // process to end before it swaps the App.
             print(quit ? "PASS app-quits-after-staging" : "FAIL app-quits-after-staging \(UpdateChecker.shared.installError ?? "")")
+            let downloads = steps.compactMap { step -> (Int64, Int64)? in
+                if case .downloading(let done, let total) = step { return (done, total) } else { return nil }
+            }
+            let shown = steps.first == .finding && !downloads.isEmpty && downloads.allSatisfy { $0.1 > 0 }
+                && steps.contains(.checking) && steps.last == .restarting
+            print(shown ? "PASS app-progress-steps" : "FAIL app-progress-steps \(steps)")
+            if !shown { exit(1) }
             exit(quit ? 0 : 1)
         }
         let error = UpdateChecker.shared.installError ?? ""

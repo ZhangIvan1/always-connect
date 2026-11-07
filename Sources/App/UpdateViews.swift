@@ -54,12 +54,19 @@ struct UpdateProgress: View {
 
     var body: some View {
         if updates.installing {
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("正在下载并校验 \(update.version)，完成后会自动退出并打开新版…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 4) {
+                if case .downloading(let done, let total) = updates.installStep, total > 0 {
+                    ProgressView(value: Double(min(done, total)), total: Double(total))
+                        .progressViewStyle(.linear)
+                        .controlSize(.small)
+                }
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(Self.stepText(updates.installStep, version: update.version))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         } else if confirming {
             VStack(alignment: .leading, spacing: 4) {
@@ -84,6 +91,25 @@ struct UpdateProgress: View {
                 .font(.caption)
                 .foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+extension UpdateProgress {
+    /// One line per step of a running update (DESIGN.md §38.5).
+    static func stepText(_ step: UpdateChecker.InstallStep?, version: String) -> String {
+        func mb(_ bytes: Int64) -> String { String(format: "%.1f", Double(bytes) / 1_000_000) }
+        switch step {
+        case .downloading(let done, let total) where total > 0:
+            return "正在下载 \(version)：\(mb(min(done, total))) / \(mb(total)) MB（VPN 照常可用）"
+        case .downloading(let done, _):
+            return "正在下载 \(version)：已下载 \(mb(done)) MB（VPN 照常可用）"
+        case .checking:
+            return "正在校验新版…"
+        case .restarting:
+            return "校验通过，正在退出并换上新版，几秒后自动打开…"
+        case .finding, .none:
+            return "正在查找 \(version) 的安装包…"
         }
     }
 }

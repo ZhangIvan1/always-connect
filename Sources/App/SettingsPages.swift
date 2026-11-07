@@ -515,11 +515,12 @@ struct CredentialForm: View {
             Section {
                 TextField("用户名", text: $username)
                 SecureField("密码", text: $password, prompt: Text(passwordPrompt))
-                TextField("Group", text: $group)
+                TextField("Group", text: $group, prompt: Text("一般留空"))
             } header: {
                 Text("登录")
             } footer: {
-                Text("密码存在钥匙串里，所有服务器共用，只能改不能看。登录时如果公司要求，请在手机上确认。")
+                Text("密码存在钥匙串里，所有服务器共用，只能改不能看。登录时如果公司要求，请在手机上确认。"
+                     + "Group 是网关上的登录组，留空就用网关默认的组；只有单位让你选别的组时才填。经 Cisco 连接时用的是 Cisco 自己的设置。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

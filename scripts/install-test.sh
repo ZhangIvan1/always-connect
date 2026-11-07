@@ -68,7 +68,10 @@ publish 0.8.0 13.0 "" "" -
 
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 BASE="http://127.0.0.1:$PORT"
-asset() { printf '{"name":"%s","browser_download_url":"%s/%s"}' "$1" "${2:-$BASE}" "$1"; }
+asset() { # name [url-base]; the size GitHub lists, when the file is here
+    local size; size=$(stat -f %z "$WWW/$1" 2>/dev/null || echo 0)
+    printf '{"name":"%s","size":%s,"browser_download_url":"%s/%s"}' "$1" "$size" "${2:-$BASE}" "$1"
+}
 rel() { # tag draft prerelease version [url-base]
     local z="AlwaysConnect-$4-macos-arm64.zip" x="AlwaysConnect-$4-macos-x86_64.zip"
     printf '{"tag_name":"%s","html_url":"https://github.com/o/r/releases/tag/%s","draft":%s,"prerelease":%s,"assets":[%s,%s,%s,%s]}' "$1" "$1" "$2" "$3" \
@@ -163,6 +166,12 @@ if [ "$ST" = 0 ] && [ "$STAGED" = "$STAGE/AlwaysConnect.app" ] && [ -f "$STAGE/.
     && [ "$(version_of "$DEST")" = 0.1.0 ]; then
     pass stage-only
 else fail "stage-only ($ST) $OUT"; fi
+# the App's progress line: the file being written and the listed size
+DL=$(echo "$OUT" | LC_ALL=C sed -n 's/^DOWNLOAD //p')
+if [ "${DL##* }" = "$(stat -f %z "$WWW/AlwaysConnect-0.2.0-macos-arm64.zip")" ] && [ "${DL##* }" -gt 0 ] \
+    && case "${DL% *}" in */app.zip) true ;; *) false ;; esac && echo "$OUT" | grep -q "正在校验"; then
+    pass stage-progress-line
+else fail "stage-progress-line: $DL"; fi
 xattr -w com.apple.quarantine "0081;00000000;Safari;" "$STAGED"
 sleep 2 & PID=$!
 START=$(date +%s)

@@ -49,6 +49,20 @@ final class UpdateChecker: ObservableObject {
     /// Why the last "更新" stopped; nil when it did not fail.
     @Published private(set) var installError: String?
 
+    /// Where a running "更新" is (DESIGN.md §38.5): the user saw only a
+    /// spinner for two minutes of a slow download. nil = not installing.
+    enum InstallStep: Equatable {
+        case finding
+        /// Bytes on disk so far and the size GitHub lists (0 = unknown).
+        case downloading(done: Int64, total: Int64)
+        case checking
+        /// Staged and checked: the App quits, the new one opens.
+        case restarting
+    }
+    @Published private(set) var installStep: InstallStep?
+    /// Polls the growing download, only while one runs.
+    private var downloadWatch: DispatchSourceTimer?
+
     /// Settable for the harness (scripts/update-check-test.sh) only.
     static var currentVersion: String =
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0"
@@ -187,6 +201,7 @@ final class UpdateChecker: ObservableObject {
         }
         installing = true
         installError = nil
+        installStep = .finding
         // A quarantined App opened from Downloads runs from a read-only
         // translocated copy: install to "应用程序" then.
         let here = Self.installTarget ?? Bundle.main.bundlePath
@@ -197,13 +212,17 @@ final class UpdateChecker: ObservableObject {
             ?? FileManager.default.temporaryDirectory
         let stage = caches.appendingPathComponent("com.alwaysconnect.app/update-\(UUID().uuidString)").path
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let (status, output) = Self.run(script, ["--version", update.tag, "--app", appPath, "--stage", stage])
+            let (status, output) = Self.run(script, ["--version", update.tag, "--app", appPath, "--stage", stage]) {
+                self?.scriptSaid($0)
+            }
+            self?.stopWatchingDownload()
             let lines = output.split(separator: "\n").map(String.init)
             guard status == 0, let staged = lines.last(where: { $0.hasPrefix("STAGED ") })?.dropFirst(7) else {
                 try? FileManager.default.removeItem(atPath: stage)
                 let reason = lines.last(where: { $0.hasPrefix("错误：") }).map { String($0.dropFirst(3)) }
                 DispatchQueue.main.async {
                     self?.installing = false
+                    self?.installStep = nil
                     self?.installError = reason ?? "下载或校验没有完成"
                 }
                 return
@@ -214,9 +233,11 @@ final class UpdateChecker: ObservableObject {
                 guard started else {
                     try? FileManager.default.removeItem(atPath: stage)
                     self?.installing = false
+                    self?.installStep = nil
                     self?.installError = "无法启动更新"
                     return
                 }
+                self?.installStep = .restarting
                 Self.quitApp()
             }
         }
@@ -230,8 +251,10 @@ final class UpdateChecker: ObservableObject {
         return env
     }
 
-    /// Runs the script to the end; its output is a few lines.
-    private static func run(_ script: String, _ arguments: [String]) -> (Int32, String) {
+    /// Runs the script to the end; its output is a few lines, each handed
+    /// to `onLine` as it arrives (on this background thread).
+    private static func run(_ script: String, _ arguments: [String],
+                            onLine: (String) -> Void = { _ in }) -> (Int32, String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [script] + arguments
@@ -242,9 +265,63 @@ final class UpdateChecker: ObservableObject {
         process.standardInput = FileHandle.nullDevice
         do { try process.run() } catch { return (-1, "") }
         try? pipe.fileHandleForWriting.close()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        var all = Data()
+        var pending = Data()
+        while true {
+            let chunk = pipe.fileHandleForReading.availableData
+            if chunk.isEmpty { break }
+            all.append(chunk)
+            pending.append(chunk)
+            while let newline = pending.firstIndex(of: 0x0A) {
+                onLine(String(decoding: pending[pending.startIndex..<newline], as: UTF8.self))
+                pending.removeSubrange(pending.startIndex...newline)
+            }
+        }
         process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+        return (process.terminationStatus, String(decoding: all, as: UTF8.self))
+    }
+
+    /// install.sh's progress lines (DESIGN.md §38.5), on its reader thread.
+    private func scriptSaid(_ line: String) {
+        if line.hasPrefix("DOWNLOAD ") {
+            let rest = line.dropFirst(9)
+            guard let space = rest.lastIndex(of: " ") else { return }
+            let path = String(rest[rest.startIndex..<space])
+            let total = Int64(rest[rest.index(after: space)...]) ?? 0
+            DispatchQueue.main.async { self.installStep = .downloading(done: 0, total: total) }
+            watchDownload(path: path, total: total)
+        } else if line.hasPrefix("正在校验") {
+            stopWatchingDownload()
+            DispatchQueue.main.async { self.installStep = .checking }
+        }
+    }
+
+    /// Twice a second while the download runs, never otherwise.
+    private func watchDownload(path: String, total: Int64) {
+        stopWatchingDownload()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5, leeway: .milliseconds(200))
+        timer.setEventHandler { [weak self] in
+            let size = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.int64Value ?? 0
+            DispatchQueue.main.async {
+                guard let self, case .downloading = self.installStep else { return }
+                self.installStep = .downloading(done: size, total: total)
+            }
+        }
+        downloadLock.lock()
+        downloadWatch = timer
+        downloadLock.unlock()
+        timer.resume()
+    }
+
+    private let downloadLock = NSLock()
+
+    private func stopWatchingDownload() {
+        downloadLock.lock()
+        let timer = downloadWatch
+        downloadWatch = nil
+        downloadLock.unlock()
+        timer?.cancel()
     }
 
     /// Starts the script in the background through a shell that exits at
