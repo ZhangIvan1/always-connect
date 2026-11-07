@@ -209,13 +209,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // still running, and Cisco's own windows.
             DispatchQueue.global(qos: .userInitiated).async {
                 Self.cleanUpBeforeExit(closeCiscoWindows: closeCiscoWindows)
-                DispatchQueue.main.async {
+                // From the run loop, not the main queue (§37): the
+                // reply must land even if terminate was called from
+                // inside a main-queue block.
+                AppQuit.onRunLoop {
                     NSApp.reply(toApplicationShouldTerminate: true)
                 }
             }
         }
         HelperClient.shared.shutdownForQuit { reply() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { reply() }
+        // The 15 s cap is a run-loop timer in every mode, not a main-queue
+        // block: it fires even when the quit was started from inside one
+        // and the main queue is stalled (§37).
+        let cap = Timer(timeInterval: 15, repeats: false) { _ in reply() }
+        RunLoop.main.add(cap, forMode: .common)
         return .terminateLater
     }
 

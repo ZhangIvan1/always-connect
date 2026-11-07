@@ -12,7 +12,9 @@ WORK=$(mktemp -d)
 SERVER=""
 # shellcheck source=scripts/lib-test-identity.sh
 . "$ROOT/scripts/lib-test-identity.sh"
-trap '[ -n "$SERVER" ] && kill $SERVER 2>/dev/null; test_identity_cleanup; rm -rf "$WORK"' EXIT
+# The scratch defaults suite's emptied plist file stays behind otherwise.
+SUITE_PLIST="$HOME/Library/Preferences/com.alwaysconnect.update-install-test.plist"
+trap '[ -n "$SERVER" ] && kill $SERVER 2>/dev/null; test_identity_cleanup; defaults delete com.alwaysconnect.update-install-test >/dev/null 2>&1 || true; rm -f "$SUITE_PLIST"; rm -rf "$WORK"' EXIT
 FAILS=0
 pass() { echo "PASS $1"; }
 fail() { echo "FAIL $1"; FAILS=$((FAILS + 1)); }
@@ -206,7 +208,7 @@ fi
 
 # 8 the App's "更新" button: UpdateChecker + the Rust decision + install.sh
 (cd "$ROOT/core" && cargo build --release --quiet)
-swiftc -O -parse-as-library "$ROOT/Sources/App/UpdateChecker.swift" "$ROOT/core/scripts/UpdateInstallTest.swift" \
+swiftc -O -parse-as-library "$ROOT/Sources/App/UpdateChecker.swift" "$ROOT/Sources/App/AppQuit.swift" "$ROOT/core/scripts/UpdateInstallTest.swift" \
     "$ROOT/core/target/release/libalwaysconnect_core.a" -o "$WORK/apptest" 2>&1 | grep -v "built for newer" || true
 run releases.json --version v0.1.0
 set +e

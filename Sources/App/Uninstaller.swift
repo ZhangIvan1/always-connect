@@ -66,7 +66,7 @@ enum Uninstaller {
                     if AppRole.isSettings {
                         SettingsLink.shared.send("quit")
                     } else {
-                        NSApp.terminate(nil)
+                        AppQuit.request()
                     }
                 }
             }

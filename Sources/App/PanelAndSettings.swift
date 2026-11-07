@@ -224,7 +224,7 @@ struct PanelView: View {
                     if manager.switchIsOn {
                         showConfirmQuit = true
                     } else {
-                        NSApp.terminate(nil)
+                        AppQuit.request()
                     }
                 }
                 .help("断开 VPN、恢复直连网络，并退出 AlwaysConnect")
@@ -236,7 +236,7 @@ struct PanelView: View {
                     Spacer()
                     Button("断开并退出") {
                         showConfirmQuit = false
-                        NSApp.terminate(nil)
+                        AppQuit.request()
                     }
                     Button("取消") { showConfirmQuit = false }
                 }

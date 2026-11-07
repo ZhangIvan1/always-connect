@@ -312,6 +312,11 @@ jobs:
         # Sources/App/ConnectionCheck.swift (DESIGN.md §26.11). The probes
         # and the automatic disconnect in the running App are Mac proof.
         run: scripts/connection-check-test.sh
+      - name: Quit from any caller (terminateLater from main-queue blocks)
+        # Sources/App/AppQuit.swift (DESIGN.md §37): the uninstall from
+        # Settings and the one-click update quit from inside main-queue
+        # blocks. The real quit on a Mac is Mac proof.
+        run: scripts/quit-test.sh
       - name: Update check (GitHub releases list, local fake server)
         # Sources/App/UpdateChecker.swift + core update_check (DESIGN.md
         # §三十三). The real GitHub answer and the panel notice are Mac proof.

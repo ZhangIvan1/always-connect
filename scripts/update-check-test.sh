@@ -7,9 +7,11 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
 SERVER=""
-trap '[ -n "$SERVER" ] && kill $SERVER 2>/dev/null; rm -rf "$WORK"' EXIT
+# The scratch suite's emptied plist file stays behind otherwise.
+SUITE_PLIST="$HOME/Library/Preferences/com.alwaysconnect.update-check-test.plist"
+trap '[ -n "$SERVER" ] && kill $SERVER 2>/dev/null; defaults delete com.alwaysconnect.update-check-test >/dev/null 2>&1 || true; rm -f "$SUITE_PLIST"; rm -rf "$WORK"' EXIT
 (cd "$ROOT/core" && cargo build --release --quiet)
-swiftc -O -parse-as-library "$ROOT/Sources/App/UpdateChecker.swift" "$ROOT/core/scripts/UpdateCheckTest.swift" \
+swiftc -O -parse-as-library "$ROOT/Sources/App/UpdateChecker.swift" "$ROOT/Sources/App/AppQuit.swift" "$ROOT/core/scripts/UpdateCheckTest.swift" \
     "$ROOT/core/target/release/libalwaysconnect_core.a" -o "$WORK/test" 2>&1 | grep -v "built for newer" || true
 
 mkdir -p "$WORK/www"

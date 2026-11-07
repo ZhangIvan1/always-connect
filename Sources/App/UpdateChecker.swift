@@ -164,7 +164,7 @@ final class UpdateChecker: ObservableObject {
     /// The App to replace; nil = this one.
     static var installTarget: String?
     /// The normal quit (VPN off, network direct, §21.5).
-    static var quitApp: () -> Void = { NSApp.terminate(nil) }
+    static var quitApp: () -> Void = { AppQuit.request() }  // never from a main-queue block (§37)
 
     /// Installs the newer version found: install.sh downloads it into a
     /// scratch directory and checks it while this App keeps running (a

@@ -2197,3 +2197,32 @@ DNS 归 Cisco，我们不插手，§二十二）。
   build-local.sh 给 cargo 加 `--remap-path-prefix`（家目录 → `/build`，crate 缓存 → `/cargo/registry/src`）；
   package-release.sh 打包前扫描 App 里所有文件的字符串，出现家目录或 `/Users/<当前用户>` 就拒绝打包。
 - 验证级别：本机打包 v0.2.0 后解包扫描：关键词清单与用户路径零命中。
+
+## 三十七、修正：从设置里卸载时 App 退不掉（2026-11-07，用户："我在程序里点了卸载了，为什么还会在 apps 里面出现，没有删干净吗？"）
+
+### 37.1 现象与证据
+- 用户在设置 → 通用 → 卸载… 输完密码后，"应用程序"里仍有 AlwaysConnect。卸载脚本（§31）先等 App 正常退出再删文件，
+  App 一直没退，脚本等满 60 秒后强制结束它，随后照常删完（事后核对：App、后台服务、随附 openconnect、日志、设置、钥匙串密码都已删除，网络直连）。
+  用户看的时候正好在这 60 秒里。
+- 系统日志：设置进程把"退出"转给菜单栏 App 的同一秒，App 隐藏了菜单栏图标、停掉了证书转接（退出流程已开始），之后再无任何输出；
+  设置进程（App 的子进程，退出收尾会结束它）一直活着，说明 App 停在退出中途，收尾从未执行。
+
+### 37.2 原因
+- App 对退出答 `.terminateLater`，断开 VPN 的各步回调和 15 秒兜底都是主队列上的块；AppKit 在 `terminate` 里开一个嵌套 run loop 等答复。
+  嵌套 run loop 在"正在执行的主队列块"里不会再执行别的主队列块。设置进程发来的"退出"由 DistributedNotificationCenter 的
+  `.main` 观察者处理（OperationQueue.main，也走主队列），于是回调、兜底都排不上，退出永远等下去。
+- 一键更新（§35.4）在 `DispatchQueue.main.async` 里调用退出，App 内卸载在 `asyncAfter` 里调用，同样会卡住。面板"退出"按钮从事件处理里调用，不受影响，
+  所以平时退出正常。
+- 最小 App 实测：在 `DispatchQueue.main.async` 或 `OperationQueue.main` 里调用 `terminate` → 卡住；在计时器或 run loop 块里调用 → 正常退出。
+
+### 37.3 修正
+- 新增 `AppQuit`（Sources/App/AppQuit.swift）：退出一律经 `CFRunLoopPerformBlock`（全部模式）从 run loop 本身发起，不在任何主队列块里。
+  设置转来的退出、App 内卸载、一键更新、面板两个退出按钮都改用它。
+- 双保险：退出收尾的最终答复同样经 run loop 送达；15 秒兜底改成加在全部模式上的 run loop 计时器，即使以后又有人在主队列块里调用退出，
+  最多 15 秒也会退出（不再等卸载脚本的 60 秒强杀，也不跳过正常退出的断开 VPN 步骤）。
+- 顺带：两个 harness（update-check-test、install-test）用的临时偏好域，结束时连同空的 plist 文件一起删除（之前会在 ~/Library/Preferences 留下空文件）。
+
+### 37.4 验证级别
+- CI harness `scripts/quit-test.sh`（已进 local-checks 与 CI macOS）：最小 App 按 `.terminateLater` + 主队列收尾，从主队列块、OperationQueue.main、
+  后台线程、直接调用四种来源经 AppQuit 退出都在 5 秒内结束；旧写法（主队列块里直接 `terminate`）仍然卡住，证明 harness 测得出这个问题。
+- 需实测：真机上从设置卸载时 App 几秒内退出、通知送达（mac-proof I17）；一键更新时 App 正常退出并换版（I20）。

@@ -133,7 +133,7 @@ final class SettingsLink {
         case "refreshStatus": client.refreshStatus()
         case "hotkey": HotkeyManager.shared.apply(ProfileStore.loadAppSettings())
         case "approvalCard": ApprovalPrompt.shared.settingsChanged()
-        case "quit": NSApp.terminate(nil)  // the uninstaller, from Settings
+        case "quit": AppQuit.request()  // the uninstaller, from Settings (not from this block, §37)
         case "installUpdate": UpdateChecker.shared.installAvailable()  // §35.4
         case "pushDirectDomains":
             client.pushDirectDomains { [weak self] ok in self?.reply(id, ok.map { $0 ? "1" : "0" }) }

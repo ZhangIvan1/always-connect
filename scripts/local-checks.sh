@@ -86,6 +86,7 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 "$REPO/scripts/connections-test.sh" > /tmp/ac-connections.log 2>&1 && pass connections || { fail connections; grep FAIL /tmp/ac-connections.log || true; }
 "$REPO/scripts/uninstall-test.sh" > /tmp/ac-uninstall.log 2>&1 && pass uninstall || { fail uninstall; grep FAIL /tmp/ac-uninstall.log || true; }
 "$REPO/scripts/connection-check-test.sh" > /tmp/ac-connection-check.log 2>&1 && pass connection-check || { fail connection-check; grep FAIL /tmp/ac-connection-check.log || true; }
+"$REPO/scripts/quit-test.sh" > /tmp/ac-quit.log 2>&1 && pass quit || { fail quit; grep FAIL /tmp/ac-quit.log || true; }
 "$REPO/scripts/update-check-test.sh" > /tmp/ac-update-check.log 2>&1 && pass update-check || { fail update-check; grep FAIL /tmp/ac-update-check.log || true; }
 "$REPO/scripts/install-test.sh" > /tmp/ac-install.log 2>&1 && pass install-script || { fail install-script; grep FAIL /tmp/ac-install.log || true; }
 # 4d4 background-service lifecycle: disconnect / release paths (§二十五)

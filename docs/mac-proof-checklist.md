@@ -95,6 +95,8 @@ CI 证明不了的项都在这里。每一项跑完后，把实测结论写回 D
   设置 → 通用 → 卸载…（两项都不保留）→ 输开机密码。期望：App 退出、几秒后通知"已卸载，网络已恢复直连"、网页能开；清单里每个路径都不存在；
   `security find-generic-password -s com.alwaysconnect.app` 找不到；`sudo pfctl -a com.apple/300.AlwaysConnect -sr` 为空；
   `launchctl print system/com.alwaysconnect.app.helper` 报不存在；`ls /private/tmp | grep alwaysconnect-uninstall` 为空；Cisco 照常能用。
+  2026-11-07 用户从设置卸载（两项都不保留）：文件、后台服务、钥匙串、网络全部符合，但 App 没有响应退出，脚本等满 60 秒强制结束后才删完（DESIGN §三十七，已修）。
+  修正后复测：点卸载后 App 应在几秒内退出（不是 60 秒），通知送达。
   顺带看系统设置的"通知"和"登录项"里是否还有 AlwaysConnect。
 - [ ] I18 Rust 迁移后的整机复测（DESIGN §32.6–32.13，引擎、网络闸门、Cisco 引擎都已换成 Rust）：经 Cisco 连接、掉线封网与重连、手动断开放行；装新版（后台服务一并更新）后连自建连接、开分流：名单内网站直连、名单外走隧道
   （DNS 转发器已是 Rust）；relay.log 有 `udp channel to gateway ready (en0)` 一类行且大流量网页流畅（DTLS 经 Rust 转发、绑物理网卡）；
