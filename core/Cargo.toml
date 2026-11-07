@@ -17,7 +17,7 @@ openconnect = []
 [dependencies]
 # DNS forwarder and relay sockets (DESIGN.md §32.6): socket options std lacks
 # (interface binding, connect timeout before connect, SO_NOSIGPIPE).
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 libc = "0.2"
 # The split list's regexp: rules; small, no Unicode tables.
 regex-lite = "0.1"
