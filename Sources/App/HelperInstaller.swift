@@ -76,19 +76,8 @@ enum HelperInstaller {
         prompt: String,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        guard let script = Bundle.main.path(forResource: "dev-helper", ofType: "sh"),
-              let helper = bundledHelperPath
-        else {
-            completion(.failure(InstallError.scriptFailed("App 包里缺少安装脚本")))
-            return
-        }
-        func quoted(_ s: String) -> String {
-            "quoted form of \"" + s.replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-        }
-        let source = "do shell script (\(quoted(script))) & \" install \" & (\(quoted(helper))) "
-            + "with prompt \"\(prompt)\" with administrator privileges"
-        AdminScript.run(source) { result in
+        PrivilegedBundle.run(resource: "dev-helper.sh", arguments: ["install"], helper: true,
+                             prompt: prompt) { result in
             if let code = result.errorNumber {
                 completion(.failure(code == -128 ? InstallError.cancelled
                                                  : InstallError.scriptFailed(result.errorMessage ?? "未知错误")))
@@ -104,15 +93,8 @@ enum HelperInstaller {
     /// restores routes/DNS, empties our pf anchor, gives our pf enable
     /// reference back and clears the held state, without the service.
     static func forceRecover(completion: @escaping (Result<Void, Error>) -> Void) {
-        guard let script = Bundle.main.path(forResource: "dev-helper", ofType: "sh") else {
-            completion(.failure(InstallError.scriptFailed("App 包里缺少恢复脚本")))
-            return
-        }
-        let quoted = "quoted form of \"" + script.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-        let source = "do shell script (\(quoted)) & \" recover\" "
-            + "with prompt \"AlwaysConnect 要强制恢复网络（后台服务没有响应）。\" with administrator privileges"
-        AdminScript.run(source) { result in
+        PrivilegedBundle.run(resource: "dev-helper.sh", arguments: ["recover"],
+                             prompt: "AlwaysConnect 要强制恢复网络（后台服务没有响应）。") { result in
             if let code = result.errorNumber {
                 completion(.failure(code == -128 ? InstallError.cancelled
                                                  : InstallError.scriptFailed(result.errorMessage ?? "未知错误")))

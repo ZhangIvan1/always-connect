@@ -2305,3 +2305,8 @@ DNS 归 Cisco，我们不插手，§二十二）。
 ### 39.3 F5：管理员脚本子进程校验父进程
 `--admin-script` 在读取 stdin 前通过 Security.framework 校验父进程的运行代码、同一叶子证书和可执行文件真实路径，校验前后确认 ppid 没变；动态代码校验和路径校验一起限制 PID 复用与替换路径。ad-hoc 开发构建要求相同 designated requirement（代码哈希）及相同路径。外部进程启动此入口会立即以 77 退出，不执行脚本。校验仍是系统 API 薄壳，没有新增常驻计时器。
 验证级别：本机编译；`admin-parent-test.sh --adhoc-only` 验证同一父程序成功、外部父进程拒绝（仅执行返回字符串的 AppleScript，无提权）。完整证书 harness 已尝试，本机临时证书不受信任，codesign 报找不到身份，证书分支未验证；需 CI harness 和 I25 实测。
+
+### 39.4 F1：提权后只执行验签的私有副本
+安装/更新后台服务、强制恢复、恢复网络、卸载全部经 `PrivilegedBundle`：运行中的 App 取得自己的叶子证书哈希并核对运行代码；固定的 root shell 以 umask 077 创建 root 专用临时目录，复制整个 App，拒绝绝对或跨父目录的符号链接，改为 root 所有且不可由组/他人写，再以 `codesign --verify --strict --deep -R` 固定 App 标识和叶子证书校验副本。校验失败给中文错误并退出，成功才运行副本内脚本及后台服务；用完清理副本。卸载脚本的异步后半程仍使用其自己的 root 私有副本。shell 和 AppleScript 分别转义。
+无证书的 ad-hoc 构建可以继续构建和测试，但管理按钮明确拒绝提权并说明使用已有开发证书；终端手动 `sudo …/dev-helper.sh install`、`sudo …/reset-network.sh` 保留，属于用户知情执行，后台服务原有拒绝 ad-hoc 客户端的规则不变。不自动建立长期身份。
+验证级别：本机编译；`privileged-bundle-test.sh` 为脚本级断言（执行顺序、两层转义、AppleScript 编译、bash 语法），并用真实 codesign 验证 ad-hoc 不满足证书 pin、改过的资源验签失败；未执行 root bootstrap。管理员安装/恢复/卸载及有效签名通过路径需实测（I26）。无新增常驻逻辑；改前/后 footprint、CPU、唤醒需实测。

@@ -86,6 +86,7 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 "$REPO/scripts/neighbors-test.sh" > /tmp/ac-neighbors.log 2>&1 && pass neighbors || { fail neighbors; grep FAIL /tmp/ac-neighbors.log || true; }
 "$REPO/scripts/connections-test.sh" > /tmp/ac-connections.log 2>&1 && pass connections || { fail connections; grep FAIL /tmp/ac-connections.log || true; }
 "$REPO/scripts/uninstall-test.sh" > /tmp/ac-uninstall.log 2>&1 && pass uninstall || { fail uninstall; grep FAIL /tmp/ac-uninstall.log || true; }
+"$REPO/scripts/privileged-bundle-test.sh" && pass privileged-bundle || fail privileged-bundle
 "$REPO/scripts/connection-check-test.sh" > /tmp/ac-connection-check.log 2>&1 && pass connection-check || { fail connection-check; grep FAIL /tmp/ac-connection-check.log || true; }
 "$REPO/scripts/quit-test.sh" > /tmp/ac-quit.log 2>&1 && pass quit || { fail quit; grep FAIL /tmp/ac-quit.log || true; }
 "$REPO/scripts/update-check-test.sh" > /tmp/ac-update-check.log 2>&1 && pass update-check || { fail update-check; grep FAIL /tmp/ac-update-check.log || true; }

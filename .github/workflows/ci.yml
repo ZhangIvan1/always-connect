@@ -307,6 +307,8 @@ jobs:
         # (Cisco, foreign bundles), the from-App detach and wait. The real
         # removal and network restore on a Mac are Mac proof.
         run: scripts/uninstall-test.sh
+      - name: Privileged bundle verification and quoting (no administrator operation)
+        run: scripts/privileged-bundle-test.sh
       - name: Third-party notices match Cargo.lock
         # THIRD_PARTY_NOTICES.md, third_party/rust-crates.txt (DESIGN.md §三十四).
         run: scripts/make-rust-notices.sh --check

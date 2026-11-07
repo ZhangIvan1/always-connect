@@ -75,8 +75,8 @@ install)
     chmod 700 "$LOGDIR"
     install -o root -g wheel -m 755 "$src" "$BIN"
     # The App's own openconnect (DESIGN.md §27.3), next to the daemon in a
-    # root-only place: the App bundle is user-writable and root never
-    # runs anything from it.
+    # root-only place. App-driven installation uses a verified root-owned
+    # snapshot (PrivilegedBundle); manual sudo is a deliberate developer action.
     oc="$(cd "$(dirname "$src")/../.." && pwd)/Resources/openconnect"
     if [ -x "$oc/bin/openconnect" ]; then
         rm -rf "$OCDIR"
