@@ -2060,8 +2060,11 @@ DNS 归 Cisco，我们不插手，§二十二）。
   失败时回落到 ftp.gnu.org，单个下载有超时。把 App 交给别人的人附上这些源码包或在同一位置提供下载。
 - 补齐许可证正文：Homebrew 对 gnutls、nettle、gettext、libtasn1 只装了 GPL 正文或缺 LGPL 正文，现在 `openconnect/licenses/`
   另放 LGPL-2.1、LGPL-3.0、GPL-2.0、GPL-3.0 全文（仓库 `third_party/licenses/`）。
-- 可替换：App 不链接这些库，只把 `bin/openconnect` 当独立程序运行，它经 `@loader_path` 加载 `lib/`；App 与后台服务都不校验其哈希。
-  `openconnect/README-LGPL.txt` 写明替换步骤（换文件 → `codesign --force --sign -` → 安装/更新后台服务）。替换后实际能否运行需实测。
+- 可替换：App 不链接这些库，只把 `bin/openconnect` 当独立程序运行，它经 `@loader_path` 加载 `lib/`。替换同名兼容组件并在组件目录执行
+  `codesign --force --sign - lib/*.dylib bin/openconnect` 后，先退出 App（VPN 断开），再由用户主动在终端安装：
+  `APP=/Applications/AlwaysConnect.app`，然后执行 `sudo /bin/bash "$APP/Contents/Resources/dev-helper.sh" install "$APP/Contents/Library/LaunchDaemons/AlwaysConnectHelper"`。
+  脚本从所给 Helper 同一 App 的 Resources/openconnect 复制组件到 root 专属位置。App 内管理按钮只接受原证书签名且完整未改动的 App；组件替换破坏整包封印，ad-hoc 签名不能恢复原证书，自动提权必须拒绝（§39.4）。
+  `openconnect/README-LGPL.txt` 随包给出该手动流程；用户明确执行的终端路径不放宽自动验签。替换后实际能否运行需实测。
 - 更正 README 旧说法："OpenConnect CLI 是 GPL"不对，openconnect 整个项目是 LGPL-2.1。
 
 ### 34.3 定位与示例（界面改动，见 UI-DESIGN；验证级别：编译 + ListRulesTest）
@@ -2191,6 +2194,7 @@ DNS 归 Cisco，我们不插手，§二十二）。
 - 每次发布由 `package-release.sh` 一并生成 `AlwaysConnect-<版本>-third-party-sources.tar.gz`（按 SOURCES 下载并校验），
   与安装包放在同一个 Release 里，满足 LGPL"在同一位置提供对应源码"。
 - 复核：THIRD_PARTY_NOTICES 与实际打包的 13 个库一一对应；自带的 vpnc-script 是独立实现（与 GPL 版只有两行普通判断相同）。
+- 组件替换按 §34.2 的主动终端安装流程；§39.4 的 App 内管理按钮不接受修改后或 ad-hoc 重签的 App，防止用户可写包变成 root 执行入口。
 
 ### 36.5 发布包里不能有构建机的路径（2026-11-07，发布前扫描发现）
 - Rust 的 panic 位置字符串带源码路径，crate 缓存在构建者家目录下（`~/.cargo/registry`），于是二进制里出现了构建机的用户名。
@@ -2309,6 +2313,7 @@ DNS 归 Cisco，我们不插手，§二十二）。
 ### 39.4 F1：提权后只执行验签的私有副本
 安装/更新后台服务、强制恢复、恢复网络、卸载全部经 `PrivilegedBundle`：运行中的 App 取得自己的叶子证书哈希并核对运行代码；固定的 root shell 以 umask 077 创建 root 专用临时目录，复制整个 App，拒绝绝对或跨父目录的符号链接，改为 root 所有且不可由组/他人写，再以 `codesign --verify --strict --deep -R` 固定 App 标识和叶子证书校验副本。校验失败给中文错误并退出，成功才运行副本内脚本及后台服务；用完清理副本。卸载脚本的异步后半程仍使用其自己的 root 私有副本。shell 和 AppleScript 分别转义。
 无证书的 ad-hoc 构建可以继续构建和测试，但管理按钮明确拒绝提权并说明使用已有开发证书；终端手动 `sudo …/dev-helper.sh install`、`sudo …/reset-network.sh` 保留，属于用户知情执行，后台服务原有拒绝 ad-hoc 客户端的规则不变。不自动建立长期身份。
+LGPL 组件替换也使用 §34.2、§36.4 和随包 README-LGPL.txt 的主动终端流程，不能再通过 App 管理按钮安装修改后的包（R1 文档修正）。验证级别：说明生成和脚本级断言；实际替换安装需实测。
 验证级别：本机编译；`privileged-bundle-test.sh` 为脚本级断言（执行顺序、两层转义、AppleScript 编译、bash 语法），并用真实 codesign 验证 ad-hoc 不满足证书 pin、改过的资源验签失败；未执行 root bootstrap。管理员安装/恢复/卸载及有效签名通过路径需实测（I26）。无新增常驻逻辑；改前/后 footprint、CPU、唤醒需实测。
 
 ### 39.5 F4：设置进程使用匿名私有通道

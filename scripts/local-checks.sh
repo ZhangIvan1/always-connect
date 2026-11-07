@@ -113,6 +113,11 @@ if [ -x "$RES/openconnect/bin/openconnect" ]; then
     [ -s "$RES/openconnect/$f" ] || { echo "  missing openconnect/$f"; NOK=0; }; done
   # Every bundled library has a source line.
   grep -q "^openconnect .* https://" "$RES/openconnect/SOURCES" || { echo "  no openconnect source line"; NOK=0; }
+  # Replaced LGPL components require deliberate Terminal installation;
+  # automatic management correctly refuses a broken bundle seal.
+  grep -Fq 'sudo /bin/bash "$APP/Contents/Resources/dev-helper.sh" install' "$RES/openconnect/README-LGPL.txt" \
+    && ! grep -Eq 'and click|App settings, which copies' "$RES/openconnect/README-LGPL.txt" \
+    || { echo "  obsolete LGPL component installation guidance"; NOK=0; }
 fi
 [ $NOK = 1 ] && pass app-notices || fail app-notices
 grep -q "^SKIP" /tmp/ac-relay.log && echo "  (relay skipped: $(grep ^SKIP /tmp/ac-relay.log))" || true
