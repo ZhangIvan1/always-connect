@@ -92,6 +92,7 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
 "$REPO/scripts/settings-transport-test.sh" && pass settings-transport || fail settings-transport
 "$REPO/scripts/update-check-test.sh" > /tmp/ac-update-check.log 2>&1 && pass update-check || { fail update-check; grep FAIL /tmp/ac-update-check.log || true; }
 "$REPO/scripts/install-test.sh" > /tmp/ac-install.log 2>&1 && pass install-script || { fail install-script; grep FAIL /tmp/ac-install.log || true; }
+"$REPO/scripts/install-policy-test.sh" && pass install-policy || fail install-policy
 # 4d4 background-service lifecycle: disconnect / release paths (§二十五)
 "$REPO/scripts/session-test.sh" > /tmp/ac-session.log 2>&1 && pass session || { fail session; grep -E "^FAIL|^==" /tmp/ac-session.log || true; }
 # 4f DNS forwarder for the domain split (DESIGN.md §26.4), loopback fake upstreams

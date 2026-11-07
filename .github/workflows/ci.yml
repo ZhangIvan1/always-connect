@@ -332,6 +332,8 @@ jobs:
         # stage-then-install, quarantine cleared. Quitting a real running
         # App and the real GitHub download are Mac proof.
         run: scripts/install-test.sh
+      - name: Installer version and final-copy policy (signature stub)
+        run: scripts/install-policy-test.sh
       - name: DNS forwarder harness (domain split, loopback fake upstreams)
         # DESIGN.md §26.4: direct names asked of the local DNS and routed
         # before the answer, IPv4 only; other names to the tunnel's DNS
