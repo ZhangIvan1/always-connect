@@ -26,7 +26,7 @@ jobs:
   rust-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libopenconnect-dev ocserv openconnect
       - name: Start test gateway
@@ -57,7 +57,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Rust tests (macOS, default features)
         working-directory: core
         run: cargo test
