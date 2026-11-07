@@ -403,7 +403,10 @@ struct PanelView: View {
     /// The engine's own words under the headline (retry count, last
     /// notice); for a plain disconnect, what "未连接" means.
     private var subtitle: String {
-        if !manager.hasCredentials { return "先填服务器、账号和密码" }
+        if !manager.hasCredentials {
+            // Servers usually come from the Mac's Cisco (§三十八).
+            return ProfileStore.loadProfile().servers.isEmpty ? "先填服务器、账号和密码" : "先填账号和密码"
+        }
         if manager.state == .disconnected, !manager.networkHeld { return "VPN 已关，正在用本地网络上网" }
         if manager.state == .reconnecting { return manager.stateLine }
         return manager.detail.isEmpty ? manager.stateLine : manager.detail
@@ -413,7 +416,9 @@ struct PanelView: View {
     @ViewBuilder private var primaryButton: some View {
         let red = manager.state == .reconnecting || manager.networkHeld
         if !manager.hasCredentials {
-            Button("填写服务器与账号") { onOpenSettings("credentials") }
+            Button(ProfileStore.loadProfile().servers.isEmpty ? "填写服务器与账号" : "填写账号与密码") {
+                onOpenSettings("credentials")
+            }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .frame(maxWidth: .infinity)

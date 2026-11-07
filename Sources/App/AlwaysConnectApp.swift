@@ -90,6 +90,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // updating a background service older than this App (one
         // password prompt, §30.5), so the update never lands on a live
         // session.
+        // Servers saved in the Mac's Cisco join the list, changes there
+        // are followed (DESIGN.md §三十八): read-only, once per launch.
+        ProfileStore.syncWithCisco()
         let profile = ProfileStore.loadProfile()
         HelperClient.shared.updateHelperAtLaunch(thenConnect: profile.autoConnectOnLaunch)
         // Global hotkey (General page): toggles the connection.

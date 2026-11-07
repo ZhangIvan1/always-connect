@@ -2226,3 +2226,45 @@ DNS 归 Cisco，我们不插手，§二十二）。
 - CI harness `scripts/quit-test.sh`（已进 local-checks 与 CI macOS）：最小 App 按 `.terminateLater` + 主队列收尾，从主队列块、OperationQueue.main、
   后台线程、直接调用四种来源经 AppQuit 退出都在 5 秒内结束；旧写法（主队列块里直接 `terminate`）仍然卡住，证明 harness 测得出这个问题。
 - 需实测：真机上从设置卸载时 App 几秒内退出、通知送达（mac-proof I17）；一键更新时 App 正常退出并换版（I20）。
+
+## 三十八、从本机 Cisco 自动导入服务器（2026-11-07，用户："希望 app 在安装时能够自动读出来 anyconnect 上已经保存的 vpn 链接地址与描述信息，然后使用时走钥匙串保存的密码或者提示用户输入"）
+
+### 38.1 现状与缺口
+- §21.13 起服务器列表在"列表为空"时从 Cisco 配置导入一次（Swift XMLParser，只取 HostName → HostAddress），之后再不看 Cisco：
+  Cisco 里新增、改地址、删掉的条目都不跟；默认选按名称排第一的，而不是 Cisco 上次连的那台；Cisco 记的用户名、组不预填；
+  同一条目出现在两个 profile 文件里时靠"按名称去重"碰巧没重复，手加过同一地址的服务器会和导入的并列两条。
+- 本机实测（只读，结论只写形状）：Secure Client 5 的 profile 目录有 4 个 XML，HostEntry 共 5 条、去重后 4 台（一条在两个文件里重复）；
+  HostAddress 都是"主机:端口"，没有 UserGroup；另有 `mgmttun/` 子目录（管理隧道，不是用户可选的服务器）。
+  偏好文件 `/opt/cisco/secureclient/vpn/.anyconnect_global` 的 `DefaultHostName` 是其中一条的主机名（不带端口、不是条目名），
+  `DefaultHostAddress` 是另一个主机（与任何条目都对不上），`DefaultUser`、`DefaultGroup` 为空；没有 `~/.anyconnect`。
+
+### 38.2 做法
+- 解析与合并移到 Rust（core/src/cisco_import.rs，经 `ac_cisco_sync` / `ac_cisco_snapshot` 交换 JSON）；Swift 的 CiscoProfiles 只剩路径与薄壳，
+  原 XMLParser 删除，连接时的条目名 → 地址（§20.6）、Cisco 引擎的网关放行表也改用同一份解析。Cisco 的文件只读不写。
+- 来源：profile 目录（`/opt/cisco/secureclient/vpn/profile`、旧版 `/opt/cisco/anyconnect/profile`）顶层的 `*.xml`，文件按名排序，同名条目先到先得；
+  子目录不读。只取 HostEntry 自己的 HostName / HostAddress / UserGroup（备用服务器、负载均衡列表里的 HostAddress 是别的网关，不取）；
+  没有 HostAddress 时 HostName 本身就是地址（Cisco 的 schema 如此）；有 UserGroup 且地址没有路径时拼成"地址/组"（Cisco 的组 URL，§23 的地址解析认这种写法）。
+  偏好文件：Secure Client 5 的全机文件、旧 AnyConnect 的 `~/.anyconnect` 与全机文件；记着服务器的、最新写入的优先，其余字段从别的文件补。
+- 合并规则（每条都有 cargo test）：
+  1. 新条目加到列表末尾，带"Cisco"小标、按条目名连接（§21.13 不变）。
+  2. 已导入的条目 Cisco 里改了地址就跟着改；用户改过的显示名保留。
+  3. Cisco 里没了的条目不删：转成普通条目、保留最后的地址；正选着它时，选择跟着变成这个地址。Cisco 读不到或一条都没有时（没装、权限、文件损坏）一律不动。
+  4. Cisco 改名（地址不变）：原条目换成新名字，位置、选择都保留，不出现一新一旧两条。
+  5. 手加过同一地址的服务器（主机名大小写、`https://`、默认端口 443、末尾斜杠都视为相同）直接挂到 Cisco 条目上，不重复列出。
+  6. 用户删掉的条目（或手改地址、从 Cisco 条目变成普通条目的）记进 Profile.dismissedCisco，自动同步不再加回；账号页"从 Cisco 重新导入"清掉这份记录、全部重新取。
+  7. 还没选服务器（首次运行）或选的那台没了：选 Cisco 上次连的那台——按条目名、显示名或主机（偏好里带端口时连端口）匹配 `DefaultHostName`，
+     它为空时用 `DefaultHostAddress`；上次连的是直接敲进 Cisco 的地址（不是任何条目）时，把它作为普通条目加进来并选上；都没有就选第一台。
+  8. 老版本只存了一个服务器的配置：那台照旧放在列表最前（§21.13 不变）。
+- 什么时候同步（无计时器、不监视文件，开销不变）：App 每次启动时一次（在自动连接之前）；账号页（含首次向导的账号一步）每次显示时一次，
+  有变化就在列表下面一行灰字说明"已从 Cisco 同步：新增…；更新…；…已不在 Cisco 里，保留为普通服务器"；点"从 Cisco 重新导入"总会给一句结果
+  （含"已和 Cisco 一致（N 台）""本机 Cisco 里没有找到保存的服务器"）。Cisco 在连接时会从网关下载更新的 profile，所以下次启动就能跟上。
+- 读不到时的回退：没装 Cisco 或没有条目时列表为空，脚注提示"点「添加服务器」填网关地址"，与以前手填一致；不显示"重新导入"按钮（没有 Cisco 目录时）。
+- 账号与密码：用户名、Group 在第一次保存前用 Cisco 记的 `DefaultUser`、`DefaultGroup` 预填（只填表单，不自动保存，所以首次向导照常出现）。
+  密码照旧：有钥匙串密码就用（§21.12，每次运行最多读一次），没有时面板按钮写"填写账号与密码"（列表还空时仍是"填写服务器与账号"），直达账号页。
+
+### 38.3 验证级别
+- Rust 单元测试（cargo test，CI 两路）：profile 与偏好的解析（备用服务器不混入、命名空间前缀、CDATA、实体、残缺 XML）、读目录（子目录与非 XML 跳过、
+  重复去重、偏好文件取舍）与上面 8 条合并规则、再同步一次无变化。夹具只用 VPN-A… 与 example.com。
+- 脚本级：scripts/list-rules-test.sh 现在连同 Rust 库一起编 CiscoProfiles.swift。
+- 本机只读实测：用 App 的 CiscoProfiles 与 Rust 库读本机真实 Cisco 文件：得到 4 台（5 条去重），默认选中的正是偏好里上次连接的那台，局域网偏好照常读出。
+- 需实测：账号页与首次向导的实际外观（"从 Cisco 重新导入"按钮、同步说明行）、删条目后重启不回来、重新导入后回来；Cisco 下发新 profile 后重启 App 跟上（mac-proof I22）。

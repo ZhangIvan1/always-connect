@@ -6,6 +6,7 @@
 
 pub mod backoff;
 pub mod cisco;
+pub mod cisco_import;
 pub mod connections;
 pub mod direct_routes;
 pub mod dns_forwarder;

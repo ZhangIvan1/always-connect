@@ -22,32 +22,103 @@ enum ProfileStore {
         return profile
     }
 
-    /// The user's server list (DESIGN.md §21.13). Filled once from the
-    /// local Cisco profile (VPN-A, VPN-B, ...), and always containing
-    /// the selected server, so an older single-server profile carries
-    /// over unchanged.
+    /// The user's server list (DESIGN.md §21.13), always containing the
+    /// selected server. An empty list is filled from the Mac's Cisco
+    /// profiles first (§三十八); the full sync runs at launch and when
+    /// the list is shown, not on every read.
     static func loadServers() -> [ServerEntry] {
+        let profile = loadProfile()
+        let selectedListed = profile.servers.contains { $0.target == profile.server }
+        if profile.servers.isEmpty || (!profile.server.isEmpty && !selectedListed) {
+            syncWithCisco()
+            return loadProfile().servers
+        }
+        return profile.servers
+    }
+
+    /// What one sync with Cisco did (names as the list shows them).
+    struct CiscoSync {
+        var added: [String]
+        var updated: [String]
+        var detached: [String]
+        /// Entries in Cisco's profiles; 0 = Cisco not readable or empty.
+        var found: Int
+        /// Cisco's last-used server as the list names it ("" = none).
+        var last_used: String
+        var changed: Bool
+    }
+
+    private struct SyncServer: Codable {
+        var id: String
+        var name: String
+        var address: String
+        var cisco_name: String?
+    }
+
+    private struct SyncRequest: Encodable {
+        var servers: [SyncServer]
+        var selected: String
+        var dismissed: [String]
+        var force: Bool
+        var profile_dirs: [String]
+        var preference_files: [String]
+    }
+
+    private struct SyncAnswer: Decodable {
+        var servers: [SyncServer]
+        var selected: String
+        var dismissed: [String]
+        var added: [String]
+        var updated: [String]
+        var detached: [String]
+        var found: Int
+        var last_used: String
+        var changed: Bool
+    }
+
+    /// Bring the server list in step with the Mac's Cisco profiles
+    /// (DESIGN.md §三十八; the merge is the Rust core's,
+    /// core/src/cisco_import.rs): new entries added, changed addresses
+    /// followed, entries gone from Cisco kept as plain ones, Cisco's last
+    /// server selected when nothing is. `force` (the "从 Cisco 重新导入"
+    /// button) also brings back entries the user removed. Cisco's files
+    /// are only read. nil = the core gave no answer.
+    @discardableResult
+    static func syncWithCisco(force: Bool = false) -> CiscoSync? {
         var profile = loadProfile()
-        var servers = profile.servers
-        if servers.isEmpty {
-            for (name, address) in CiscoProfiles.hostEntries().sorted(by: { $0.key < $1.key }) {
-                servers.append(ServerEntry(name: name, address: address, ciscoName: name))
-            }
+        let request = SyncRequest(
+            servers: profile.servers.map {
+                SyncServer(id: $0.id.uuidString, name: $0.name, address: $0.address, cisco_name: $0.ciscoName)
+            },
+            selected: profile.server,
+            dismissed: profile.dismissedCisco,
+            force: force,
+            profile_dirs: CiscoProfiles.directories,
+            preference_files: CiscoProfiles.preferenceFiles)
+        guard let answer: SyncAnswer = CiscoProfiles.callJSON(ac_cisco_sync, request) else { return nil }
+        let servers = answer.servers.map {
+            ServerEntry(id: UUID(uuidString: $0.id) ?? UUID(), name: $0.name,
+                        address: $0.address, ciscoName: $0.cisco_name)
         }
-        if !profile.server.isEmpty, !servers.contains(where: { $0.target == profile.server }) {
-            servers.insert(ServerEntry(name: profile.server, address: profile.server), at: 0)
-        }
-        // Nothing shipped as the server (§27.1): the first entry found
-        // in the Mac's Cisco profile is the starting choice.
-        if profile.server.isEmpty, let first = servers.first {
-            profile.server = first.target
-            saveProfile(profile)
-        }
-        if servers != profile.servers {
+        if servers != profile.servers || answer.selected != profile.server
+            || answer.dismissed != profile.dismissedCisco {
             profile.servers = servers
+            profile.server = answer.selected
+            profile.dismissedCisco = answer.dismissed
             saveProfile(profile)
         }
-        return servers
+        return CiscoSync(added: answer.added, updated: answer.updated, detached: answer.detached,
+                         found: answer.found, last_used: answer.last_used, changed: answer.changed)
+    }
+
+    /// The user removed a server, or turned a Cisco entry into a plain
+    /// one: the automatic sync must not bring the Cisco entry back.
+    static func dismissCisco(_ keys: [String]) {
+        var profile = loadProfile()
+        for key in keys where !key.isEmpty && !profile.dismissedCisco.contains(key) {
+            profile.dismissedCisco.append(key)
+        }
+        saveProfile(profile)
     }
 
     static func saveServers(_ servers: [ServerEntry], selected: String? = nil) {

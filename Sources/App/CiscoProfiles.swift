@@ -29,13 +29,7 @@ enum CiscoProfiles {
     /// ~/.anyconnect. The first file that mentions it wins. nil = no
     /// preferences file mentions it yet (the profile default, off).
     static func localLanAccessEnabled() -> Bool? {
-        let candidates = [
-            "/opt/cisco/secureclient/vpn/.anyconnect_global",
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".anyconnect").path,
-            "/opt/cisco/anyconnect/.anyconnect_global",
-        ]
-        for path in candidates {
+        for path in preferenceFiles {
             guard let text = try? String(contentsOfFile: path, encoding: .utf8),
                   text.contains("<LocalLanAccess")
             else { continue }
@@ -53,61 +47,75 @@ enum CiscoProfiles {
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true"
     }
 
+    /// Cisco's preferences files, newest wins for the last connection
+    /// (DESIGN.md §三十八): Secure Client 5's machine-wide file, an older
+    /// AnyConnect's per-user and machine-wide ones.
+    static var preferenceFiles: [String] {
+        [
+            "/opt/cisco/secureclient/vpn/.anyconnect_global",
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".anyconnect").path,
+            "/opt/cisco/anyconnect/.anyconnect_global",
+        ]
+    }
+
+    /// Cisco is installed here, or once was (a profile folder exists).
+    static var isPresent: Bool {
+        directories.contains { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    struct Snapshot: Decodable {
+        struct Entry: Decodable { var name: String; var address: String }
+        struct Preferences: Decodable {
+            var host_name: String
+            var host_address: String
+            var user: String
+            var group: String
+        }
+        var entries: [Entry]
+        var preferences: Preferences
+    }
+
+    /// Cisco's entries and last connection, read by the Rust core
+    /// (core/src/cisco_import.rs). Cisco's files are only read.
+    static func snapshot() -> Snapshot? {
+        let request: [String: [String]] = ["profile_dirs": directories, "preference_files": preferenceFiles]
+        return callJSON(ac_cisco_snapshot, request)
+    }
+
     /// HostName -> HostAddress across every profile; the first
     /// profile (by file name) to define a name wins.
     static func hostEntries() -> [String: String] {
         var entries: [String: String] = [:]
-        let fm = FileManager.default
-        for dir in directories {
-            guard let files = try? fm.contentsOfDirectory(atPath: dir) else { continue }
-            for file in files.sorted() where file.hasSuffix(".xml") {
-                let url = URL(fileURLWithPath: dir).appendingPathComponent(file)
-                guard let parser = XMLParser(contentsOf: url) else { continue }
-                let collector = HostEntryCollector()
-                parser.delegate = collector
-                parser.parse()
-                for (name, address) in collector.entries where entries[name] == nil {
-                    entries[name] = address
-                }
-            }
+        for entry in snapshot()?.entries ?? [] where entries[entry.name] == nil {
+            entries[entry.name] = entry.address
         }
         return entries
     }
-}
 
-private final class HostEntryCollector: NSObject, XMLParserDelegate {
-    var entries: [(String, String)] = []
-    private var inHostEntry = false
-    private var name = ""
-    private var address = ""
-    private var text = ""
+    /// The user name Cisco last logged in with ("" = none).
+    static func lastUser() -> String { snapshot()?.preferences.user ?? "" }
 
-    func parser(_ parser: XMLParser, didStartElement elementName: String,
-                namespaceURI: String?, qualifiedName: String?,
-                attributes: [String: String] = [:]) {
-        if elementName == "HostEntry" {
-            inHostEntry = true
-            name = ""
-            address = ""
-        }
-        text = ""
-    }
+    /// The group Cisco last used ("" = the gateway's default).
+    static func lastGroup() -> String { snapshot()?.preferences.group ?? "" }
 
-    func parser(_ parser: XMLParser, foundCharacters string: String) {
-        text += string
-    }
-
-    func parser(_ parser: XMLParser, didEndElement elementName: String,
-                namespaceURI: String?, qualifiedName: String?) {
-        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        switch elementName {
-        case "HostName" where inHostEntry: name = value
-        case "HostAddress" where inHostEntry: address = value
-        case "HostEntry":
-            if !name.isEmpty, !address.isEmpty { entries.append((name, address)) }
-            inHostEntry = false
-        default: break
-        }
-        text = ""
+    /// One JSON request to the core, one JSON answer back.
+    static func callJSON<Request: Encodable, Answer: Decodable>(
+        _ function: (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?, _ request: Request
+    ) -> Answer? {
+        guard let data = try? JSONEncoder().encode(request),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+        guard let reply = text.withCString({ function($0) }) else { return nil }
+        defer { cisco_string_free(reply) }
+        return try? JSONDecoder().decode(Answer.self, from: Data(String(cString: reply).utf8))
     }
 }
+
+@_silgen_name("ac_cisco_snapshot")
+func ac_cisco_snapshot(_ request: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+// Same symbol as CertificateRelay's ac_string_free, declared here too so
+// this file builds alone in the test harnesses.
+@_silgen_name("ac_string_free")
+private func cisco_string_free(_ s: UnsafeMutablePointer<CChar>?)
+@_silgen_name("ac_cisco_sync")
+func ac_cisco_sync(_ request: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?

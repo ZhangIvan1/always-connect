@@ -41,9 +41,13 @@ struct Profile: Codable, Equatable {
     /// since §26.13 the split list and the detected local network feed
     /// the allowlist (AppSettings.effectiveAllowNetworks); no fixed LAN.
     var allowNetworks: [String] = []
-    /// The user's server list (DESIGN.md §21.13). Empty until first
-    /// filled from the Cisco profile.
+    /// The user's server list (DESIGN.md §21.13). Kept in step with the
+    /// Mac's Cisco profiles (§三十八).
     var servers: [ServerEntry] = []
+    /// Cisco entry names and addresses the user removed from the list
+    /// (or detached by editing the address): the automatic sync with
+    /// Cisco leaves them out until "从 Cisco 重新导入" (DESIGN.md §三十八).
+    var dismissedCisco: [String] = []
 
     init() {}
 
@@ -60,6 +64,7 @@ struct Profile: Codable, Equatable {
         defaultMode = try c.decodeIfPresent(DefaultMode.self, forKey: .defaultMode) ?? d.defaultMode
         allowNetworks = try c.decodeIfPresent([String].self, forKey: .allowNetworks) ?? d.allowNetworks
         servers = try c.decodeIfPresent([ServerEntry].self, forKey: .servers) ?? d.servers
+        dismissedCisco = try c.decodeIfPresent([String].self, forKey: .dismissedCisco) ?? d.dismissedCisco
     }
 }
 

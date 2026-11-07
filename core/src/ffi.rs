@@ -1634,3 +1634,30 @@ pub extern "C" fn ac_update_decide(
         .map(CString::into_raw)
         .unwrap_or(std::ptr::null_mut())
 }
+
+/// The server list merged with the Mac's Cisco profiles (DESIGN.md
+/// §三十八): request and result are JSON (cisco_import::SyncRequest /
+/// SyncResult). Free the result with ac_string_free.
+#[no_mangle]
+pub extern "C" fn ac_cisco_sync(request: *const c_char) -> *mut c_char {
+    let request: crate::cisco_import::SyncRequest =
+        c_str(request).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    serde_json::to_string(&crate::cisco_import::sync(&request))
+        .ok()
+        .and_then(|s| CString::new(s).ok())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Cisco's server entries and last connection, read-only (JSON,
+/// cisco_import::Snapshot). Free the result with ac_string_free.
+#[no_mangle]
+pub extern "C" fn ac_cisco_snapshot(request: *const c_char) -> *mut c_char {
+    let request: crate::cisco_import::SnapshotRequest =
+        c_str(request).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    serde_json::to_string(&crate::cisco_import::snapshot(&request))
+        .ok()
+        .and_then(|s| CString::new(s).ok())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}

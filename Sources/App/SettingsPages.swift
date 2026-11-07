@@ -286,10 +286,12 @@ struct UninstallSection: View {
 // MARK: - Account
 
 /// The server list (DESIGN.md §21.13): pick the one to use, add, edit,
-/// remove. Seeded once from the local Cisco profile.
+/// remove. Kept in step with the Mac's Cisco profiles each time it is
+/// shown, and on "从 Cisco 重新导入" (§三十八).
 struct ServerListSection: View {
     @Binding var selected: String
     @State private var servers = ProfileStore.loadServers()
+    @State private var importNote: String?
     @State private var editingID: UUID?
     @State private var adding = false
     @State private var draftName = ""
@@ -307,24 +309,79 @@ struct ServerListSection: View {
             if adding {
                 editor(save: add)
             } else {
-                Button {
-                    startEditing(nil)
-                    adding = true
-                } label: {
-                    Label("添加服务器", systemImage: "plus.circle.fill")
+                HStack {
+                    Button {
+                        startEditing(nil)
+                        adding = true
+                    } label: {
+                        Label("添加服务器", systemImage: "plus.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    Spacer()
+                    if CiscoProfiles.isPresent {
+                        Button {
+                            sync(force: true)
+                        } label: {
+                            Label("从 Cisco 重新导入", systemImage: "arrow.down.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("重新读取本机 Cisco 里保存的服务器，删掉过的也会加回来")
+                    }
                 }
-                .buttonStyle(.borderless)
+            }
+            if let importNote {
+                Text(importNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         } header: {
             Text("服务器")
         } footer: {
-            Text(!CiscoEngine.isAvailable ? "点圆圈选用。"
-                 : HelperClient.shared.usesCisco
-                 ? "点圆圈选用；来自 Cisco 配置的条目按名称连接，证书由 Cisco 自动出示。"
-                 : "点圆圈选用；来自 Cisco 配置的条目会自动换成它的网关地址。")
+            Text(footer)
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        .onAppear { sync(force: false) }
+    }
+
+    private var footer: String {
+        if servers.isEmpty {
+            return CiscoProfiles.isPresent
+                ? "本机 Cisco 里没有保存的服务器，请点「添加服务器」填网关地址。"
+                : "没有找到 Cisco，请点「添加服务器」填网关地址。"
+        }
+        let pick = servers.contains { $0.ciscoName != nil }
+            ? "点圆圈选用；标着 Cisco 的条目从本机 Cisco 自动导入，并随 Cisco 的改动更新。"
+            : "点圆圈选用。"
+        if !CiscoEngine.isAvailable { return pick }
+        return HelperClient.shared.usesCisco
+            ? pick + "经 Cisco 连接时按名称连接，证书由 Cisco 自动出示。"
+            : pick + "自建连接时自动换成它的网关地址。"
+    }
+
+    /// Bring the list in step with Cisco (DESIGN.md §三十八). Shown
+    /// quietly on appear when something changed; the button always says
+    /// what happened.
+    private func sync(force: Bool) {
+        let report = ProfileStore.syncWithCisco(force: force)
+        servers = ProfileStore.loadProfile().servers
+        selected = ProfileStore.loadProfile().server
+        importNote = Self.note(report, asked: force)
+    }
+
+    static func note(_ report: ProfileStore.CiscoSync?, asked: Bool) -> String? {
+        guard let report else { return asked ? "读取 Cisco 配置失败" : nil }
+        var parts: [String] = []
+        if !report.added.isEmpty { parts.append("新增 \(report.added.joined(separator: "、"))") }
+        if !report.updated.isEmpty { parts.append("更新 \(report.updated.joined(separator: "、"))") }
+        if !report.detached.isEmpty {
+            parts.append("\(report.detached.joined(separator: "、")) 已不在 Cisco 里，保留为普通服务器")
+        }
+        if parts.isEmpty {
+            guard asked else { return nil }
+            return report.found == 0 ? "本机 Cisco 里没有找到保存的服务器" : "已和 Cisco 一致（\(report.found) 台）"
+        }
+        return "已从 Cisco 同步：" + parts.joined(separator: "；")
     }
 
     private func row(_ entry: ServerEntry) -> some View {
@@ -414,7 +471,9 @@ struct ServerListSection: View {
         let wasSelected = entry.target == selected
         servers[index].name = name
         if address != entry.address {
-            // A hand-edited address is ours, no longer Cisco's entry.
+            // A hand-edited address is ours, no longer Cisco's entry; the
+            // sync must not add Cisco's entry back beside it.
+            if let ciscoName = entry.ciscoName { ProfileStore.dismissCisco([ciscoName]) }
             servers[index].address = address
             servers[index].ciscoName = nil
         }
@@ -424,6 +483,8 @@ struct ServerListSection: View {
     }
 
     private func remove(_ entry: ServerEntry) {
+        // Removed stays removed: the sync with Cisco skips it (§三十八).
+        ProfileStore.dismissCisco([entry.ciscoName ?? entry.address])
         servers.removeAll { $0.id == entry.id }
         if entry.target == selected { selected = servers.first?.target ?? "" }
         ProfileStore.saveServers(servers, selected: selected)
@@ -439,8 +500,10 @@ struct CredentialForm: View {
 
     @ObservedObject private var manager = HelperClient.shared
     @State private var server = ProfileStore.loadProfile().server
-    @State private var group = ProfileStore.loadProfile().group
-    @State private var username = ProfileStore.loadUsername() ?? ""
+    // Before the first save, what Cisco last logged in with (§三十八).
+    @State private var group = ProfileStore.loadUsername() == nil && ProfileStore.loadProfile().group.isEmpty
+        ? CiscoProfiles.lastGroup() : ProfileStore.loadProfile().group
+    @State private var username = ProfileStore.loadUsername() ?? CiscoProfiles.lastUser()
     @State private var password = ""
     @State private var message: String?
     @State private var messageIsError = false
