@@ -88,6 +88,7 @@ SUDO=""
 OLD=""          # where the previous copy waits until the new one is in
 RUNNING=0       # a copy was running and has been quit by us
 DONE=0
+VERIFY_REQUIREMENT=""
 cleanup() {
     local status=$?
     # bash 3.2 reports an unbound-variable abort as status 0 here: only a
@@ -273,9 +274,11 @@ check_app() { # app
     id=$(plist "$app" CFBundleIdentifier)
     [ "$id" = "$BUNDLE_ID" ] || die "安装包里的不是 AlwaysConnect（${id}）"
     codesign --verify --strict "$app" 2>/dev/null || die "安装包的签名校验不通过，已停止"
-    signer=$(expected_signer)
-    codesign --verify --strict \
-        -R="identifier \"$BUNDLE_ID\" and certificate leaf = H\"$signer\"" "$app" 2>/dev/null \
+    if [ -z "$VERIFY_REQUIREMENT" ]; then
+        signer=$(expected_signer)
+        VERIFY_REQUIREMENT="identifier \"$BUNDLE_ID\" and certificate leaf = H\"$signer\""
+    fi
+    codesign --verify --strict -R="$VERIFY_REQUIREMENT" "$app" 2>/dev/null \
         || die "安装包不是用 AlwaysConnect 的发布证书签名的（可能被替换过），已停止"
     version=$(plist "$app" CFBundleShortVersionString)
     [ -n "$EXPECTED_VERSION" ] || die "缺少期望版本：--from 必须同时提供 --expected-version"
@@ -352,7 +355,8 @@ replace() { # new-app
     # Downloads by curl carry no quarantine flag; clear one anyway (a zip
     # opened in Finder first, a copy made by a browser).
     $SUDO xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
-    if ! codesign --verify --strict "$DEST" 2>/dev/null; then
+    if ! codesign --verify --strict -R="$VERIFY_REQUIREMENT" "$DEST" 2>/dev/null \
+        || [ "$(plist "$DEST" CFBundleShortVersionString)" != "$EXPECTED_VERSION" ]; then
         $SUDO rm -rf "$DEST" || true
         die "新版本复制后校验不通过，已恢复原来的版本"
     fi
@@ -378,6 +382,8 @@ if [ -n "$STAGE" ]; then
 fi
 
 quit_running
+# Recheck after the wait, with the signer captured before the old App moves.
+check_app "$NEW"
 replace "$NEW"
 VERSION=$(plist "$DEST" CFBundleShortVersionString)
 say "已安装 AlwaysConnect $VERSION 到 $DEST"

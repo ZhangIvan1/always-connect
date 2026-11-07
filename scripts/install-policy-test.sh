@@ -10,6 +10,15 @@ cat >"$WORK/bin/codesign" <<'STUB'
 #!/bin/bash
 # No installed certificate: use install.sh's release signer.
 [ "$1" != -d ] || exit 1
+# Simulate a valid but differently signed final copy. Only a pinned
+# requirement rejects it; generic integrity verification would accept it.
+pin=0 last=""
+for last in "$@"; do
+    case "$last" in -R=*'certificate leaf'*) pin=1 ;; esac
+done
+if [ "${AC_TAMPER_FINAL:-0}" = 1 ] && [ "$last" = "${AC_FINAL_DEST:-}" ] && [ "$pin" = 1 ]; then
+    exit 1
+fi
 exit 0
 STUB
 chmod +x "$WORK/bin/codesign"
@@ -53,4 +62,21 @@ app "$NEW" 1.2.3
 expect pass 已安装 --expected-version 1.2.3
 app "$NEW" invalid
 expect fail 版本号无效 --expected-version invalid
+app "$NEW" 1.2.4
+AC_TAMPER_FINAL=1 AC_FINAL_DEST="$DEST" expect fail 复制后校验不通过 --expected-version 1.2.4
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DEST/Contents/Info.plist")" = 1.2.3 ]
+echo 'PASS final signer mismatch restores installed App'
+cat >"$WORK/bin/ditto" <<'STUB'
+#!/bin/bash
+/usr/bin/ditto "$@" || exit $?
+last=""
+for last in "$@"; do :; done
+if [ "$last" = "$AC_VERSION_DEST" ]; then
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString 1.0.0' "$last/Contents/Info.plist"
+fi
+STUB
+chmod +x "$WORK/bin/ditto"
+AC_VERSION_DEST="$DEST" expect fail 复制后校验不通过 --expected-version 1.2.4
+[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DEST/Contents/Info.plist")" = 1.2.3 ]
+echo 'PASS final version mismatch restores installed App'
 echo 'install-policy-test: all passed (codesign stubbed)'

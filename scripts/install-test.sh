@@ -258,6 +258,34 @@ if [ "$ST" = 0 ] && [ "$(version_of "$DEST")" = 0.2.0 ] && grep -q "已安装 Al
     pass app-update-installed-after-quit
 else fail "app-update-installed-after-quit ($ST) $OUT $(cat "$WORK/update.log" 2>/dev/null)"; fi
 
+# Copy-time replacement by an ad-hoc signed App must fail final signer
+# validation and restore the old App. Only the harness's ditto is wrapped.
+make_app "$WORK/swap" 0.2.0 13.0 "" -
+mkdir -p "$WORK/stubs"
+cat >"$WORK/stubs/ditto" <<'STUB'
+#!/bin/bash
+/usr/bin/ditto "$@" || exit $?
+last=""
+for last in "$@"; do :; done
+if [ "$last" = "$AC_SWAP_DEST" ]; then
+    /bin/rm -rf "$last"
+    /usr/bin/ditto "$AC_SWAP_APP" "$last"
+fi
+STUB
+chmod +x "$WORK/stubs/ditto"
+PATH="$WORK/stubs:$PATH" AC_SWAP_DEST="$DEST" AC_SWAP_APP="$WORK/swap/AlwaysConnect.app" \
+    run releases.json --version v0.2.0
+if [ "$ST" != 0 ] && echo "$OUT" | grep -q "复制后校验不通过" && [ "$(version_of "$DEST")" = 0.2.0 ] \
+    && codesign --verify --strict -R="certificate leaf = H\"$TEST_SIGN_SHA1\"" "$DEST" 2>/dev/null; then
+    pass final-copy-signer-refused-and-rollback
+else fail "final-copy-signer-refused-and-rollback ($ST) $OUT"; fi
+make_app "$WORK/swap-old" 0.1.0 13.0
+PATH="$WORK/stubs:$PATH" AC_SWAP_DEST="$DEST" AC_SWAP_APP="$WORK/swap-old/AlwaysConnect.app" \
+    run releases.json --version v0.2.0
+if [ "$ST" != 0 ] && echo "$OUT" | grep -q "复制后校验不通过" && [ "$(version_of "$DEST")" = 0.2.0 ]; then
+    pass final-copy-old-signed-version-refused
+else fail "final-copy-old-signed-version-refused ($ST) $OUT"; fi
+
 # 9 the scratch directory is gone every time
 if ls -d "${TMPDIR:-/tmp}"/alwaysconnect-install.* >/dev/null 2>&1; then
     fail "scratch directories left: $(ls -d "${TMPDIR:-/tmp}"/alwaysconnect-install.*)"
