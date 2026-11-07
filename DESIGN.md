@@ -2310,3 +2310,8 @@ DNS 归 Cisco，我们不插手，§二十二）。
 安装/更新后台服务、强制恢复、恢复网络、卸载全部经 `PrivilegedBundle`：运行中的 App 取得自己的叶子证书哈希并核对运行代码；固定的 root shell 以 umask 077 创建 root 专用临时目录，复制整个 App，拒绝绝对或跨父目录的符号链接，改为 root 所有且不可由组/他人写，再以 `codesign --verify --strict --deep -R` 固定 App 标识和叶子证书校验副本。校验失败给中文错误并退出，成功才运行副本内脚本及后台服务；用完清理副本。卸载脚本的异步后半程仍使用其自己的 root 私有副本。shell 和 AppleScript 分别转义。
 无证书的 ad-hoc 构建可以继续构建和测试，但管理按钮明确拒绝提权并说明使用已有开发证书；终端手动 `sudo …/dev-helper.sh install`、`sudo …/reset-network.sh` 保留，属于用户知情执行，后台服务原有拒绝 ad-hoc 客户端的规则不变。不自动建立长期身份。
 验证级别：本机编译；`privileged-bundle-test.sh` 为脚本级断言（执行顺序、两层转义、AppleScript 编译、bash 语法），并用真实 codesign 验证 ad-hoc 不满足证书 pin、改过的资源验签失败；未执行 root bootstrap。管理员安装/恢复/卸载及有效签名通过路径需实测（I26）。无新增常驻逻辑；改前/后 footprint、CPU、唤醒需实测。
+
+### 39.5 F4：设置进程使用匿名私有通道
+删除 DistributedNotificationCenter 的状态、动作、请求与回复广播和环境 token。父进程创建匿名 socketpair，只将子端继承为设置进程的 stdin/stdout；子进程先校验同签名、同路径的父 App。状态镜像、动作、回复和打开指定页均经过该通道，原动作及三秒超时不变。同会话的其他进程没有可监听或连接的名字，也不再能从广播取到权限凭据。
+`SettingsTransport` 只做系统 IPC 薄壳：非阻塞描述符、DispatchSource 读写就绪、JSON 行的边界与一 MB 缓冲上限；不增加轮询，空闲不注册写就绪，错误/EOF 关闭并回收描述符。设置窗口退出释放通道；父进程退出触发 EOF，设置子进程随之退出。连接业务决策仍在原 Rust 核心与 App 外壳中。
+验证级别：本机编译、CI harness（`settings-transport-test.sh`：双向请求/回复、换行转义、非法消息关闭、缓冲上限、EOF；检查无广播入口）。窗口交互与资源回收、改前/后 footprint/CPU/每秒唤醒需实测（I27）；未运行真实 App。

@@ -321,6 +321,8 @@ jobs:
         # Settings and the one-click update quit from inside main-queue
         # blocks. The real quit on a Mac is Mac proof.
         run: scripts/quit-test.sh
+      - name: Private settings IPC and process lifetime
+        run: scripts/settings-transport-test.sh
       - name: Update check (GitHub releases list, local fake server)
         # Sources/App/UpdateChecker.swift + core update_check (DESIGN.md
         # §三十三). The real GitHub answer and the panel notice are Mac proof.

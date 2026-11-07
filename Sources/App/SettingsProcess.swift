@@ -17,30 +17,16 @@ import Foundation
 /// quit is a plain exit, and it exits when the App does.
 enum AppRole {
     static let isSettings = CommandLine.arguments.contains("--settings")
-    /// Shared secret between the App and the settings process it started:
-    /// actions without it are ignored.
-    static let token: String = {
-        if isSettings { return ProcessInfo.processInfo.environment["ALWAYSCONNECT_SETTINGS_TOKEN"] ?? "" }
-        return UUID().uuidString
-    }()
+
 }
 
 final class SettingsLink {
     static let shared = SettingsLink()
 
-    private enum Name {
-        static let state = Notification.Name("com.alwaysconnect.app.settings.state")
-        static let request = Notification.Name("com.alwaysconnect.app.settings.request")
-        static let action = Notification.Name("com.alwaysconnect.app.settings.action")
-        static let reply = Notification.Name("com.alwaysconnect.app.settings.reply")
-        static let show = Notification.Name("com.alwaysconnect.app.settings.show")
-    }
-
-    private let center = DistributedNotificationCenter.default()
+    private var transport: SettingsTransport?
     private var process: Process?
     private var cancellables = Set<AnyCancellable>()
     private var pendingReplies: [String: (String?) -> Void] = [:]
-    private var parentWatch: DispatchSourceProcess?
 
     private init() {}
 
@@ -58,9 +44,7 @@ final class SettingsLink {
     /// running one forward.
     func show(tab: String?) {
         if let process, process.isRunning {
-            center.postNotificationName(Name.show, object: nil,
-                                        userInfo: ["tab": tab ?? "", "token": AppRole.token],
-                                        deliverImmediately: true)
+            transport?.send(["type": "show", "tab": tab ?? ""])
             return
         }
         if let tab { UserDefaults.standard.set(tab, forKey: "settingsTab") }
@@ -68,16 +52,38 @@ final class SettingsLink {
         let p = Process()
         p.executableURL = executable
         p.arguments = ["--settings"]
-        var env = ProcessInfo.processInfo.environment
-        env["ALWAYSCONNECT_SETTINGS_TOKEN"] = AppRole.token
-        p.environment = env
-        p.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async { self?.process = nil }
+        var pair: [Int32] = [-1, -1]
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0 else { return }
+        _ = fcntl(pair[0], F_SETFD, FD_CLOEXEC)
+        _ = fcntl(pair[1], F_SETFD, FD_CLOEXEC)
+        let child = FileHandle(fileDescriptor: pair[1], closeOnDealloc: true)
+        p.standardInput = child
+        p.standardOutput = child
+        p.standardError = FileHandle.nullDevice
+        p.terminationHandler = { [weak self] ended in
+            DispatchQueue.main.async {
+                guard let self, self.process === ended else { return }
+                self.transport?.close()
+                self.transport = nil
+                self.process = nil
+            }
         }
         do {
             try p.run()
+            try? child.close()
             process = p
+            let output = dup(pair[0])
+            guard output >= 0 else { Darwin.close(pair[0]); p.terminate(); return }
+            transport = SettingsTransport(input: pair[0], output: output, receive: { [weak self] info in
+                guard self?.process === p else { return }
+                if info["type"] == "request" { self?.sendState() }
+                if info["type"] == "action", let name = info["name"] {
+                    self?.perform(name, argument: info["arg"] ?? "", id: info["id"])
+                }
+            }, ended: { [weak p] in if let p, p.isRunning { p.terminate() } })
         } catch {
+            try? child.close()
+            Darwin.close(pair[0])
             NSLog("AlwaysConnect: settings process failed to start")
         }
     }
@@ -85,15 +91,6 @@ final class SettingsLink {
     /// The App answers the settings process: state on request and on
     /// every change while it runs, and the actions it forwards.
     func startAppSide() {
-        center.addObserver(forName: Name.request, object: nil, queue: .main) { [weak self] note in
-            guard Self.trusted(note) else { return }
-            self?.sendState()
-        }
-        center.addObserver(forName: Name.action, object: nil, queue: .main) { [weak self] note in
-            guard Self.trusted(note), let info = note.userInfo as? [String: String],
-                  let name = info["name"] else { return }
-            self?.perform(name, argument: info["arg"] ?? "", id: info["id"])
-        }
         HelperClient.shared.objectWillChange
             .debounce(for: .milliseconds(150), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -103,22 +100,15 @@ final class SettingsLink {
             .store(in: &cancellables)
     }
 
-    private static func trusted(_ note: Notification) -> Bool {
-        (note.userInfo?["token"] as? String) == AppRole.token && !AppRole.token.isEmpty
-    }
-
     private func sendState() {
-        let json = HelperClient.shared.remoteSnapshot()
-        center.postNotificationName(Name.state, object: nil,
-                                    userInfo: ["json": json, "token": AppRole.token],
-                                    deliverImmediately: true)
+        transport?.send(["type": "state", "json": HelperClient.shared.remoteSnapshot()])
     }
 
     private func reply(_ id: String?, _ result: String?) {
         guard let id else { return }
-        var info = ["id": id, "token": AppRole.token]
+        var info = ["type": "reply", "id": id]
         if let result { info["result"] = result }
-        center.postNotificationName(Name.reply, object: nil, userInfo: info, deliverImmediately: true)
+        transport?.send(info)
     }
 
     private func perform(_ name: String, argument: String, id: String?) {
@@ -156,6 +146,7 @@ final class SettingsLink {
     /// "disconnected" took our own tunnel and DNS forwarder for another
     /// VPN's (user screenshot, 2026-11-06).
     func startSettingsSide(onReady: @escaping () -> Void) {
+        guard AppIdentity.hasAppParent() else { exit(77) }
         var ready = false
         let fire = {
             guard !ready else { return }
@@ -163,36 +154,27 @@ final class SettingsLink {
             onReady()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { fire() }
-        center.addObserver(forName: Name.state, object: nil, queue: .main) { note in
-            guard Self.trusted(note), let json = note.userInfo?["json"] as? String else { return }
-            HelperClient.shared.applyRemoteSnapshot(json)
-            fire()
-        }
-        center.addObserver(forName: Name.reply, object: nil, queue: .main) { [weak self] note in
-            guard Self.trusted(note), let info = note.userInfo as? [String: String],
-                  let id = info["id"], let done = self?.pendingReplies.removeValue(forKey: id) else { return }
-            done(info["result"])
-        }
-        center.addObserver(forName: Name.show, object: nil, queue: .main) { note in
-            guard Self.trusted(note) else { return }
-            let tab = (note.userInfo?["tab"] as? String) ?? ""
-            SettingsWindow.shared.show(tab: tab.isEmpty ? nil : tab)
-        }
-        center.postNotificationName(Name.request, object: nil, userInfo: ["token": AppRole.token],
-                                    deliverImmediately: true)
-        // The App is this process's parent: when it goes (quit, crash),
-        // so does Settings — it must never outlive it.
-        let parent = getppid()
-        let watch = DispatchSource.makeProcessSource(identifier: parent, eventMask: .exit, queue: .main)
-        watch.setEventHandler { exit(0) }
-        watch.resume()
-        parentWatch = watch
-        if getppid() != parent || parent == 1 { exit(0) }
+        transport = SettingsTransport(input: STDIN_FILENO, output: STDOUT_FILENO, receive: { [weak self] info in
+            switch info["type"] {
+            case "state":
+                guard let json = info["json"] else { return }
+                HelperClient.shared.applyRemoteSnapshot(json)
+                fire()
+            case "reply":
+                guard let id = info["id"], let done = self?.pendingReplies.removeValue(forKey: id) else { return }
+                done(info["result"])
+            case "show":
+                let tab = info["tab"] ?? ""
+                SettingsWindow.shared.show(tab: tab.isEmpty ? nil : tab)
+            default: break
+            }
+        }, ended: { exit(0) })
+        transport?.send(["type": "request"])
     }
 
     /// Forwards one action to the App; `done` gets its answer (nil after 3 s).
     func send(_ name: String, _ argument: String = "", done: ((String?) -> Void)? = nil) {
-        var info = ["name": name, "arg": argument, "token": AppRole.token]
+        var info = ["type": "action", "name": name, "arg": argument]
         if let done {
             let id = UUID().uuidString
             info["id"] = id
@@ -201,6 +183,6 @@ final class SettingsLink {
                 self?.pendingReplies.removeValue(forKey: id)?(nil)
             }
         }
-        center.postNotificationName(Name.action, object: nil, userInfo: info, deliverImmediately: true)
+        transport?.send(info)
     }
 }
