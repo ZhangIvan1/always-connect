@@ -851,11 +851,13 @@ impl Shared {
         }
     }
 
+    /// The direct networks (the App's list, the local network, the
+    /// gateway's own private excludes) go via the physical router
+    /// whenever the session knows it — the domain split's forwarder
+    /// or not (§40.1): a split that could not start must not send the
+    /// modem at 192.168.100.1 into the tunnel.
     fn route_networks_direct(&self, c: &mut Core) {
         let Some(gateway) = c.physical_gateway.clone() else { return };
-        if c.forwarder.is_none() {
-            return;
-        }
         let wanted: HashSet<String> =
             direct_routes::networks_to_route(&c.direct_networks(), &direct_routes::attached_networks()).into_iter().collect();
         let gone: Vec<String> = c.routed_networks.difference(&wanted).cloned().collect();
@@ -1223,7 +1225,7 @@ impl Shared {
                             let previous = c.physical_gateway.replace(v.to_string());
                             // A fresh connect on a different network: this
                             // session's routes still point at the old router.
-                            if previous.is_some_and(|p| p != *v) && c.forwarder.is_some() {
+                            if previous.is_some_and(|p| p != *v) {
                                 self.routes.repoint(v);
                             }
                         }
@@ -1495,17 +1497,11 @@ impl Shared {
         if move_gateway_route {
             run_script("follow-network", &c.config.script_path, &c.support(), c.config.no_routes, c.config.test_active);
         }
-        if c.forwarder.is_none() {
-            if let Some((tun, gws)) = c.last_pf.clone() {
-                // pf passes the gateway on the physical interface.
-                let allow = c.last_allow_direct_egress;
-                self.load_pf(c, Some(tun), gws, allow);
-            }
-            return;
-        }
+        // The session's direct routes (the split's addresses and the
+        // direct networks, §40.1) go via the new router.
         self.routes.repoint(gateway);
-        c.local_dns = if c.config.no_routes { Vec::new() } else { (self.hooks.local_dns)(interface) };
         if let Some(f) = &c.forwarder {
+            c.local_dns = if c.config.no_routes { Vec::new() } else { (self.hooks.local_dns)(interface) };
             f.set_upstreams(Upstreams {
                 tunnel: c.tunnel_dns.clone(),
                 local: c.local_dns.clone(),
@@ -1514,6 +1510,7 @@ impl Shared {
         }
         self.route_networks_direct(c);
         if let Some((tun, gws)) = c.last_pf.clone() {
+            // pf passes the gateway on the physical interface.
             let allow = c.last_allow_direct_egress;
             self.load_pf(c, Some(tun), gws, allow);
         }

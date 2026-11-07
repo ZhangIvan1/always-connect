@@ -25,7 +25,14 @@ fi
 [ -n "${FAKE_CONNECT_DELAY:-}" ] && sleep "$FAKE_CONNECT_DELAY"
 echo "Cookie: webvpn=fakecookie42; webvpncontext=x"
 export TUNDEV=utun99 VPNGATEWAY=198.51.100.7 INTERNAL_IP4_ADDRESS=10.9.0.2
-reason=connect /bin/sh -c "$script" || exit 1
+# FAKE_CONNECT_HOOK: the connect hook line a real network would give
+# (phys=, physgw=, lanex= are absent in test mode), sent instead of the
+# script's own.
+if [ -n "${FAKE_CONNECT_HOOK:-}" ]; then
+  echo "AC_HOOK $FAKE_CONNECT_HOOK"
+else
+  reason=connect /bin/sh -c "$script" || exit 1
+fi
 # SIGTERM (a manual stop) ends the stand-in and its sleep together: an
 # orphaned sleep would keep the caller's output pipe open.
 sleep "${FAKE_UP_SECONDS:-1}" &

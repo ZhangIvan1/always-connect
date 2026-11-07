@@ -23,7 +23,7 @@ SCENARIOS=("$@")
 [ ${#SCENARIOS[@]} -gt 0 ] || SCENARIOS=(cisco-disconnect protection-off own-disconnect own-then-cisco
     own-protection-off own-protection-toggle
     grace-expiry grace-cancelled quit-no-relaunch restart-same-boot restart-other-boot legacy-pf-state
-    own-replace orphan-sweep journal-at-start direct-routes-journal
+    own-lan-direct own-replace orphan-sweep journal-at-start direct-routes-journal
     takeover-adopted takeover-replace protection-off-adopted held-allow-update
     direct-table direct-before-hold direct-adopt old-record)
 FAILED=0

@@ -162,6 +162,25 @@ struct SessionHarness {
                 (sync { reply in session.getSessionInfo { reason, _ in reply(reason) } } ?? 0) == 1
             }
             assertReleased("own-disconnect")
+        case "own-lan-direct":
+            // §40.1: without the domain split's forwarder (no relay here),
+            // the gateway's private excludes still go via the physical
+            // router, and the route is undone on disconnect.
+            setenv("FAKE_CONNECT_HOOK",
+                   "connect tun=utun99 gateway=198.51.100.7 lanex=172.31.240.0/20 phys=en0 physgw=192.0.2.1", 1)
+            defer { unsetenv("FAKE_CONNECT_HOOK") }
+            let journal = TestSeam.supportDir!.appendingPathComponent("direct-routes")
+            let journalled = { ((try? String(contentsOf: journal, encoding: .utf8)) ?? "").split(separator: "\n") }
+            check(connect(session) == true, "own connection accepted")
+            check(waitFor(10) { journalled().contains("172.31.240.0/20 192.0.2.1") },
+                  "the gateway's private exclude routed via the physical router (\(journalled()))")
+            check(waitFor(5) { lastRules().contains("172.31.240.0/20") }, "and let through pf")
+            check(disconnect(session), "disconnect replied")
+            _ = waitFor(15) {
+                (sync { reply in session.getSessionInfo { reason, _ in reply(reason) } } ?? 0) == 1
+            }
+            check(!FileManager.default.fileExists(atPath: journal.path), "the route undone on disconnect")
+            assertReleased("own-lan-direct")
         case "own-protection-off":
             // 断线保护关 (DESIGN.md §26.19): the own connection loads no pf
             // set, and a drop (the stand-in exits after 2 s up) leaves
