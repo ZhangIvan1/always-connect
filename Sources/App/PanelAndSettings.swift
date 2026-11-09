@@ -39,7 +39,7 @@ struct PanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             let look = StatusLook.of(manager.state, held: manager.networkHeld,
-                                     hasCredentials: manager.hasCredentials)
+                                     hasCredentials: manager.hasCredentials, onDemand: manager.onDemandPaused)
             HStack(spacing: 12) {
                 Image(nsImage: GlobeIcon.image(
                     GlobeIcon.badge(for: manager.state, held: manager.networkHeld), size: 36))
@@ -407,6 +407,7 @@ struct PanelView: View {
             // Servers usually come from the Mac's Cisco (§三十八).
             return ProfileStore.loadProfile().servers.isEmpty ? "先填服务器、账号和密码" : "先填账号和密码"
         }
+        if manager.onDemandPaused, manager.state == .disconnected, !manager.networkHeld { return manager.stateLine }
         if manager.state == .disconnected, !manager.networkHeld { return "VPN 已关，正在用本地网络上网" }
         if manager.state == .reconnecting { return manager.stateLine }
         return manager.detail.isEmpty ? manager.stateLine : manager.detail
@@ -424,7 +425,7 @@ struct PanelView: View {
                 .frame(maxWidth: .infinity)
         } else if manager.state == .disconnected, !manager.networkHeld {
             Button { showConfirmDisconnect = false; onStart() } label: {
-                Text("连接 VPN").frame(maxWidth: .infinity)
+                Text(manager.onDemandPaused ? "仍然连接" : "连接 VPN").frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
@@ -528,7 +529,7 @@ final class PanelController: NSObject, NSWindowDelegate {
             manager: manager,
             profile: ProfileStore.loadProfile(),
             onStart: { [weak self] in self?.startTapped() },
-            onStop: { [weak self] in self?.manager.disconnect() },
+            onStop: { [weak self] in self?.manager.disconnectByUser() },
             onOpenSettings: { [weak self] tab in
                 self?.panel?.close()
                 SettingsWindow.shared.show(tab: tab)
@@ -612,7 +613,7 @@ final class PanelController: NSObject, NSWindowDelegate {
     private func startTapped() {
         // Credentials come from the Keychain; without them the panel
         // switch is disabled, so this guard is a second line only.
-        _ = manager.connectWithStoredCredentials()
+        _ = manager.connectWithStoredCredentials(manual: true)
     }
 }
 

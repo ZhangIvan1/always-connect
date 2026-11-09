@@ -15,7 +15,7 @@ final class NetworkFacts: NSObject, CLLocationManagerDelegate {
     var interface: NWInterface?
     var locationDescription: String {
         switch location?.authorizationStatus ?? .notDetermined {
-        case .authorizedAlways, .authorized: return "定位已授权"
+        case .authorizedAlways, .authorized: return "未读取到 Wi-Fi 名称（定位已授权）"
         case .denied, .restricted: return "未授权定位，读不到 Wi-Fi 名称。请在系统设置 → 隐私与安全性 → 定位服务中允许 AlwaysConnect。"
         default: return "Wi-Fi 名称未知；启用按需连接并保存 Wi-Fi 名称条件后会请求定位授权。"
         }

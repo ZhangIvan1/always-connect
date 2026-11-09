@@ -69,6 +69,7 @@ final class OnDemandController {
     private var generation = 0
     private var pendingAuto: (() -> Void)?
     private var lastFacts: OnDemandFacts?
+    private var collectedFacts: OnDemandFacts?
 
     func configure(enabled: Bool, rules: [OnDemandRule]) {
         self.enabled = enabled; self.rules = rules
@@ -76,6 +77,7 @@ final class OnDemandController {
     }
     func manualConnect() {
         generation += 1; cancelProbe(); evaluating = false; pendingAuto = nil; ready = true
+        lastFacts = collectedFacts ?? lastFacts
         transition(event: "manual")
     }
     func automatic(_ body: @escaping () -> Void) {
@@ -85,6 +87,9 @@ final class OnDemandController {
             return
         }
         if !state.paused { body() }
+    }
+    func networkWillChange() {
+        generation += 1; cancelProbe(); ready = false; evaluating = true
     }
     func networkChanged() { evaluate(event: "network") }
     private func transition(event: String, decision: OnDemandDecision = OnDemandDecision(action: "ignore")) {
@@ -109,7 +114,7 @@ final class OnDemandController {
             // VPN route changes must not cancel a manual override. Only
             // changes in the physical facts count as a new network.
             if event == "network", self.lastFacts == facts { self.finish(token); return }
-            self.lastFacts = facts
+            self.collectedFacts = facts
             if event == "network" || event == "settings" { self.transition(event: event) }
             self.decide(facts, token: token)
         }
@@ -124,6 +129,7 @@ final class OnDemandController {
                 self.decide(next, token: token)
             }
         } else {
+            var offline = facts; offline.probes = [:]; lastFacts = offline
             transition(event: "decision", decision: d)
             finish(token)
         }

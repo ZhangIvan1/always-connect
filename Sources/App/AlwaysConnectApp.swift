@@ -68,9 +68,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.button?.action = #selector(togglePanel(_:))
         updateStatusIcon(state: HelperClient.shared.state, held: false)
         HelperClient.shared.$state
-            .combineLatest(HelperClient.shared.$networkHeld)
+            .combineLatest(HelperClient.shared.$networkHeld, HelperClient.shared.$onDemandPaused)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] state, held in self?.updateStatusIcon(state: state, held: held) }
+            .sink { [weak self] state, held, _ in self?.updateStatusIcon(state: state, held: held) }
             .store(in: &cancellables)
         // Attach to the Helper first: a session it kept running while
         // the App was closed must show up even without auto-connect.
@@ -99,9 +99,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         HotkeyManager.shared.onHotkey = {
             guard !SettingsLink.shared.settingsInFront else { return }
             if HelperClient.shared.switchIsOn {
-                HelperClient.shared.disconnect()
+                HelperClient.shared.disconnectByUser()
             } else {
-                _ = HelperClient.shared.connectWithStoredCredentials()
+                _ = HelperClient.shared.connectWithStoredCredentials(manual: true)
             }
         }
         HotkeyManager.shared.apply(ProfileStore.loadAppSettings())
@@ -263,13 +263,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// gray ring = manual disconnect.
     private func updateStatusIcon(state: HelperClient.State, held: Bool) {
         guard let button = statusItem?.button else { return }
-        let look = StatusLook.of(state, held: held,
-                                 hasCredentials: HelperClient.shared.hasCredentials)
         // Globe + state badge (GlobeIcon); drawn with label
         // colours, so it follows the light/dark menu bar by itself.
         button.image = GlobeIcon.image(GlobeIcon.badge(for: state, held: held))
         button.contentTintColor = nil
-        button.toolTip = "AlwaysConnect：\(look.headline)"
+        button.toolTip = "AlwaysConnect：\(HelperClient.shared.stateLine)"
     }
 
 }

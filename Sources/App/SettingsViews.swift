@@ -73,7 +73,7 @@ struct WizardView: View {
                         var profile = ProfileStore.loadProfile()
                         profile.defaultMode = .secure
                         ProfileStore.saveProfile(profile)
-                        _ = HelperClient.shared.connectWithStoredCredentials()
+                        _ = HelperClient.shared.connectWithStoredCredentials(manual: true)
                         onDone()
                     }
                     .buttonStyle(.borderedProminent)
