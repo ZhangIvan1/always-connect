@@ -2448,7 +2448,18 @@ list-rules harness 同时覆盖旧 AppSettings 缺少新增字段的迁移。
 - 本机实测：定位授权、SSID、真实物理探针、两种 VPN 的断开/恢复和开销均需实测（I32）。
 
 
-### 42.7 DNS 探针交叉验证修复（2026-11-09）
+### 42.7 交叉验证修复（2026-11-09）
+
+**断开收尾不是一个等 XPC completion 的锁存位。** `OnDemandDisconnect` 管理单次系统操作的代次、
+本地 Cisco 停止、状态核对和只完成一次的回调。断开回复丢失时，使用既有 getStatus/getNetworkHeld，
+同一 proxy 发出的请求由后台服务的串行队列按序处理，只有会话已断开且网络未被拦截才能释放等待。
+自建引擎的实际停止/旧引擎替换仍由既有后台服务管理；Cisco 要先等本地 Rust CLI 停止回调，再发最后的撤保护请求；还经既有 Rust CLI 外壳读取 state（2 秒截止），确认 Cisco 自身确实 Disconnected，不能把后台服务空闲或 App 的提前断开通知当作 Cisco 已停。
+
+3 秒一次性截止只标记需要恢复并请求核对，绝不直接放行。若连状态回复也丢失，保持安全等待；
+手动连接、关闭按需开关、后台服务正常状态/恢复、XPC interruption/invalidation、强制恢复取消或完成
+均能重新核对。每个新事件让旧核对失效；强制恢复期间暂停核对并撤销此前自动恢复意图。
+旧连接的失效回调不能清除替代连接。迟到/重复的旧断开回复不能释放新代次、重发 disconnect 或影响新会话。
+既有 watchRestore 的迟到超时/回复也受操作代次约束。没有新增 XPC 方法或空闲轮询。
 
 **DNS 结果必须对应本次问题。** Swift 用系统随机源生成 16 位事务 ID，Rust 生成 A/AAAA 查询；
 回包必须携带原查询供核心校验。检查 ID、QR、opcode、RCODE、TC、QDCOUNT 和 QNAME/QTYPE/QCLASS，
@@ -2456,5 +2467,17 @@ list-rules harness 同时覆盖旧 AppSettings 缺少新增字段的迁移。
 不接受不相关名称、非 IN 地址或冲突/循环的 CNAME。URL 的 DNS 解析复用这套校验；失败即不命中。
 随机 ID 不是网络身份认证，DNS 探针仍受当前物理网络的 DNS 可信度约束。
 
-验证：Rust 103 项单测通过，新增非 IN、错误问题/ID、头部/截断、压缩环与 CNAME 链负例。
-新增模块经 rustfmt；FFI 仅格式化按需连接增量，之前的代码字节未变。系统外壳通过 macOS 13 类型检查和本机构建。
+**设置测试可取消。** 切页/关窗时同步复位 testing，再取消探针、监视器并使旧代次失效，返回可重新测试。
+
+验证级别：Rust 负例、原有 Controller 断言、从实际 HelperClient 方法/回调和设置 onDisappear 提取的
+故障注入接线断言。后者使用确定性的 XPC/Cisco/主队列替身，覆盖无回复、服务恢复、强制恢复取消/完成、
+迟到回复、仍在连接、仍被拦截、旧连接失效与排队顺序；它不实例化 App，也不证明真实 XPC 调度、VPN、TCC 或实际 pf 效果。
+NetworkFacts 本体加入 harness 的类型检查，不运行真实权限或探针。真实故障注入和开销仍需 I32 实测。
+
+可读性：新增 Rust 模块经 rustfmt，FFI 仅格式化按需连接的增量区；Swift 拆开多语句与长行。
+
+
+本轮本机验证：Rust 103 项通过；原有 Controller 20 项与实际接线 29 项断言通过，旧设置迁移通过；
+最终 `scripts/build-local.sh` 编译/链接与 ad-hoc 组装验签通过。未跑本机签名 harness，缺 openconnect 的本地包只作编译验证。
+在独立临时副本恢复旧的回复依赖/宽松 DNS 解析/移除切页复位后，新测试分别退出 1/101/1，均为行为断言失败而非编译失败。
+修复前 HEAD 的远端 CI 已通过；追加修复提交的 CI 以 fork PR #2 当前 HEAD 的检查与交接报告为准。

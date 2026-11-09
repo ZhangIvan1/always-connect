@@ -116,7 +116,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private let onDemand = OnDemandController()
     private var onDemandProbe: OnDemandNetworkProbe?
     private var onDemandLaunchReady = false
-    private var onDemandDisconnecting = false
+    private let onDemandDisconnect = OnDemandDisconnect()
     private var onDemandResumePending = false
     private var onDemandDebounce: DispatchWorkItem?
     private var onDemandPathReady = false
@@ -129,7 +129,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             guard let self else { return }
             if self.onDemandPathReady {
                 done(self.networkFacts.collect(path: self.pathMonitor.currentPath, needsSSID: ssid))
-            } else { self.pendingOnDemandFacts = (ssid, done) }
+            } else {
+                self.pendingOnDemandFacts = (ssid, done)
+            }
         }
         onDemand.probe = { [weak self] probe, facts, done in
             let task = OnDemandNetworkProbe()
@@ -137,46 +139,120 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             task.run(probe, interface: self?.networkFacts.interface, servers: facts.servers) { result in
                 if self?.onDemandProbe === task { self?.onDemandProbe = nil }
                 done(result)
-                _ = task // retain until the bounded operation completes
+                _ = task  // retain until the bounded operation completes
             }
         }
-        onDemand.cancelProbe = { [weak self] in self?.onDemandProbe?.cancel(); self?.onDemandProbe = nil }
+        onDemand.cancelProbe = { [weak self] in
+            self?.onDemandProbe?.cancel()
+            self?.onDemandProbe = nil
+        }
+        setupOnDemandDisconnection()
         onDemand.disconnect = { [weak self] in
-            guard let self, !self.onDemandDisconnecting else { return }
-            self.onDemandDisconnecting = true
-            self.awaitingRestartRecovery = false
-            self.disconnect {
-                self.onDemandDisconnecting = false
-                if self.onDemandResumePending && self.onDemandLaunchReady {
-                    self.onDemandResumePending = false
-                    _ = self.connectWithStoredCredentials()
-                }
-            }
+            self?.awaitingRestartRecovery = false
+            self?.onDemandDisconnect.begin()
         }
         onDemand.connect = { [weak self] in
             guard let self else { return }
-            if self.onDemandDisconnecting || !self.onDemandLaunchReady { self.onDemandResumePending = true }
-            else { _ = self.connectWithStoredCredentials() }
+            if self.onDemandDisconnect.waiting || !self.onDemandLaunchReady {
+                self.onDemandResumePending = true
+                self.onDemandDisconnect.recheck()
+            } else {
+                _ = self.connectWithStoredCredentials()
+            }
         }
         onDemand.changed = { [weak self] in
             guard let self else { return }
             self.onDemandPaused = self.onDemand.state.paused
             if self.onDemandPaused {
                 self.onDemandResumePending = false
-                self.onDemandRuleName = self.onDemand.rules.first { $0.id == self.onDemand.state.rule_id }?.name ?? self.onDemandRuleName
-            } else { self.onDemandRuleName = nil }
+                self.onDemandRuleName =
+                    self.onDemand.rules.first { $0.id == self.onDemand.state.rule_id }?.name ?? self.onDemandRuleName
+            } else {
+                self.onDemandRuleName = nil
+            }
         }
         networkFacts.networkChanged = { [weak self] in self?.scheduleOnDemandEvaluation() }
         onDemandSettingsChanged()
     }
 
+    /// These callbacks are also exercised by the source-wiring fault harness.
+    private func setupOnDemandDisconnection() {
+        onDemandDisconnect.stop = { [weak self] token, localStopped, replied in
+            guard let self else { return }
+            self.disconnect(
+                completion: replied,
+                onLocalStopped: localStopped,
+                isCurrent: { [weak self] in self?.onDemandDisconnect.isCurrent(token) == true })
+        }
+        onDemandDisconnect.verifyIdle = { [weak self] done in
+            self?.verifyOnDemandIdle(done)
+        }
+        onDemandDisconnect.needsAttention = { [weak self] in self?.helperUnresponsive = true }
+        onDemandDisconnect.settled = { [weak self] in
+            guard let self else { return }
+            self.helperUnresponsive = false
+            if self.onDemandResumePending && self.onDemandLaunchReady {
+                self.onDemandResumePending = false
+                _ = self.connectWithStoredCredentials()
+            }
+        }
+    }
+
+    /// Both reads use the same proxy as the preceding disconnect. The service
+    /// enqueues all three on its serial queue. No response means no permission
+    /// to start. A recovered connection supplies a fresh observation.
+    private func verifyOnDemandIdle(_ done: @escaping (Bool) -> Void) {
+        ensureConnection { proxy in
+            var finished = false
+            let finish: (Bool) -> Void = { idle in
+                guard !finished else { return }
+                finished = true
+                done(idle)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(false) }
+            proxy.getStatus { code, _ in
+                DispatchQueue.main.async {
+                    guard !finished, code == State.disconnected.rawValue else {
+                        finish(false)
+                        return
+                    }
+                    proxy.getNetworkHeld { held in
+                        DispatchQueue.main.async {
+                            guard !finished, !held else {
+                                finish(false)
+                                return
+                            }
+                            guard self.usesCisco else {
+                                finish(true)
+                                return
+                            }
+                            // The service cannot report Cisco's session. Read
+                            // Cisco itself after its local stop callback; parsing
+                            // and the bounded CLI process remain in the Rust core.
+                            DispatchQueue.global(qos: .utility).async {
+                                let result = CiscoEngine.run(["state"], timeout: 2)
+                                let idle = result.status == 0
+                                    && CiscoEngine.parseState(result.output) == "Disconnected"
+                                DispatchQueue.main.async { finish(idle) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func onDemandSettingsChanged() {
-        if AppRole.isSettings { SettingsLink.shared.send("onDemandChanged"); return }
+        if AppRole.isSettings {
+            SettingsLink.shared.send("onDemandChanged")
+            return
+        }
         onDemandDebounce?.cancel()
         pendingOnDemandFacts = nil
         let settings = ProfileStore.loadAppSettings()
         networkFacts.watch(enabled: settings.onDemandEnabled == true)
         onDemand.configure(enabled: settings.onDemandEnabled == true, rules: settings.onDemandRules ?? [])
+        onDemandDisconnect.recheck()
     }
 
     private func scheduleOnDemandEvaluation() {
@@ -443,15 +519,15 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// The restore must visibly do something: no answer from the
     /// background service in 5 s offers the forced restore (F9).
-    private func watchRestore(_ send: (@escaping () -> Void) -> Void) {
+    private func watchRestore(isCurrent: @escaping () -> Bool = { true }, _ send: (@escaping () -> Void) -> Void) {
         var answered = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            if !answered { self?.helperUnresponsive = true }
+            if !answered && isCurrent() { self?.helperUnresponsive = true }
         }
         send {
             DispatchQueue.main.async {
                 answered = true
-                self.helperUnresponsive = false
+                if isCurrent() { self.helperUnresponsive = false }
             }
         }
     }
@@ -463,11 +539,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     func prepareForForcedRestore() {
         dropTracker.noteUserStop()
         resettingNetwork = true
+        onDemandResumePending = false
+        onDemandDisconnect.suspend()
     }
 
     /// Panel: the forced restore was cancelled or failed.
     func forcedRestoreAbandoned() {
         resettingNetwork = false
+        onDemandDisconnect.recover()
     }
 
     /// Panel: the forced restore went through (or the service is back).
@@ -475,30 +554,42 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         helperUnresponsive = false
         resettingNetwork = false
         awaitingRestartRecovery = false
+        onDemandDisconnect.recover()
         refreshStatus()
     }
 
     func disconnectByUser() {
         onDemandDebounce?.cancel()
-        onDemand.manualConnect() // cancel pending probes; preserve the user's intent
+        onDemand.manualConnect()  // cancel pending probes; preserve the user's intent
         onDemandResumePending = false
-        disconnect()
+        if onDemandDisconnect.waiting {
+            onDemandDisconnect.recheck()
+        } else {
+            disconnect()
+        }
     }
 
-    func disconnect(completion: (() -> Void)? = nil) {
+    func disconnect(
+        completion: (() -> Void)? = nil,
+        onLocalStopped: (() -> Void)? = nil,
+        isCurrent: @escaping () -> Bool = { true }
+    ) {
         dropTracker.noteUserStop()
         if let cisco {
             // Network first: "断开 VPN，恢复直连网络" must restore the
             // direct network at once, not after Cisco has wound down a
             // login that may still be trying (DESIGN.md §21.10).
             pfWarning = nil
-            watchRestore { answered in
+            watchRestore(isCurrent: isCurrent) { answered in
                 ensureConnection { proxy in
-                    proxy.disconnect { answered(); DispatchQueue.main.async { self.refreshHeld() } }
+                    proxy.disconnect {
+                        answered()
+                        DispatchQueue.main.async { self.refreshHeld() }
+                    }
                 }
             }
             cisco.disconnect { [weak self] in
-                guard let self else { return }
+                guard let self, isCurrent() else { return }
                 // Unload again in case the engine re-armed in between. But
                 // if the user has meanwhile switched to the own connection
                 // (按网站分流 on), a full disconnect would stop the session
@@ -506,29 +597,41 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 // Cisco kill switch goes then.
                 self.ensureConnection { proxy in
                     if self.usesCisco {
-                        proxy.disconnect { DispatchQueue.main.async { self.refreshHeld(); completion?() } }
+                        proxy.disconnect {
+                            DispatchQueue.main.async {
+                                guard isCurrent() else { return }
+                                self.refreshHeld()
+                                completion?()
+                            }
+                        }
                     } else {
-                        proxy.setKillSwitch(0, tunnelIf: "", gatewayIps: []) { _, _ in DispatchQueue.main.async { completion?() } }
+                        proxy.setKillSwitch(0, tunnelIf: "", gatewayIps: []) { _, _ in
+                            DispatchQueue.main.async { completion?() }
+                        }
                     }
+                    onLocalStopped?()
                 }
             }
             return
         }
         let relay = takeRelay()
-        watchRestore { answered in
+        if onLocalStopped != nil { retire(relay) }
+        watchRestore(isCurrent: isCurrent) { answered in
             ensureConnection { proxy in
                 proxy.disconnect { [weak self] in
                     answered()
                     // An engine-less restore (held network, no session)
                     // pushes nothing; re-read state and the held flag.
                     DispatchQueue.main.async {
-                        self?.retire(relay)
+                        guard isCurrent() else { return }
+                        if onLocalStopped == nil { self?.retire(relay) }
                         self?.refreshStatus()
                         completion?()
                     }
                 }
             }
         }
+        onLocalStopped?()
     }
 
     /// Own connection only (§26.11): connected but nothing gets through
@@ -863,11 +966,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         if manual {
             onDemandDebounce?.cancel()
             onDemand.manualConnect()
-            if onDemandDisconnecting { onDemandResumePending = true; return hasCredentials }
+            if onDemandDisconnect.waiting {
+                onDemandResumePending = true
+                onDemandDisconnect.recheck()
+                return hasCredentials
+            }
             return startStoredConnection()
         }
-        if onDemandDisconnecting {
+        if onDemandDisconnect.waiting {
             if !onDemandPaused { onDemandResumePending = true }
+            onDemandDisconnect.recheck()
             return hasCredentials
         }
         onDemand.automatic { [weak self] in _ = self?.startStoredConnection() }
@@ -1047,12 +1155,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     }
 
     func refreshStatus() {
-        if AppRole.isSettings { SettingsLink.shared.send("refreshStatus"); return }
+        if AppRole.isSettings {
+            SettingsLink.shared.send("refreshStatus")
+            return
+        }
         ensureConnection { proxy in
             proxy.getStatus { [weak self] stateCode, detail in
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.markHelperReachable()
+                    self.onDemandDisconnect.recheck()
                     if self.usesCisco {
                         self.refreshHeld()
                     } else {
@@ -1184,6 +1296,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.markHelperReachable()
+            self.onDemandDisconnect.recheck()
             // With the Cisco engine the Helper's own (idle) engine is
             // not the tunnel; its pushes only prove the Helper is up.
             if !self.usesCisco {
@@ -1559,7 +1672,18 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 DispatchQueue.main.async {
                     guard let self else { return }
                     guard !self.resettingNetwork else { return }
-                    if self.onDemandPaused { self.awaitingRestartRecovery = false; self.refreshStatus(); return }
+                    if self.onDemandDisconnect.waiting {
+                        self.awaitingRestartRecovery = false
+                        self.markHelperReachable()
+                        self.onDemandDisconnect.recover()
+                        self.refreshStatus()
+                        return
+                    }
+                    if self.onDemandPaused {
+                        self.awaitingRestartRecovery = false
+                        self.refreshStatus()
+                        return
+                    }
                     let awaited = self.awaitingRestartRecovery
                     self.awaitingRestartRecovery = false
                     self.markHelperReachable()
@@ -1576,8 +1700,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         // closed the episode at once as 断了 2 秒，停止重试
                         // while the App was already connecting again
                         // (user report, DESIGN.md §27.5).
-                        self.applyState(stateCode: State.reconnecting.rawValue,
-                                        detail: "后台服务重启了，正在重新连接…")
+                        self.applyState(
+                            stateCode: State.reconnecting.rawValue,
+                            detail: "后台服务重启了，正在重新连接…")
                         _ = self.connectWithStoredCredentials()
                     } else {
                         self.applyState(stateCode: stateCode, detail: detail)
@@ -1655,7 +1780,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     private func ensureConnection(_ body: @escaping (AlwaysConnectHelperProtocol) -> Void) {
         if let connection,
-           let proxy = connection.remoteObjectProxy as? AlwaysConnectHelperProtocol {
+            let proxy = connection.remoteObjectProxy as? AlwaysConnectHelperProtocol
+        {
             body(proxy)
             return
         }
@@ -1666,22 +1792,30 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         connection.exportedInterface = NSXPCInterface(
             with: AlwaysConnectHelperClientProtocol.self)
         connection.exportedObject = self
-        connection.interruptionHandler = { [weak self] in
+        connection.interruptionHandler = { [weak self, weak connection] in
             DispatchQueue.main.async {
-                guard let self, !AppRole.isSettings else { return }
+                guard let self, self.connection === connection, !AppRole.isSettings else { return }
                 // The panel's "后台服务未运行" row already says it;
                 // no second red line.
                 self.helperAvailable = false
+                self.onDemandDisconnect.transportLost()
                 // The reset stops the service on purpose (§24.6).
                 guard !self.resettingNetwork else { return }
-                let wasActive = self.state != .disconnected
+                let wasActive = self.state != .disconnected || self.onDemandDisconnect.waiting
                 self.scheduleRestartRecovery(wasActive: wasActive)
             }
         }
-        connection.invalidationHandler = { [weak self] in
+        connection.invalidationHandler = { [weak self, weak connection] in
             DispatchQueue.main.async {
-                if !AppRole.isSettings { self?.helperAvailable = false }
-                self?.connection = nil
+                guard let self, self.connection === connection else { return }
+                self.connection = nil
+                if !AppRole.isSettings {
+                    self.helperAvailable = false
+                    self.onDemandDisconnect.transportLost()
+                    if self.onDemandDisconnect.waiting, !self.resettingNetwork {
+                        self.scheduleRestartRecovery(wasActive: true)
+                    }
+                }
             }
         }
         connection.resume()

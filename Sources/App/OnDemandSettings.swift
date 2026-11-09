@@ -26,17 +26,30 @@ struct OnDemandSettings: View {
                             Text(actionName(rule.action)).font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button("上移") { rules.swapAt(index, index - 1); save() }.disabled(index == 0)
-                        Button("下移") { rules.swapAt(index, index + 1); save() }.disabled(index + 1 == rules.count)
+                        Button("上移") {
+                            rules.swapAt(index, index - 1)
+                            save()
+                        }.disabled(index == 0)
+                        Button("下移") {
+                            rules.swapAt(index, index + 1)
+                            save()
+                        }.disabled(index + 1 == rules.count)
                         Button("编辑") { editing = rule }
-                        Button("删除", role: .destructive) { rules.remove(at: index); save() }
+                        Button("删除", role: .destructive) {
+                            rules.remove(at: index)
+                            save()
+                        }
                     }
                 }
                 if let draft = editing {
                     OnDemandRuleEditor(rule: draft, cancel: { editing = nil }) { rule in
-                        if let index = rules.firstIndex(where: { $0.id == rule.id }) { rules[index] = rule }
-                        else { rules.append(rule) }
-                        editing = nil; save()
+                        if let index = rules.firstIndex(where: { $0.id == rule.id }) {
+                            rules[index] = rule
+                        } else {
+                            rules.append(rule)
+                        }
+                        editing = nil
+                        save()
                     }
                     .id(draft.id)
                 } else {
@@ -51,33 +64,57 @@ struct OnDemandSettings: View {
             }.padding(6)
         }
         .onDisappear {
+            testing = false
             testGeneration += 1
-            testProbe?.cancel(); testProbe = nil
-            testMonitor?.pathUpdateHandler = nil; testMonitor?.cancel(); testMonitor = nil; testFacts = nil
+            testProbe?.cancel()
+            testProbe = nil
+            testMonitor?.pathUpdateHandler = nil
+            testMonitor?.cancel()
+            testMonitor = nil
+            testFacts = nil
         }
     }
     private func save() {
         var settings = ProfileStore.loadAppSettings()
-        settings.onDemandEnabled = enabled; settings.onDemandRules = rules
+        settings.onDemandEnabled = enabled
+        settings.onDemandRules = rules
         ProfileStore.saveAppSettings(settings)
         HelperClient.shared.onDemandSettingsChanged()
-        testGeneration += 1; testProbe?.cancel(); testProbe = nil; testing = false; testResult = nil
-        testMonitor?.pathUpdateHandler = nil; testMonitor?.cancel(); testMonitor = nil; testFacts = nil
+        testGeneration += 1
+        testProbe?.cancel()
+        testProbe = nil
+        testing = false
+        testResult = nil
+        testMonitor?.pathUpdateHandler = nil
+        testMonitor?.cancel()
+        testMonitor = nil
+        testFacts = nil
     }
     private func test() {
         guard enabled else { return }
-        testGeneration += 1; let token = testGeneration
+        testGeneration += 1
+        let token = testGeneration
         testing = true
         // Settings child owns this read-only, short-lived monitor. It never
         // changes VPN state; the normal policy is evaluated by the App.
-        let monitor = NWPathMonitor(); testMonitor = monitor
-        let reader = NetworkFacts(); testFacts = reader
+        let monitor = NWPathMonitor()
+        testMonitor = monitor
+        let reader = NetworkFacts()
+        testFacts = reader
         monitor.pathUpdateHandler = { path in
             DispatchQueue.main.async {
                 guard token == testGeneration else { return }
-                monitor.pathUpdateHandler = nil; monitor.cancel(); testMonitor = nil
+                monitor.pathUpdateHandler = nil
+                monitor.cancel()
+                testMonitor = nil
                 let facts = reader.collect(path: path, needsSSID: rules.contains { !$0.ssids.isEmpty })
-                let description = "网络：\(facts.network == "wifi" ? "Wi-Fi" : facts.network == "wired" ? "有线" : "未知")\nWi-Fi 名称：\(facts.ssid ?? reader.locationDescription)\n搜索域：\(facts.domains.joined(separator: ", "))\nDNS 服务器：\(facts.servers.joined(separator: ", "))"
+                let network = facts.network == "wifi" ? "Wi-Fi" : facts.network == "wired" ? "有线" : "未知"
+                let description = [
+                    "网络：\(network)",
+                    "Wi-Fi 名称：\(facts.ssid ?? reader.locationDescription)",
+                    "搜索域：\(facts.domains.joined(separator: ", "))",
+                    "DNS 服务器：\(facts.servers.joined(separator: ", "))",
+                ].joined(separator: "\n")
                 testDecision(facts, reader: reader, description: description, token: token)
             }
         }
@@ -87,18 +124,21 @@ struct OnDemandSettings: View {
         guard token == testGeneration else { return }
         let result = OnDemandCore.decide(enabled: true, rules: rules, facts: facts)
         if let probe = result.probe, let id = result.rule_id {
-            let task = OnDemandNetworkProbe(); testProbe = task
+            let task = OnDemandNetworkProbe()
+            testProbe = task
             task.run(probe, interface: reader.interface, servers: facts.servers) { matched in
                 _ = task
                 guard token == testGeneration else { return }
                 testProbe = nil
-                var facts = facts; facts.probes[id] = matched
+                var facts = facts
+                facts.probes[id] = matched
                 testDecision(facts, reader: reader, description: description, token: token)
             }
         } else {
             let name = rules.first { $0.id == result.rule_id }?.name ?? "未命中规则"
             testResult = description + "\n结果：\(name) · \(actionName(result.action))（测试不会更改连接）"
-            testing = false; testFacts = nil
+            testing = false
+            testFacts = nil
         }
     }
 }
@@ -120,7 +160,9 @@ private struct OnDemandRuleEditor: View {
         VStack(alignment: .leading, spacing: 8) {
             TextField("规则名称", text: $rule.name)
             Picker("网络类型", selection: $rule.network) {
-                Text("任意").tag("any"); Text("Wi-Fi").tag("wifi"); Text("有线").tag("wired")
+                Text("任意").tag("any")
+                Text("Wi-Fi").tag("wifi")
+                Text("有线").tag("wired")
             }
             TextField("Wi-Fi 名称，每行一个，例如 Office-WiFi", text: $ssids, axis: .vertical)
             TextField("DNS 搜索域，例如 *.example.com", text: $domains)
@@ -128,25 +170,36 @@ private struct OnDemandRuleEditor: View {
             Text("Wi-Fi 名称每行一个，精确匹配；其他值用换行或逗号分隔。留空表示不限制。")
                 .font(.caption).foregroundStyle(.secondary)
             Picker("探针", selection: $probeKind) {
-                Text("不使用").tag("none"); Text("URL 返回 200").tag("url"); Text("域名能解析").tag("dns")
+                Text("不使用").tag("none")
+                Text("URL 返回 200").tag("url")
+                Text("域名能解析").tag("dns")
             }
             if probeKind != "none" {
-                TextField(probeKind == "url" ? "https://intranet.example.com/" : "intranet.example.com", text: $probeTarget)
+                TextField(
+                    probeKind == "url" ? "https://intranet.example.com/" : "intranet.example.com", text: $probeTarget)
                 Text("仅经物理网卡，3 秒超时；VPN 或断线保护拦截时视为不命中。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Picker("命中后", selection: $rule.action) {
-                Text("连接").tag("connect"); Text("断开").tag("disconnect"); Text("忽略").tag("ignore")
+                Text("连接").tag("connect")
+                Text("断开").tag("disconnect")
+                Text("忽略").tag("ignore")
             }
             if let error { Text(error).font(.caption).foregroundStyle(.orange) }
-            HStack { Spacer(); Button("取消", action: cancel); Button("保存", action: commit) }
+            HStack {
+                Spacer()
+                Button("取消", action: cancel)
+                Button("保存", action: commit)
+            }
         }
         .textFieldStyle(.roundedBorder)
         .padding(10).background(Color.primary.opacity(0.04)).cornerRadius(8)
         .onAppear {
-            ssids = rule.ssids.joined(separator: "\n"); domains = rule.domains.joined(separator: ", ")
+            ssids = rule.ssids.joined(separator: "\n")
+            domains = rule.domains.joined(separator: ", ")
             servers = rule.servers.joined(separator: ", ")
-            probeKind = rule.probe?.kind ?? "none"; probeTarget = rule.probe?.target ?? ""
+            probeKind = rule.probe?.kind ?? "none"
+            probeTarget = rule.probe?.target ?? ""
         }
     }
     private func values(_ text: String) -> [String] {
@@ -156,12 +209,22 @@ private struct OnDemandRuleEditor: View {
     private func commit() {
         var draft = rule
         draft.name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        draft.ssids = ssids.components(separatedBy: .newlines).filter { !$0.isEmpty }; draft.domains = values(domains); draft.servers = values(servers)
-        draft.probe = probeKind == "none" ? nil : OnDemandProbe(kind: probeKind, target: probeTarget.trimmingCharacters(in: .whitespacesAndNewlines))
-        guard !draft.name.isEmpty else { error = "请给规则起一个名字。"; return }
+        draft.ssids = ssids.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        draft.domains = values(domains)
+        draft.servers = values(servers)
+        draft.probe =
+            probeKind == "none"
+            ? nil : OnDemandProbe(kind: probeKind, target: probeTarget.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !draft.name.isEmpty else {
+            error = "请给规则起一个名字。"
+            return
+        }
         struct Validation: Decodable { var valid: Bool }
         let answer: Validation? = OnDemandCore.call(ac_on_demand_validate, draft)
-        guard answer?.valid == true else { error = "至少填写一个条件；请检查域名、DNS 地址和探针地址。"; return }
+        guard answer?.valid == true else {
+            error = "至少填写一个条件；请检查域名、DNS 地址和探针地址。"
+            return
+        }
         save(draft)
     }
 }
