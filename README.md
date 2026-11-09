@@ -85,6 +85,33 @@
 
 在面板上拨一下「按网站分流」就能切换。连着 VPN 时也能切，确认后会自动重新连接一次。
 
+## 它是怎么工作的
+
+AlwaysConnect 由两个程序组成：**菜单栏 App** 和**后台服务**。改防火墙和路由要管理员权限，所以交给后台服务；
+钥匙串里的密码和证书只有你的账号能用，所以用到它们的部分留在 App 里。
+
+<p align="center">
+  <img src="docs/images/overview.svg" alt="菜单栏 App 和后台服务各管什么，以及经 Cisco、按网站分流两种连法">
+</p>
+
+<details>
+<summary><b>给想改代码的人：每一块在哪</b></summary>
+
+| 图里的 | 代码 |
+| --- | --- |
+| 面板、设置、登录提醒、检查更新 | `Sources/App/`（设置窗口是同一个程序以 `--settings` 启动的子进程） |
+| 替你登录 Cisco（方式一） | `core/src/cisco.rs` |
+| 证书转接 | `Sources/App/CertificateRelay.swift`（钥匙串证书与 TLS 握手）+ `core/src/relay.rs`（分包与 DTLS 转发） |
+| App 给后台服务发指令 | XPC：`Sources/Shared/HelperXPC.swift`；后台服务外壳在 `Sources/Helper/` |
+| 运行 openconnect、掉线重连 | `core/src/oc_engine.rs`；改路由与 DNS 的 vpnc-script 在 `Sources/Helper/VpncScript.swift` |
+| 按网站分流 | `core/src/dns_forwarder.rs`（本机 DNS 转发）、`core/src/direct_routes.rs`（直连路由）；名单写法的解析在 `Sources/App/ListRules.swift` |
+| 断线保护 | `core/src/network_guard.rs`（全项目唯一修改 pf 的地方）、`core/src/kill_switch.rs`（经 Cisco 时的掉线监视） |
+| 断开时还原网络设置 | 直连路由的台账（`core/src/direct_routes.rs`）与 vpnc-script 的 route-state |
+
+长时间运行的逻辑都用 Rust 写在 `core/` 里，Swift 只负责界面和系统接口。这张图由 `scripts/make-overview-diagram.py` 生成，改图请改脚本再运行。
+完整设计和每一条实测结论见 [DESIGN.md](DESIGN.md)。
+</details>
+
 ## 安装
 
 > 目前 Releases 页面还没有公开发布的版本，可以先按页面下方「从源码构建」自己编一份。
@@ -151,22 +178,6 @@ xattr -dr com.apple.quarantine /Applications/AlwaysConnect.app
 - 单位 VPN 怎么用由单位说了算：使用前请确认单位允许这类第三方客户端，尤其是"按网站分流"这种自建连接方式；
   并遵守所在地的法律法规。详见 [使用须知与责任声明](RESPONSIBLE-USE.md)。
 - 发现安全问题请按 [SECURITY.md](SECURITY.md) 私下报告，不要开公开 Issue；反馈问题前请先把服务器地址、账号、内网地址换成示例值。
-
-<details>
-<summary><b>它是怎么工作的</b></summary>
-
-```
-菜单栏 App（你的账号权限，读钥匙串）
-  ├─ 经 Cisco：调用 Cisco Secure Client 的命令行登录、监视状态，掉线后重新登录
-  ├─ 按网站分流：用 App 内的证书转接，让打包的 OpenConnect 出示钥匙串里的证书
-  └─ 后台服务（root，用的时候才启动）
-        ├─ 断线保护：用 macOS 防火墙 pf，连着时放行，会话一丢就关上本地出口
-        └─ 分流：本地 DNS 转发 + 按需加直连路由
-```
-
-长时间运行的逻辑（转发、规则匹配、DNS、重连决策）都用 Rust 写在 `core/` 里，Swift 只负责界面和系统接口。
-完整设计和每一条实测结论见 [DESIGN.md](DESIGN.md)。
-</details>
 
 <details>
 <summary><b>验证状态</b></summary>
