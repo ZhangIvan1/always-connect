@@ -2435,3 +2435,14 @@ list-rules harness 同时覆盖旧 AppSettings 缺少新增字段的迁移。
 
 网络事件到达时即取消旧探针、使旧代次失效，去抖期间自动入口等待；稳定后才采样重判。
 未完成的探针不会把网络标成「已判定」，避免相同事实的下一次事件误跳过判定。
+
+
+### 42.6 本批验证记录
+- 脚本级断言：Rust 98 项单测通过，其中按需连接 9 项；Swift 编排 harness 20 项断言通过；
+  list-rules harness（含旧设置缺字段迁移）通过。
+- 编译：macOS 13 目标 App 与后台服务编译、链接、ad-hoc 组装和验签通过；没有运行 App。
+  本地包因构建机缺少 openconnect 不含该组件，仅供构建验证，不作交付安装包。
+- CI harness（本地运行）：local-checks 结束 FAILS=5。模拟网关与经转接的真实引擎缺少 openconnect；
+  helper-client、admin-parent、install-script 的临时签名身份不可用（独立检查 no identity found）。
+  不能称完整验证通过；未推送，远端 CI 未运行。其余断言的通过不能替代上述缺口。
+- 本机实测：定位授权、SSID、真实物理探针、两种 VPN 的断开/恢复和开销均需实测（I32）。

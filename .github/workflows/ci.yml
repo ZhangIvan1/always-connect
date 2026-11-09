@@ -295,6 +295,8 @@ jobs:
         # Sources/App/ApprovalPromptTracker.swift (DESIGN.md §29). The
         # window on a real screen is Mac proof.
         run: scripts/approval-prompt-test.sh
+      - name: On-demand policy and connection orchestration
+        run: scripts/on-demand-test.sh
       - name: Split list rules (domains, geosite, geoip, networks; bundled data)
         # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
         run: scripts/list-rules-test.sh
