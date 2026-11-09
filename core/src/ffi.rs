@@ -1685,3 +1685,9 @@ pub extern "C" fn ac_on_demand_probe(request: *const c_char) -> *mut c_char {
     });
     CString::new(serde_json::to_string(&answer).unwrap_or_default()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
 }
+
+#[no_mangle]
+pub extern "C" fn ac_on_demand_validate(request: *const c_char) -> *mut c_char {
+    let valid = c_str(request).and_then(|s| serde_json::from_str::<crate::on_demand::Rule>(&s).ok()).is_some_and(|r| crate::on_demand::valid(&r));
+    CString::new(serde_json::json!({"valid":valid}).to_string()).unwrap().into_raw()
+}

@@ -2393,3 +2393,39 @@ relay.log 里这些连接"开了 1000 秒左右、隧道计时只有 46 秒"，�
 Rust 单测与脚本 harness 证明纯逻辑；编译证明链接。真实定位、物理网卡探针、VPN 断开不封网与
 开销对比均需实测；未经真实 Mac + 网关验证，不宣称达到本机实测级别。
 章节编号沿用上游已有四十、四十一，避免覆盖既有契约。
+
+
+### 42.3 系统外壳、隐私与连接生命周期
+设置放在「连接」页的顶部：按需决定是否建立 VPN，分流页仍负责已连接时流量如何走。
+AppSettings 的可选字段由合成 Codable 的 decodeIfPresent 兼容旧数据，nil 为关闭/空列表；
+仍在既有 App Groups 偏好内，卸载无需新增清理位置。设置经既有私有 SettingsLink 通知菜单栏 App，
+暂停与命中规则名随 remoteSnapshot 同步；无新增后台服务 XPC 方法。
+只有开启且存在 SSID 条件才初始化 CLLocationManager 并请求 requestWhenInUseAuthorization；
+CoreWLAN 读取物理接口的 SSID，拒绝授权记未知。macOS 13 目标下 API 编译检查；真实授权需实测。
+DNS 只读 en* 服务的 SearchDomains/DomainName/ServerAddresses，不读 Global/DNS。
+URL 探针先问物理服务 DNS，再以地址连接，TLS 使用原主机名并保留系统证书校验；
+DNS 与 HTTP(S) 都以 NWParameters.requiredInterface 绑定 en*，总计 3 秒截止，失败不命中。
+无凭据、cookie、重定向或系统代理；仅获取状态行，读缓冲有界。
+
+既有 NWPathMonitor 与 configd 事件通知触发 1.5 秒一次性去抖；无新增轮询/重复计时器。
+物理事实不变的 VPN 路由通知不取消手动覆盖。启动自动连接、后台服务恢复、孤儿会话接管、
+网关换址和连接方式切换统一通过默认的自动入口；面板/快捷键/设置明确 manual=true。
+暂停中自动入口不读密码、不发起连接；手动入口覆盖至下次物理网络变化或编辑规则。
+命中断开调用既有 disconnect（Cisco 和自建均生效），中途准备的自建连接也检查暂停。
+连接动作清除暂停；仅自动连接已开或暂停前在连接时恢复；忽略保留原暂停。
+
+### 42.4 限制与开销预算
+Cisco 全隧道过滤器可能挡住物理探针；自建连接封网时非本地探针可能被 pf 拦截。
+本次不放宽 pf，不绕过 Cisco；失败保持连接，优先使用 SSID/搜索域条件。
+关闭功能不采集事实、不请求定位、不发探针；运行中只保留小规则/事实快照，探针截止后释放。
+本任务不运行 App，无法测量改前后 footprint / CPU / 每秒唤醒，列入真机清单，不能宣称开销已达标。
+
+
+### 42.5 收尾竞态与验证入口
+手动连接、关开关、换网络时取消旧探针，代次检查丢弃迟到结果。
+若规则变化或用户「仍然连接」发生在异步断开收尾中，先等待既有 disconnect 回调再连接，
+不以新的轮询等待收尾，防止 Cisco 的迟到卸载停止新会话。用户手动断开也取消待恢复请求。
+configd 物理服务变更和接口/地址指纹用于区分真实换网与 VPN 自身通知。
+域名探针按需查询 A/AAAA；HTTPS 用原始域名验证证书。全部探针共用一个 3 秒截止。
+新增 `scripts/on-demand-test.sh`（桩事实编排断言）并加入 local-checks 和 macOS CI；
+list-rules harness 同时覆盖旧 AppSettings 缺少新增字段的迁移。

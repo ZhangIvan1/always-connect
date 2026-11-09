@@ -29,7 +29,11 @@ fn any(expected: &[String], actual: &[String], matches: impl Fn(&str,&str)->bool
     expected.is_empty() || expected.iter().any(|p|actual.iter().any(|v|matches(p,v)))
 }
 pub fn valid(r: &Rule) -> bool {
-    !r.id.is_empty() && ["connect","disconnect","ignore"].contains(&r.action.as_str())
+    !r.id.is_empty()
+        && r.ssids.iter().all(|s| !s.is_empty())
+        && r.domains.iter().all(|s| dns_query(s.strip_prefix("*.").unwrap_or(s)).is_some())
+        && r.servers.iter().all(|s| s.parse::<std::net::IpAddr>().is_ok())
+        && ["connect","disconnect","ignore"].contains(&r.action.as_str())
         && ["","any","wifi","wired"].contains(&r.network.as_str())
         && (r.network=="wifi" || r.network=="wired" || !r.ssids.is_empty() || !r.domains.is_empty() || !r.servers.is_empty() || r.probe.is_some())
         && r.probe.as_ref().is_none_or(|p|probe_plan(p).is_some())
@@ -64,14 +68,14 @@ pub fn transition(t:Transition)->Effect {
         "network"|"settings"=>{s.manual=false;}
         "decision" if !s.manual=>match t.action.as_str() {
             "disconnect"=>{s.resume|=t.active;s.paused=true;s.rule_id=t.rule_id;effect="disconnect";}
-            "connect"=>{if s.paused && (s.resume||t.auto_connect) {effect="connect";} s=Runtime::default();}
+            "connect"=>{if (s.paused || (t.rule_id.is_some() && !t.active)) && (s.resume||t.auto_connect) {effect="connect";} s=Runtime::default();}
             _=>(),
         },_=>(),
     }
     Effect{state:s,effect:effect.into()}
 }
 #[derive(Debug, Serialize)]
-pub struct ProbePlan {pub host:String,pub port:u16,pub tls:bool,pub request:Vec<u8>,pub dns_query:Vec<u8>}
+pub struct ProbePlan {pub host:String,pub port:u16,pub tls:bool,pub request:Vec<u8>,pub dns_query:Vec<u8>,pub dns_query_v6:Vec<u8>}
 fn dns_query(host:&str)->Option<Vec<u8>> {
     let host=host.trim_end_matches('.'); if host.is_empty()||host.len()>253{return None;}
     let mut q=vec![0x41,0x43,1,0,0,1,0,0,0,0,0,0];
@@ -91,12 +95,30 @@ pub fn probe_plan(p:&Probe)->Option<ProbePlan> {
             (host.into(),port,tls,format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n").into_bytes())
         },_=>return None,
     };
-    Some(ProbePlan{dns_query:dns_query(&host)?,host,port,tls,request})
+    let dns_query=dns_query(&host)?; let mut dns_query_v6=dns_query.clone(); let n=dns_query_v6.len(); dns_query_v6[n-3]=28;
+    Some(ProbePlan{dns_query,dns_query_v6,host,port,tls,request})
+}
+fn dns_addresses(b:&[u8])->Vec<String> {
+    let mut ips=crate::dns_forwarder::ipv4_answers(b).iter().map(ToString::to_string).collect::<Vec<_>>();
+    let mut at=12;
+    let qd=u16::from_be_bytes([b[4],b[5]]); let an=u16::from_be_bytes([b[6],b[7]]);
+    for _ in 0..qd {let Some((_,end))=crate::dns_forwarder::read_name(b,at) else{return ips;}; at=end+4;}
+    for _ in 0..an {
+        let Some((_,end))=crate::dns_forwarder::read_name(b,at) else{break;};
+        if end+10>b.len(){break;}
+        let len=u16::from_be_bytes([b[end+8],b[end+9]]) as usize; let data=end+10;
+        if data+len>b.len(){break;}
+        if b[end..end+4]==[0,28,0,1] && len==16 {
+            let octets: [u8;16]=b[data..data+16].try_into().unwrap(); ips.push(std::net::Ipv6Addr::from(octets).to_string());
+        }
+        at=data+len;
+    }
+    ips
 }
 pub fn probe_reply(kind:&str,b:&[u8])->serde_json::Value {
     if kind=="dns" {
         let ips=if b.len()>=12 && b[..2]==[0x41,0x43] && b[2]&0x82==0x80 && b[3]&15==0 {
-            crate::dns_forwarder::ipv4_answers(b).iter().map(ToString::to_string).collect::<Vec<_>>()
+            dns_addresses(b)
         }else{vec![]};serde_json::json!({"matched":!ips.is_empty(),"addresses":ips})
     }else{
         let line=b.split(|b|*b==b'\n').next().unwrap_or_default();let mut words=std::str::from_utf8(line).unwrap_or("").split_whitespace();
@@ -131,6 +153,43 @@ pub fn probe_reply(kind:&str,b:&[u8])->serde_json::Value {
         let e=transition(Transition{event:"manual".into(),..Default::default()});
         let e=transition(Transition{state:e.state,event:"decision".into(),action:"disconnect".into(),..Default::default()});assert!(!e.state.paused);
         assert!(!transition(Transition{state:e.state,event:"network".into(),..Default::default()}).state.manual);
+    }
+    #[test] fn first_probe_precedes_later_rule_and_falls_through_on_failure() {
+        let r=serde_json::json!([
+            {"id":"a","network":"wired","probe":{"kind":"url","target":"https://intranet.example.com/"},"action":"ignore"},
+            {"id":"b","network":"wired","action":"disconnect"}]);
+        assert_eq!(d(r.clone(),serde_json::json!({"network":"wired"})).action,"probe");
+        assert_eq!(d(r.clone(),serde_json::json!({"network":"wired","probes":{"a":true}})).action,"ignore");
+        assert_eq!(d(r,serde_json::json!({"network":"wired","probes":{"a":false}})).rule_id.as_deref(),Some("b"));
+    }
+    #[test] fn dns_wire_addresses_and_errors() {
+        let p=Probe{kind:"dns".into(),target:"intranet.example.com".into()}; let plan=probe_plan(&p).unwrap();
+        let mut a=plan.dns_query.clone(); a[2]=0x81;a[3]=0x80;a[7]=1;
+        a.extend([0xc0,0x0c,0,1,0,1,0,0,0,30,0,4,10,0,0,53]);
+        assert_eq!(probe_reply("dns",&a)["addresses"][0],"10.0.0.53");
+        a[3]=0x83; assert_eq!(probe_reply("dns",&a)["matched"],false);
+        let mut a=plan.dns_query_v6.clone();a[2]=0x81;a[3]=0x80;a[7]=1;
+        a.extend([0xc0,0x0c,0,28,0,1,0,0,0,30,0,16]);
+        a.extend(std::net::Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(probe_reply("dns",&a)["addresses"][0],"::1");
+        a[0]=0;assert_eq!(probe_reply("dns",&a)["matched"],false);
+    }
+    #[test] fn invalid_conditions_are_not_disconnect_rules() {
+        for r in [
+            serde_json::json!({"id":"a","network":"any","action":"disconnect"}),
+            serde_json::json!({"id":"a","servers":["invalid"],"action":"disconnect"}),
+            serde_json::json!({"id":"a","domains":["*bad.example.com"],"action":"disconnect"})
+        ] { assert_eq!(d(serde_json::json!([r]),serde_json::json!({})).action,"connect"); }
+    }
+    #[test] fn disabled_never_requests_a_probe() {
+        let r=Rule{id:"a".into(),probe:Some(Probe{kind:"dns".into(),target:"example.com".into()}),action:"disconnect".into(),..Default::default()};
+        assert_eq!(decide(&Request{enabled:false,rules:vec![r],..Default::default()}).action,"connect");
+    }
+    #[test] fn auto_connect_resumes_and_idle_off_does_not() {
+        for (auto,expected) in [(true,"connect"),(false,"none")] {
+            let e=transition(Transition{state:Runtime{paused:true,..Default::default()},event:"decision".into(),action:"connect".into(),auto_connect:auto,..Default::default()});
+            assert_eq!(e.effect,expected);assert!(!e.state.paused);
+        }
     }
     #[test] fn wire_validation(){
         for t in ["https://intranet.example.com/check","http://10.0.0.53/?a=b"]{assert!(probe_plan(&Probe{kind:"url".into(),target:t.into()}).is_some());}
