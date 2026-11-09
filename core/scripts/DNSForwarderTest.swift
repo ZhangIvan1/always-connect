@@ -57,9 +57,18 @@ func query(_ name: String, type: UInt16, id: UInt16 = 0x1234) -> [UInt8] {
     return m
 }
 
-/// The question echoed back with one A record (compressed name pointer).
+/// An HTTPS record's data: priority 1, TargetName ".", alpn h3.
+let httpsKept: [UInt8] = [0, 1, 0, 0, 1, 0, 3, 2, 0x68, 0x33]
+
+/// The question echoed back with one A record (compressed name pointer);
+/// an HTTPS question gets an HTTPS record with alpn and an ipv4hint.
 func answer(to q: [UInt8], ip: [UInt8], truncated: Bool = false) -> [UInt8] {
     var m = q
+    if !truncated, q.count >= 2, Array(q.suffix(4).prefix(2)) == [0, UInt8(DNSMessage.typeHTTPS)] {
+        let data = httpsKept + [0, 4, 0, 4] + ip
+        m[2] = 0x81; m[3] = 0x80; m[6] = 0; m[7] = 1
+        return m + [0xC0, 0x0C, 0, 65, 0, 1, 0, 0, 1, 44, 0, UInt8(data.count)] + data
+    }
     m[2] = 0x81 | (truncated ? 0x02 : 0); m[3] = 0x80
     m[6] = 0; m[7] = truncated ? 0 : 1
     if !truncated { m += [0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4] + ip }
@@ -173,9 +182,13 @@ struct DNSForwarderTest {
         // 2 IPv4 only for direct names
         let a2 = ask(query("www.sitea.com", type: DNSMessage.typeAAAA), port: 5400)
         check(a2 != nil && a2![7] == 0 && a2![3] & 0x0F == 0, "direct AAAA: empty NOERROR answer")
+        check(local.udpQueries == 1, "AAAA never reached the local DNS")
         let a3 = ask(query("www.sitea.com", type: DNSMessage.typeHTTPS), port: 5400)
-        check(a3 != nil && a3![7] == 0, "direct HTTPS record: empty answer, no address hints")
-        check(local.udpQueries == 1, "those never reached the local DNS")
+        let hintless = [0xC0, 0x0C, 0, 65, 0, 1, 0, 0, 1, 44, 0, UInt8(httpsKept.count)] + httpsKept
+        check(a3 != nil && a3![7] == 1 && Array(a3!.suffix(hintless.count)) == hintless
+              && a3!.count == query("www.sitea.com", type: DNSMessage.typeHTTPS).count + hintless.count,
+              "direct HTTPS record: passed on from the local DNS without its address hint")
+        check(local.udpQueries == 2, "the HTTPS question went to the local DNS")
 
         // 3 everything else: tunnel DNS, next server when the first is down
         events.removeAll()
@@ -188,6 +201,9 @@ struct DNSForwarderTest {
         let a4v6 = ask(query("intranet.example", type: DNSMessage.typeAAAA), port: 5400)
         check(a4v6 != nil && a4v6![7] == 0 && a4v6![3] & 0x0F == 0, "other names' AAAA: empty NOERROR answer")
         check(tunnelGood.udpQueries == before, "...without asking the tunnel's DNS")
+        let a4h = ask(query("intranet.example", type: DNSMessage.typeHTTPS), port: 5400)
+        check(a4h != nil && a4h![7] == 1 && Array(a4h!.suffix(hintless.count)) == hintless,
+              "other names' HTTPS record: passed on without its address hint")
 
         // 4 truncated over UDP: the same server again over TCP
         fwd.update(tunnelServers: ["127.0.0.1:5404"], localServers: ["127.0.0.1:5401"], physicalIf: nil)

@@ -11,8 +11,9 @@
 //! other, over UDP and then TCP (also when the UDP answer is truncated).
 //!
 //! The tunnel carries IPv4 only and pf drops IPv6 out of the Mac in
-//! split mode, so AAAA answers are empty for every name, and HTTPS
-//! (SVCB) answers too for direct names (no unrouted address hints).
+//! split mode, so AAAA answers are empty for every name. HTTPS and SVCB
+//! answers pass with their address hints taken out (§42), so a client
+//! connects only to what an A query returned, which is routed first.
 //!
 //! Threads: one waits (poll, no timeout) on the UDP and TCP sockets and
 //! drains whatever is ready; queries are answered by pooled workers with
@@ -33,7 +34,19 @@ use std::time::{Duration, Instant};
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_AAAA: u16 = 28;
+pub const TYPE_SVCB: u16 = 64;
 pub const TYPE_HTTPS: u16 = 65;
+const TYPE_NS: u16 = 2;
+const TYPE_CNAME: u16 = 5;
+const TYPE_SOA: u16 = 6;
+const TYPE_PTR: u16 = 12;
+const TYPE_MX: u16 = 15;
+const TYPE_SRV: u16 = 33;
+const TYPE_DNAME: u16 = 39;
+/// SvcParamKeys (RFC 9460 §14.3.2).
+const SVC_MANDATORY: u16 = 0;
+const SVC_IPV4HINT: u16 = 4;
+const SVC_IPV6HINT: u16 = 6;
 
 const MAX_INFLIGHT: usize = 64;
 const WORKER_STACK: usize = 128 * 1024;
@@ -146,6 +159,264 @@ pub fn ipv4_answers(m: &[u8]) -> Vec<Ipv4Addr> {
         at = data + length;
     }
     out
+}
+
+// MARK: - HTTPS/SVCB answers without addresses (§42)
+
+/// A name as raw labels (compression pointers followed, with a hop
+/// limit; 255 bytes at most) and the offset after it in its own place.
+fn read_labels(m: &[u8], start: usize) -> Option<(Vec<Vec<u8>>, usize)> {
+    let mut labels = Vec::new();
+    let mut at = start;
+    let mut end = None;
+    let mut hops = 0;
+    let mut size = 1;
+    loop {
+        let len = *m.get(at)? as usize;
+        if len == 0 {
+            return Some((labels, end.unwrap_or(at + 1)));
+        }
+        if len & 0xC0 == 0xC0 {
+            let low = *m.get(at + 1)? as usize;
+            if hops >= 16 {
+                return None;
+            }
+            end.get_or_insert(at + 2);
+            at = (len & 0x3F) << 8 | low;
+            hops += 1;
+            continue;
+        }
+        if len & 0xC0 != 0 {
+            return None; // extended label types (RFC 6891 obsoleted them)
+        }
+        let label = m.get(at + 1..at + 1 + len)?;
+        size += 1 + len;
+        if size > 255 {
+            return None;
+        }
+        labels.push(label.to_vec());
+        at += 1 + len;
+    }
+}
+
+fn is_service(qtype: u16) -> bool {
+    qtype == TYPE_HTTPS || qtype == TYPE_SVCB
+}
+
+fn same_name(a: &[Vec<u8>], b: &[Vec<u8>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+}
+
+type Labels = Vec<Vec<u8>>;
+
+/// A record as it is written back: owner, type/class/TTL, data.
+type Record = (Labels, [u8; 8], Vec<Part>);
+
+/// An SVCB record's data: SvcPriority, TargetName, SvcParams, and
+/// whether anything was taken out.
+type Svcb = (Vec<u8>, Labels, Vec<u8>, bool);
+
+/// A piece of record data as it is written back.
+enum Part {
+    Bytes(Vec<u8>),
+    /// A name that may be compressed (RFC 1035 types).
+    Name(Vec<Vec<u8>>),
+    /// A name that must not be (SRV, DNAME, SVCB's TargetName).
+    Plain(Vec<Vec<u8>>),
+}
+
+enum Shape {
+    Name(bool),
+    Fixed(usize),
+}
+
+/// Record data laid out as `shape`, which must cover it exactly.
+fn parts(m: &[u8], data: usize, stop: usize, shape: &[Shape]) -> Option<Vec<Part>> {
+    let mut at = data;
+    let mut out = Vec::new();
+    for s in shape {
+        match s {
+            Shape::Name(compressible) => {
+                let (name, end) = read_labels(m, at)?;
+                at = end;
+                out.push(if *compressible { Part::Name(name) } else { Part::Plain(name) });
+            }
+            Shape::Fixed(k) => {
+                out.push(Part::Bytes(m.get(at..at + k)?.to_vec()));
+                at += k;
+            }
+        }
+    }
+    (at == stop).then_some(out)
+}
+
+/// An SVCB/HTTPS record's data (RFC 9460 §2.2) with ipv4hint and
+/// ipv6hint taken out (and out of "mandatory", which may list them).
+fn svcb_without_hints(m: &[u8], data: usize, stop: usize) -> Option<Svcb> {
+    let priority = m.get(data..data + 2)?.to_vec();
+    let (target, mut at) = read_labels(m, data + 2)?;
+    let mut params = Vec::new();
+    let mut removed = false;
+    while at < stop {
+        let head = m.get(at..at + 4)?;
+        let key = (head[0] as u16) << 8 | head[1] as u16;
+        let len = (head[2] as usize) << 8 | head[3] as usize;
+        let value = m.get(at + 4..at + 4 + len)?;
+        at += 4 + len;
+        if key == SVC_IPV4HINT || key == SVC_IPV6HINT {
+            removed = true;
+            continue;
+        }
+        let mut value = value.to_vec();
+        if key == SVC_MANDATORY {
+            if value.len() % 2 != 0 {
+                return None;
+            }
+            let keys: Vec<u8> = value
+                .chunks(2)
+                .filter(|k| {
+                    let k = (k[0] as u16) << 8 | k[1] as u16;
+                    k != SVC_IPV4HINT && k != SVC_IPV6HINT
+                })
+                .flatten()
+                .copied()
+                .collect();
+            if keys.len() != value.len() {
+                removed = true;
+                if keys.is_empty() {
+                    continue;
+                }
+                value = keys;
+            }
+        }
+        params.extend_from_slice(&[(key >> 8) as u8, key as u8, (value.len() >> 8) as u8, value.len() as u8]);
+        params.extend_from_slice(&value);
+    }
+    (at == stop).then_some((priority, target, params, removed))
+}
+
+/// Writes `name`, its longest suffix shared with the question's name as
+/// a pointer into the question (the one part whose offsets stay).
+fn write_name(out: &mut Vec<u8>, name: &[Vec<u8>], question: &[Vec<u8>], offsets: &[usize]) {
+    for i in 0..name.len() {
+        let rest = name.len() - i;
+        if rest <= question.len() && same_name(&name[i..], &question[question.len() - rest..]) {
+            write_plain(out, &name[..i], false);
+            let p = offsets[question.len() - rest];
+            out.extend_from_slice(&[0xC0 | (p >> 8) as u8, p as u8]);
+            return;
+        }
+    }
+    write_plain(out, name, true);
+}
+
+fn write_plain(out: &mut Vec<u8>, labels: &[Vec<u8>], terminate: bool) {
+    for l in labels {
+        out.push(l.len() as u8);
+        out.extend_from_slice(l);
+    }
+    if terminate {
+        out.push(0);
+    }
+}
+
+/// The answer to an HTTPS or SVCB query with no addresses left in it
+/// (§42): ipv4hint/ipv6hint come out of every HTTPS/SVCB record and A/AAAA
+/// records are dropped, so a client connects only to what its own A
+/// query returned (which, for a direct name, the forwarder has routed
+/// first); everything else (ALPN, ECH, port, ...) passes as sent. The
+/// original bytes come back when there is nothing to take out.
+///
+/// None when the message cannot be read, would come out longer, or, for
+/// a name on the direct list (`direct`), holds a record for another name
+/// (a CNAME's target, a TargetName other than "."): the client would go
+/// on to a name the list may not cover.
+pub fn without_addresses(answer: &[u8], direct: bool) -> Option<Vec<u8>> {
+    if answer.len() < 12 {
+        return None;
+    }
+    let count = |i: usize| (answer[i] as usize) << 8 | answer[i + 1] as usize;
+    if count(4) != 1 {
+        return None;
+    }
+    let (qname, qend) = read_labels(answer, 12)?;
+    if qend + 4 > answer.len() {
+        return None;
+    }
+    let mut offsets = Vec::new();
+    let mut at = 12;
+    for l in &qname {
+        offsets.push(at);
+        at += 1 + l.len();
+    }
+    // A question written with a pointer: compress against nothing.
+    let anchor: &[Vec<u8>] = if at + 1 == qend { &qname } else { &[] };
+
+    let mut sections: [Vec<Record>; 3] = Default::default();
+    let mut changed = false;
+    let mut at = qend + 4;
+    for (s, section) in sections.iter_mut().enumerate() {
+        for _ in 0..count(6 + 2 * s) {
+            let (owner, end) = read_labels(answer, at)?;
+            let head: [u8; 8] = answer.get(end..end + 8)?.try_into().ok()?;
+            let rtype = (head[0] as u16) << 8 | head[1] as u16;
+            let length = answer.get(end + 8..end + 10)?;
+            let data = end + 10;
+            let stop = data + ((length[0] as usize) << 8 | length[1] as usize);
+            if stop > answer.len() {
+                return None;
+            }
+            at = stop;
+            let p = match rtype {
+                TYPE_A | TYPE_AAAA => {
+                    changed = true;
+                    continue;
+                }
+                TYPE_SVCB | TYPE_HTTPS => {
+                    let (priority, target, params, removed) = svcb_without_hints(answer, data, stop)?;
+                    if direct && (!same_name(&owner, &qname) || !target.is_empty()) {
+                        return None;
+                    }
+                    changed |= removed;
+                    vec![Part::Bytes(priority), Part::Plain(target), Part::Bytes(params)]
+                }
+                TYPE_CNAME | TYPE_NS | TYPE_PTR => parts(answer, data, stop, &[Shape::Name(true)])?,
+                TYPE_DNAME => parts(answer, data, stop, &[Shape::Name(false)])?,
+                TYPE_MX => parts(answer, data, stop, &[Shape::Fixed(2), Shape::Name(true)])?,
+                TYPE_SRV => parts(answer, data, stop, &[Shape::Fixed(6), Shape::Name(false)])?,
+                TYPE_SOA => parts(answer, data, stop, &[Shape::Name(true), Shape::Name(true), Shape::Fixed(20)])?,
+                _ => vec![Part::Bytes(answer[data..stop].to_vec())],
+            };
+            section.push((owner, head, p));
+        }
+    }
+    if !changed {
+        return Some(answer.to_vec());
+    }
+
+    let mut out = answer[..12].to_vec();
+    for (s, section) in sections.iter().enumerate() {
+        out[6 + 2 * s] = (section.len() >> 8) as u8;
+        out[7 + 2 * s] = section.len() as u8;
+    }
+    out.extend_from_slice(&answer[12..qend + 4]);
+    for (owner, head, p) in sections.iter().flatten() {
+        write_name(&mut out, owner, anchor, &offsets);
+        out.extend_from_slice(head);
+        let length_at = out.len();
+        out.extend_from_slice(&[0, 0]);
+        for part in p {
+            match part {
+                Part::Bytes(b) => out.extend_from_slice(b),
+                Part::Name(n) => write_name(&mut out, n, anchor, &offsets),
+                Part::Plain(n) => write_plain(&mut out, n, true),
+            }
+        }
+        let length = out.len() - length_at - 2;
+        out[length_at] = (length >> 8) as u8;
+        out[length_at + 1] = length as u8;
+    }
+    (out.len() <= answer.len()).then_some(out)
 }
 
 // MARK: - The direct list
@@ -481,12 +752,19 @@ impl Inner {
                     }
                 }
             }
+            if is_service(q.qtype) {
+                return answer.map(|a| without_addresses(&a, false).unwrap_or(a));
+            }
             return answer;
         };
-        if q.qtype == TYPE_AAAA || q.qtype == TYPE_HTTPS {
+        if q.qtype == TYPE_AAAA {
             return empty_answer(query);
         }
         let answer = exchange(query, &up.local, self.upstream_port, up.physical_if.as_deref(), self.timeout)?;
+        if is_service(q.qtype) {
+            // Nothing to route: no addresses are left in it.
+            return without_addresses(&answer, true).or_else(|| empty_answer(query));
+        }
         let addresses = ipv4_answers(&answer);
         if !addresses.is_empty() {
             self.direct(&entry, &addresses);
@@ -706,7 +984,111 @@ mod tests {
         m
     }
 
+    fn wire(name: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in name.split('.').filter(|l| !l.is_empty()) {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    fn param(key: u16, value: &[u8]) -> Vec<u8> {
+        let mut p = vec![(key >> 8) as u8, key as u8, (value.len() >> 8) as u8, value.len() as u8];
+        p.extend_from_slice(value);
+        p
+    }
+
+    /// alpn h3,h2 + ipv4hint (two) + ech + ipv6hint, the shape a CDN serves.
+    fn hinted_params() -> Vec<u8> {
+        let mut v6 = vec![0x20, 0x01, 0x0d, 0xb8];
+        v6.extend_from_slice(&[0; 11]);
+        v6.push(1);
+        [
+            param(1, b"\x02h3\x02h2"),
+            param(4, &[192, 0, 2, 1, 192, 0, 2, 2]),
+            param(5, b"ech-config-bytes"),
+            param(6, &v6),
+        ]
+        .concat()
+    }
+
+    /// One resource record: `owner` already in wire form (or a pointer).
+    fn rr(owner: &[u8], rtype: u16, ttl: u32, data: &[u8]) -> Vec<u8> {
+        let mut r = owner.to_vec();
+        r.extend_from_slice(&[(rtype >> 8) as u8, rtype as u8, 0, 1]);
+        r.extend_from_slice(&ttl.to_be_bytes());
+        r.extend_from_slice(&[(data.len() >> 8) as u8, data.len() as u8]);
+        r.extend_from_slice(data);
+        r
+    }
+
+    fn svcb_data(priority: u16, target: &str, params: &[u8]) -> Vec<u8> {
+        [vec![(priority >> 8) as u8, priority as u8], wire(target), params.to_vec()].concat()
+    }
+
+    /// `q` answered with `records` in the three sections.
+    fn reply(q: &[u8], an: &[Vec<u8>], ns: &[Vec<u8>], ar: &[Vec<u8>]) -> Vec<u8> {
+        let mut m = q.to_vec();
+        m[2] = 0x81;
+        m[3] = 0x80;
+        for (i, n) in [an.len(), ns.len(), ar.len()].into_iter().enumerate() {
+            m[6 + 2 * i] = 0;
+            m[7 + 2 * i] = n as u8;
+        }
+        for r in an.iter().chain(ns).chain(ar) {
+            m.extend_from_slice(r);
+        }
+        m
+    }
+
+    /// Every record as (owner, type, ttl, data with names expanded for
+    /// CNAME/SOA, SvcParamKeys for SVCB/HTTPS), section by section.
+    fn records(m: &[u8]) -> Vec<(String, u16, u32, String)> {
+        let count = |i: usize| (m[i] as usize) << 8 | m[i + 1] as usize;
+        let (_, mut at) = read_name(m, 12).unwrap();
+        at += 4;
+        let mut out = Vec::new();
+        for _ in 0..count(6) + count(8) + count(10) {
+            let (owner, end) = read_name(m, at).unwrap();
+            let rtype = (m[end] as u16) << 8 | m[end + 1] as u16;
+            let ttl = u32::from_be_bytes(m[end + 4..end + 8].try_into().unwrap());
+            let data = end + 10;
+            let stop = data + ((m[end + 8] as usize) << 8 | m[end + 9] as usize);
+            let shown = match rtype {
+                TYPE_CNAME => read_name(m, data).unwrap().0,
+                TYPE_SOA => {
+                    let (a, e) = read_name(m, data).unwrap();
+                    let (b, e) = read_name(m, e).unwrap();
+                    assert_eq!(e + 20, stop);
+                    format!("{a} {b} {:?}", &m[e..e + 4])
+                }
+                TYPE_HTTPS | TYPE_SVCB => {
+                    let (target, mut p) = read_name(m, data + 2).unwrap();
+                    let mut keys = vec![format!("prio={} target={target}", (m[data] as u16) << 8 | m[data + 1] as u16)];
+                    while p < stop {
+                        let key = (m[p] as u16) << 8 | m[p + 1] as u16;
+                        let len = (m[p + 2] as usize) << 8 | m[p + 3] as usize;
+                        keys.push(format!("{key}:{}", String::from_utf8_lossy(&m[p + 4..p + 4 + len])));
+                        p += 4 + len;
+                    }
+                    assert_eq!(p, stop);
+                    keys.join(" ")
+                }
+                _ => format!("{:?}", &m[data..stop]),
+            };
+            out.push((owner, rtype, ttl, shown));
+            at = stop;
+        }
+        assert_eq!(at, m.len());
+        out
+    }
+
     fn answer(q: &[u8], ip: [u8; 4], truncated: bool) -> Vec<u8> {
+        if !truncated && question(q).map(|q| q.qtype) == Some(TYPE_HTTPS) {
+            return reply(q, &[rr(&[0xC0, 0x0C], TYPE_HTTPS, 300, &svcb_data(1, ".", &hinted_params()))], &[], &[]);
+        }
         let mut m = q.to_vec();
         m[2] = 0x81 | if truncated { 0x02 } else { 0 };
         m[3] = 0x80;
@@ -762,6 +1144,73 @@ mod tests {
         bad[12] = 0xC0;
         bad[13] = 12;
         assert_eq!(question(&bad), None);
+    }
+
+    #[test]
+    fn service_answers_lose_only_their_addresses() {
+        let q = query("www.example.com", TYPE_HTTPS, 9);
+        let here = [0xC0u8, 0x0C];
+        // The usual shape: hints in the record, an OPT and an A in the
+        // additional section.
+        let opt = rr(&[0], 41, 0, &[]);
+        let a = rr(&here, TYPE_A, 60, &[192, 0, 2, 9]);
+        let m = reply(&q, &[rr(&here, TYPE_HTTPS, 300, &svcb_data(1, ".", &hinted_params()))], &[], &[a, opt.clone()]);
+        for direct in [false, true] {
+            let out = without_addresses(&m, direct).unwrap();
+            assert!(out.len() < m.len());
+            assert_eq!(&out[..6], &m[..6], "id, flags and question count kept");
+            assert_eq!(question(&out), question(&m));
+            assert_eq!(
+                records(&out),
+                vec![
+                    ("www.example.com".into(), TYPE_HTTPS, 300, "prio=1 target= 1:\u{2}h3\u{2}h2 5:ech-config-bytes".into()),
+                    ("".into(), 41, 0, "[]".into()),
+                ]
+            );
+        }
+
+        // "mandatory" naming a hint loses that key; empty, it goes.
+        let params = [param(0, &[0, 1, 0, 4]), param(1, b"\x02h2"), param(4, &[192, 0, 2, 1])].concat();
+        let m = reply(&q, &[rr(&here, TYPE_HTTPS, 300, &svcb_data(1, ".", &params))], &[], &[]);
+        assert_eq!(records(&without_addresses(&m, true).unwrap())[0].3, "prio=1 target= 0:\0\u{1} 1:\u{2}h2");
+        let params = [param(0, &[0, 6]), param(6, &[0; 16])].concat();
+        let m = reply(&q, &[rr(&here, TYPE_HTTPS, 300, &svcb_data(1, ".", &params))], &[], &[]);
+        assert_eq!(records(&without_addresses(&m, true).unwrap())[0].3, "prio=1 target=");
+
+        // Nothing to take out: the very same bytes.
+        let soa = [wire("ns.example.com"), vec![0xC0, 16], vec![0, 0, 0, 7], vec![0; 16]].concat();
+        let nodata = reply(&q, &[], &[rr(&[0xC0, 16], TYPE_SOA, 900, &soa)], &[]);
+        assert_eq!(without_addresses(&nodata, true).unwrap(), nodata);
+        let plain = reply(&q, &[rr(&here, TYPE_HTTPS, 300, &svcb_data(1, ".", &param(1, b"\x02h3")))], &[], &[]);
+        assert_eq!(without_addresses(&plain, true).unwrap(), plain);
+
+        // A CNAME to another name, or a TargetName other than ".": fine
+        // through the tunnel, not for a direct name.
+        let cname = rr(&here, TYPE_CNAME, 60, &wire("edge.example.net"));
+        let at_target = rr(&wire("edge.example.net"), TYPE_HTTPS, 300, &svcb_data(1, ".", &hinted_params()));
+        let soa_rr = rr(&[0xC0, 16], TYPE_SOA, 900, &soa);
+        let m = reply(&q, &[cname, at_target], &[soa_rr], &[]);
+        assert_eq!(without_addresses(&m, true), None);
+        let out = records(&without_addresses(&m, false).unwrap());
+        assert_eq!(out[0], ("www.example.com".into(), TYPE_CNAME, 60, "edge.example.net".into()));
+        assert_eq!(out[1].3, "prio=1 target= 1:\u{2}h3\u{2}h2 5:ech-config-bytes");
+        assert_eq!(out[2], ("example.com".into(), TYPE_SOA, 900, "ns.example.com example.com [0, 0, 0, 7]".into()));
+        let m = reply(&q, &[rr(&here, TYPE_HTTPS, 300, &svcb_data(1, "pool.example.net", &hinted_params()))], &[], &[]);
+        assert_eq!(without_addresses(&m, true), None);
+        assert_eq!(records(&without_addresses(&m, false).unwrap())[0].3, "prio=1 target=pool.example.net 1:\u{2}h3\u{2}h2 5:ech-config-bytes");
+
+        // Broken messages are not rewritten.
+        let mut short = reply(&q, &[rr(&here, TYPE_HTTPS, 300, &svcb_data(1, ".", &hinted_params()))], &[], &[]);
+        short.truncate(short.len() - 3);
+        assert_eq!(without_addresses(&short, false), None);
+        let mut lying = reply(&q, &[rr(&here, TYPE_HTTPS, 300, &svcb_data(1, ".", &hinted_params()))], &[], &[]);
+        let last = lying.len() - 1;
+        lying[last - 17] = 0xFF; // ipv6hint's length runs past the record
+        assert_eq!(without_addresses(&lying, false), None);
+        let mut looped = m.clone();
+        looped[12] = 0xC0;
+        looped[13] = 12;
+        assert_eq!(without_addresses(&looped, false), None);
     }
 
     /// A fake upstream on loopback answering every query with `ip`.
@@ -851,9 +1300,11 @@ mod tests {
 
         let a = ask(&query("www.sitea.com", TYPE_AAAA, 2), port).unwrap();
         assert_eq!(a[7], 0);
+        // HTTPS: asked of the local DNS, passed on without its hints.
         let a = ask(&query("www.sitea.com", TYPE_HTTPS, 3), port).unwrap();
-        assert_eq!(a[7], 0);
-        assert_eq!(local_count.load(Ordering::SeqCst), 1);
+        let shown = "prio=1 target= 1:\u{2}h3\u{2}h2 5:ech-config-bytes";
+        assert_eq!(records(&a), vec![("www.sitea.com".into(), TYPE_HTTPS, 300, shown.into())]);
+        assert_eq!(local_count.load(Ordering::SeqCst), 2);
 
         let a = ask(&query("intranet.example", TYPE_A, 4), port).unwrap();
         assert_eq!(ipv4_answers(&a), vec![Ipv4Addr::new(198, 51, 100, 2)]);
@@ -861,6 +1312,8 @@ mod tests {
         let a = ask(&query("intranet.example", TYPE_AAAA, 5), port).unwrap();
         assert_eq!((a[7], a[3] & 0x0F), (0, 0));
         assert_eq!(tunnel_count.load(Ordering::SeqCst), before);
+        let a = ask(&query("intranet.example", TYPE_HTTPS, 9), port).unwrap();
+        assert_eq!(records(&a), vec![("intranet.example".into(), TYPE_HTTPS, 300, shown.into())]);
 
         fwd.set_upstreams(Upstreams {
             tunnel: vec![format!("127.0.0.1:{trunc}")],
