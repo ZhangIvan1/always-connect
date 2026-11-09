@@ -1032,7 +1032,10 @@ struct DiagnosticsPage: View {
                         HStack(alignment: .center, spacing: 8) {
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 6) {
-                                    Text(formatDate(drop.droppedAt))
+                                    Text(dropTimeText(drop))
+                                    if drop.isSleepRecord {
+                                        Text("睡眠中").font(.caption).foregroundStyle(.secondary)
+                                    }
                                     if let engine = drop.engineLabel {
                                         Text(engine).font(.caption).foregroundStyle(.secondary)
                                     }
@@ -1070,7 +1073,7 @@ struct DiagnosticsPage: View {
                         }
                 }
             } footer: {
-                Footnote("每条写明断了多久、重新登录了几次、最后恢复没有。超过 \(ProfileStore.dropHistoryLimit) 次时自动删掉最早的一条；删除记录不影响连接。")
+                Footnote("每条写明断了多久、重新登录了几次、最后恢复没有；电脑一次睡眠中的断线合成一条。超过 \(ProfileStore.dropHistoryLimit) 次时自动删掉最早的一条；删除记录不影响连接。")
             }
 
             Section {
@@ -1183,6 +1186,14 @@ struct DiagnosticsPage: View {
         formatter.countStyle = .file
         formatter.allowsNonnumericFormatting = false
         return formatter.string(fromByteCount: count)
+    }
+
+    /// A sleep record spans its first to its newest drop (DESIGN.md §41).
+    private func dropTimeText(_ drop: DropRecord) -> String {
+        guard drop.sleepDropCount > 1 else { return formatDate(drop.droppedAt) }
+        let formatter = DateFormatter()
+        formatter.dateFormat = Calendar.current.isDate(drop.droppedAt, inSameDayAs: drop.latestDropAt) ? "HH:mm" : "M月d日 HH:mm"
+        return "\(formatDate(drop.droppedAt)) – \(formatter.string(from: drop.latestDropAt))"
     }
 
     private func formatDate(_ date: Date) -> String {

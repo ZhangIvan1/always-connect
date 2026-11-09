@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Network
 
@@ -70,8 +71,10 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Drop episodes → DropRecords (DESIGN.md §21.22).
     private var dropTracker = DropEpisodeTracker()
     /// The record a just-ended episode produced, waiting for the
-    /// engine's terminal reason (it arrives after "disconnected").
-    private var recordAwaitingTerminal: DropRecord.ID?
+    /// engine's terminal reason (it arrives after "disconnected"), and
+    /// that episode's own retries (a sleep record sums several).
+    private var recordAwaitingTerminal: (id: DropRecord.ID, episodeRetries: Int)?
+    private var sleepObservers: [NSObjectProtocol] = []
 
     /// Credentials are complete when a username is stored and the
     /// Keychain holds a password for it. The panel reads this on open
@@ -197,6 +200,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         if AppRole.isSettings { return }
         ProfileStore.migrateSplitList()
         watchLocalNetwork()
+        watchSleep()
         guard let cisco = ciscoEngine else { return }
         cisco.credentialsProvider = { [weak self] in
             let profile = ProfileStore.loadProfile()
@@ -1004,21 +1008,41 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         lastDrop = nil
     }
 
-    private func appendDrop(_ record: DropRecord) {
-        dropHistory = ProfileStore.trimmedDropHistory(dropHistory + [record])
+    /// Adds a finished episode; a drop of the same sleep folds into
+    /// the sleep's record (DESIGN.md §41). Returns the record it is in.
+    @discardableResult
+    private func appendDrop(_ record: DropRecord) -> DropRecord.ID? {
+        dropHistory = ProfileStore.trimmedDropHistory(DropRecord.appending(record, to: dropHistory))
         ProfileStore.saveDropHistory(dropHistory)
         lastDrop = dropHistory.last
+        return dropHistory.last?.id
+    }
+
+    /// Sleep windows for the drop history (DESIGN.md §41): "will sleep"
+    /// opens one, the screens waking closes it (dark wakes wake none).
+    private func watchSleep() {
+        let center = NSWorkspace.shared.notificationCenter
+        sleepObservers = [
+            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.dropTracker.noteSleep()
+            },
+            center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.dropTracker.noteWake()
+            },
+        ]
     }
 
     /// Refines the record of an episode that just ended in
     /// "disconnected" with the engine's terminal reason.
     /// The own connection's final retry count comes with it.
     private func applyTerminalToDrop(_ reason: Int, retries: Int? = nil) {
-        guard let id = recordAwaitingTerminal else { return }
+        guard let pending = recordAwaitingTerminal else { return }
         recordAwaitingTerminal = nil
-        guard let index = dropHistory.firstIndex(where: { $0.id == id }) else { return }
+        guard let index = dropHistory.firstIndex(where: { $0.id == pending.id }) else { return }
         var record = dropHistory[index].applyingTerminal(reason)
-        if let retries { record.retries = max(record.retries ?? 0, retries) }
+        if let retries, retries > pending.episodeRetries {
+            record.retries = (record.retries ?? 0) + retries - pending.episodeRetries
+        }
         dropHistory[index] = record
         ProfileStore.saveDropHistory(dropHistory)
         lastDrop = dropHistory.last
@@ -1088,8 +1112,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         if let record = dropTracker.handle(
             Self.dropEvent(parsed), previous: Self.dropEvent(old),
             engine: usesCisco ? "cisco" : "own", retries: dropRetryCount) {
-            appendDrop(record)
-            recordAwaitingTerminal = parsed == .disconnected ? record.id : nil
+            let id = appendDrop(record)
+            recordAwaitingTerminal = parsed == .disconnected ? id.map { ($0, record.retries ?? 0) } : nil
         }
         if parsed == .connected {
             if old != .connected {
@@ -1437,6 +1461,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     // MARK: - Settings process mirror (§32.15)
 
+    private static func dropSignature(_ record: DropRecord?) -> String {
+        guard let record else { return "" }
+        return "\(record.recoveredAt.timeIntervalSince1970) \(record.sleepDropCount) \(record.outcomeLabel) \(record.retries ?? 0)"
+    }
+
     /// What the settings process shows, as JSON.
     func remoteSnapshot() -> String {
         var json: [String: Any] = [
@@ -1445,7 +1474,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             "networkHeld": networkHeld, "helperUnresponsive": helperUnresponsive,
             "ownConnection": ownConnection, "splitSwitchPending": splitSwitchPending,
             "helperUpdatePending": helperUpdatePending, "drops": dropHistory.count,
-            "lastDropId": lastDrop?.id.uuidString ?? "",
+            "lastDropId": lastDrop?.id.uuidString ?? "", "lastDropSignature": Self.dropSignature(lastDrop),
         ]
         if let lastError { json["lastError"] = lastError }
         if let autoStopNotice { json["autoStopNotice"] = autoStopNotice }
@@ -1474,7 +1503,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         // The drop list is stored; reload it when the App's changed.
         let drops = json["drops"] as? Int ?? 0
         let last = json["lastDropId"] as? String ?? ""
-        if drops != dropHistory.count || last != (dropHistory.last?.id.uuidString ?? "") {
+        // A sleep record changes in place (one more drop folded in, or the
+        // terminal reason) without a new id: compare what it shows too.
+        let signature = json["lastDropSignature"] as? String ?? ""
+        if drops != dropHistory.count || last != (dropHistory.last?.id.uuidString ?? "")
+            || signature != Self.dropSignature(dropHistory.last) {
             dropHistory = ProfileStore.loadDropHistory()
             lastDrop = dropHistory.last
         }

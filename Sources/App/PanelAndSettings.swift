@@ -81,7 +81,7 @@ struct PanelView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let drop = manager.lastDrop {
-                Label("上次掉线 \(dropTime(drop.droppedAt))，\(drop.panelSummary)",
+                Label("上次掉线 \(dropTime(drop.latestDropAt))，\(drop.panelSummary)",
                       systemImage: "clock.arrow.circlepath")
                     .font(.caption)
                     .foregroundStyle(.secondary)
