@@ -2444,5 +2444,17 @@ list-rules harness 同时覆盖旧 AppSettings 缺少新增字段的迁移。
   本地包因构建机缺少 openconnect 不含该组件，仅供构建验证，不作交付安装包。
 - CI harness（本地运行）：local-checks 结束 FAILS=5。模拟网关与经转接的真实引擎缺少 openconnect；
   helper-client、admin-parent、install-script 的临时签名身份不可用（独立检查 no identity found）。
-  不能称完整验证通过；未推送，远端 CI 未运行。其余断言的通过不能替代上述缺口。
+  上述为本机历史记录。相同 HEAD 的 fork CI run 42576246697 已在 Linux/macOS 全部通过，涵盖五组本机受阻检查；本轮交叉验证修复后的 CI 需按新 HEAD 重新核对。
 - 本机实测：定位授权、SSID、真实物理探针、两种 VPN 的断开/恢复和开销均需实测（I32）。
+
+
+### 42.7 DNS 探针交叉验证修复（2026-11-09）
+
+**DNS 结果必须对应本次问题。** Swift 用系统随机源生成 16 位事务 ID，Rust 生成 A/AAAA 查询；
+回包必须携带原查询供核心校验。检查 ID、QR、opcode、RCODE、TC、QDCOUNT 和 QNAME/QTYPE/QCLASS，
+拒绝截断、保留标签格式、压缩环与非法长度。只接受从问题名称出发的唯一 IN CNAME 链末端的 IN A/AAAA，
+不接受不相关名称、非 IN 地址或冲突/循环的 CNAME。URL 的 DNS 解析复用这套校验；失败即不命中。
+随机 ID 不是网络身份认证，DNS 探针仍受当前物理网络的 DNS 可信度约束。
+
+验证：Rust 103 项单测通过，新增非 IN、错误问题/ID、头部/截断、压缩环与 CNAME 链负例。
+新增模块经 rustfmt；FFI 仅格式化按需连接增量，之前的代码字节未变。系统外壳通过 macOS 13 类型检查和本机构建。

@@ -1662,32 +1662,63 @@ pub extern "C" fn ac_cisco_snapshot(request: *const c_char) -> *mut c_char {
         .unwrap_or(std::ptr::null_mut())
 }
 
-// On-demand policy: JSON in/out, release with ac_string_free.
+/// First-match on-demand decision as JSON; release with ac_string_free.
 #[no_mangle]
 pub extern "C" fn ac_on_demand_decide(request: *const c_char) -> *mut c_char {
-    let answer = c_str(request).and_then(|s| serde_json::from_str::<crate::on_demand::Request>(&s).ok()).map(|r| crate::on_demand::decide(&r));
-    CString::new(serde_json::to_string(&answer).unwrap_or_default()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+    let answer = c_str(request)
+        .and_then(|s| serde_json::from_str::<crate::on_demand::Request>(&s).ok())
+        .map(|r| crate::on_demand::decide(&r));
+    CString::new(serde_json::to_string(&answer).unwrap_or_default())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }
+/// Apply one policy event; release the returned JSON with ac_string_free.
 #[no_mangle]
 pub extern "C" fn ac_on_demand_transition(request: *const c_char) -> *mut c_char {
-    let answer = c_str(request).and_then(|s| serde_json::from_str::<crate::on_demand::Transition>(&s).ok()).map(crate::on_demand::transition);
-    CString::new(serde_json::to_string(&answer).unwrap_or_default()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+    let answer = c_str(request)
+        .and_then(|s| serde_json::from_str::<crate::on_demand::Transition>(&s).ok())
+        .map(crate::on_demand::transition);
+    CString::new(serde_json::to_string(&answer).unwrap_or_default())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }
+/// Build a probe with a caller-supplied random transaction_id, or parse a reply.
+/// DNS reply requests must include the original query bytes. Free with ac_string_free.
 #[no_mangle]
 pub extern "C" fn ac_on_demand_probe(request: *const c_char) -> *mut c_char {
-    let answer = c_str(request).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).map(|v| {
-        if let Some(bytes) = v.get("bytes") {
-            let bytes = serde_json::from_value::<Vec<u8>>(bytes.clone()).unwrap_or_default();
-            crate::on_demand::probe_reply(v["kind"].as_str().unwrap_or(""), &bytes)
-        } else {
-            serde_json::from_value::<crate::on_demand::Probe>(v).ok().and_then(|p| crate::on_demand::probe_plan(&p)).and_then(|p| serde_json::to_value(p).ok()).unwrap_or(serde_json::Value::Null)
-        }
-    });
-    CString::new(serde_json::to_string(&answer).unwrap_or_default()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+    let answer = c_str(request)
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| {
+            if let Some(bytes) = v.get("bytes") {
+                let bytes = serde_json::from_value::<Vec<u8>>(bytes.clone()).unwrap_or_default();
+                let query =
+                    serde_json::from_value::<Vec<u8>>(v["query"].clone()).unwrap_or_default();
+                crate::on_demand::probe_reply(v["kind"].as_str().unwrap_or(""), &bytes, &query)
+            } else {
+                v["transaction_id"]
+                    .as_u64()
+                    .and_then(|id| u16::try_from(id).ok())
+                    .and_then(|id| {
+                        serde_json::from_value::<crate::on_demand::Probe>(v)
+                            .ok()
+                            .and_then(|p| crate::on_demand::probe_plan(&p, id))
+                    })
+                    .and_then(|p| serde_json::to_value(p).ok())
+                    .unwrap_or(serde_json::Value::Null)
+            }
+        });
+    CString::new(serde_json::to_string(&answer).unwrap_or_default())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
 }
 
+/// Validate a stored rule without system I/O; free with ac_string_free.
 #[no_mangle]
 pub extern "C" fn ac_on_demand_validate(request: *const c_char) -> *mut c_char {
-    let valid = c_str(request).and_then(|s| serde_json::from_str::<crate::on_demand::Rule>(&s).ok()).is_some_and(|r| crate::on_demand::valid(&r));
-    CString::new(serde_json::json!({"valid":valid}).to_string()).unwrap().into_raw()
+    let valid = c_str(request)
+        .and_then(|s| serde_json::from_str::<crate::on_demand::Rule>(&s).ok())
+        .is_some_and(|r| crate::on_demand::valid(&r));
+    CString::new(serde_json::json!({"valid":valid}).to_string())
+        .unwrap()
+        .into_raw()
 }
