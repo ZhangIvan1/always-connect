@@ -1661,3 +1661,27 @@ pub extern "C" fn ac_cisco_snapshot(request: *const c_char) -> *mut c_char {
         .map(CString::into_raw)
         .unwrap_or(std::ptr::null_mut())
 }
+
+// On-demand policy: JSON in/out, release with ac_string_free.
+#[no_mangle]
+pub extern "C" fn ac_on_demand_decide(request: *const c_char) -> *mut c_char {
+    let answer = c_str(request).and_then(|s| serde_json::from_str::<crate::on_demand::Request>(&s).ok()).map(|r| crate::on_demand::decide(&r));
+    CString::new(serde_json::to_string(&answer).unwrap_or_default()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+}
+#[no_mangle]
+pub extern "C" fn ac_on_demand_transition(request: *const c_char) -> *mut c_char {
+    let answer = c_str(request).and_then(|s| serde_json::from_str::<crate::on_demand::Transition>(&s).ok()).map(crate::on_demand::transition);
+    CString::new(serde_json::to_string(&answer).unwrap_or_default()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+}
+#[no_mangle]
+pub extern "C" fn ac_on_demand_probe(request: *const c_char) -> *mut c_char {
+    let answer = c_str(request).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).map(|v| {
+        if let Some(bytes) = v.get("bytes") {
+            let bytes = serde_json::from_value::<Vec<u8>>(bytes.clone()).unwrap_or_default();
+            crate::on_demand::probe_reply(v["kind"].as_str().unwrap_or(""), &bytes)
+        } else {
+            serde_json::from_value::<crate::on_demand::Probe>(v).ok().and_then(|p| crate::on_demand::probe_plan(&p)).and_then(|p| serde_json::to_value(p).ok()).unwrap_or(serde_json::Value::Null)
+        }
+    });
+    CString::new(serde_json::to_string(&answer).unwrap_or_default()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+}
