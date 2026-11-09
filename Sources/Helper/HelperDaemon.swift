@@ -480,11 +480,12 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 case .authFailure: self.lastReasonCode = 2
                 case .attemptsExhausted: self.lastReasonCode = 3
                 case .componentMissing: self.lastReasonCode = 4
+                case .approvalDeclined: self.lastReasonCode = 5
                 }
                 self.lastRetryCount = retries
                 // Terminal state is already reflected by the last pushed
                 // state + detail; the App maps authFailure to its error row.
-                if reason == .authFailure, let error {
+                if reason == .authFailure || reason == .approvalDeclined, let error {
                     self.push(state: self.lastStateCode, detail: error)
                 }
             }

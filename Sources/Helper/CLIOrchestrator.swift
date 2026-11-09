@@ -41,7 +41,18 @@ final class CLIOrchestrator {
     }
 
     enum FedCredential { case password, cookie }
-    enum TerminalReason { case stoppedManual, authFailure, attemptsExhausted, componentMissing }
+    enum TerminalReason { case stoppedManual, authFailure, attemptsExhausted, componentMissing, approvalDeclined }
+
+    /// The Rust engine's Terminal codes (core/src/oc_engine.rs).
+    static func terminalReason(_ code: Int32) -> TerminalReason {
+        switch code {
+        case 0: return .stoppedManual
+        case 1: return .authFailure
+        case 3: return .componentMissing
+        case 4: return .approvalDeclined
+        default: return .attemptsExhausted
+        }
+    }
 
     var onState: ((SessionDriverClient.State, String) -> Void)? {
         get { box.onState }
@@ -109,7 +120,7 @@ final class CLIOrchestrator {
             terminal: { ctx, reason in
                 guard let ctx else { return }
                 let box = Unmanaged<Box>.fromOpaque(ctx).takeUnretainedValue()
-                let value: TerminalReason = reason == 0 ? .stoppedManual : reason == 1 ? .authFailure : reason == 3 ? .componentMissing : .attemptsExhausted
+                let value = CLIOrchestrator.terminalReason(reason)
                 box.lock.lock(); let handler = box.onTerminal; box.lock.unlock()
                 handler?(value)
             },
@@ -192,7 +203,7 @@ final class CLIOrchestrator {
     var lastError: String? { info?.lastError }
     var pfError: String? { info?.pfError }
     var lastTerminalReason: TerminalReason? {
-        info?.lastTerminal.map { $0 == 0 ? .stoppedManual : $0 == 1 ? .authFailure : $0 == 3 ? .componentMissing : .attemptsExhausted }
+        info?.lastTerminal.map { Self.terminalReason(Int32($0)) }
     }
     var tunnelInterface: String? { info?.tunnelIf }
     var gatewayAddresses: [String] { info?.gatewayIps ?? [] }

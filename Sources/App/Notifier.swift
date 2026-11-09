@@ -64,6 +64,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             post(title: "AlwaysConnect：登录被拒，已停止重连",
                  body: "可能是密码错误，或没有在手机上点批准。网络如仍暂停，点「恢复直连」恢复。",
                  held: true)
+        case 5:
+            post(title: "AlwaysConnect：手机上的登录确认没有通过，已停止重连",
+                 body: "确认手机能上网后点「重新连接」。网络如仍暂停，点「恢复直连」恢复。",
+                 held: true)
         case 3:
             post(title: "AlwaysConnect：多次重连失败",
                  body: "请检查网络或账号。网络如仍暂停，点「恢复直连」恢复。", held: true)

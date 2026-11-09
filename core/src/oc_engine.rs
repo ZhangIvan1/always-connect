@@ -90,6 +90,9 @@ pub struct Config {
 
 pub const QUIET_AFTER: f64 = 3600.0;
 pub const QUIET_INTERVAL: f64 = 900.0;
+/// After a quick failed phone confirmation, ask once more after this
+/// (±20%; the first push backoff when configured) before giving up (§43).
+pub const DECLINED_RETRY: f64 = 30.0;
 
 pub struct Hooks {
     /// (state code 0-5, detail).
@@ -112,6 +115,10 @@ pub enum Terminal {
     AuthFailure = 1,
     AttemptsExhausted = 2,
     ComponentMissing = 3,
+    /// The gateway took the password and waited for the phone, then the
+    /// confirmation failed quickly twice in a row (§43): declined on the
+    /// phone, or the phone could not reach its service.
+    ApprovalDeclined = 4,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -364,6 +371,11 @@ struct Core {
     last_credential_wait: f64,
     unanswered_since: Option<Instant>,
     expired_approvals: usize,
+    /// This password attempt was held for the phone (the gateway took
+    /// the password: it was right).
+    approval_waited: bool,
+    /// Quick confirmation failures in a row (§43).
+    declined_approvals: usize,
     in_drop_episode: bool,
     episode_retries: u32,
     last_terminal: Option<Terminal>,
@@ -435,6 +447,8 @@ impl Engine {
                 last_credential_wait: 0.0,
                 unanswered_since: None,
                 expired_approvals: 0,
+                approval_waited: false,
+                declined_approvals: 0,
                 in_drop_episode: false,
                 episode_retries: 0,
                 last_terminal: None,
@@ -1247,6 +1261,7 @@ impl Shared {
                 Self::cancel(c, Timer::ApprovalTimeout);
                 c.unanswered_since = None;
                 c.expired_approvals = 0;
+                c.declined_approvals = 0;
                 c.episode_retries = 0;
                 c.in_drop_episode = false;
                 c.driver.on_auth_outcome(AuthOutcome::Success);
@@ -1280,6 +1295,7 @@ impl Shared {
     fn credential_sent(self: &Arc<Self>, c: &mut Core) {
         c.credential_sent_at = Some(Instant::now());
         c.last_credential_wait = 0.0;
+        c.approval_waited = false;
         let quiet = c.config.approval_quiet_secs;
         self.timer(c, Timer::ApprovalProbe, quiet);
     }
@@ -1308,6 +1324,7 @@ impl Shared {
             return;
         }
         if let DriverAction::WaitApproval { timeout } = c.driver.on_auth_outcome(AuthOutcome::NeedsApproval) {
+            c.approval_waited = true;
             self.report(c, "awaiting approval");
             self.timer(c, Timer::ApprovalTimeout, timeout.as_secs_f64());
         }
@@ -1339,6 +1356,28 @@ impl Shared {
             // The password waited for the phone that long, then failed:
             // the approval expired. Ask again later instead of stopping.
             self.reinitiate_expired_approval(c);
+            return;
+        }
+        if c.saw_login_failed && c.approval_waited {
+            // The gateway held the password for the phone, so the password
+            // was right; the confirmation failed before it could expire —
+            // declined, or the phone off the network (a router restart
+            // takes both down, §43). Ask once more, then stop: never a
+            // stream of pushes after a real "decline".
+            c.saw_login_failed = false;
+            c.approval_waited = false;
+            if c.declined_approvals == 0 {
+                c.declined_approvals += 1;
+                let delay = c.config.push_backoff.first().copied().unwrap_or(DECLINED_RETRY) * jitter();
+                self.report(c, &format!("手机上的登录确认没有通过，{} 秒后重新发起", delay.round() as i64));
+                self.respawn_after(delay);
+                return;
+            }
+            c.driver.on_auth_outcome(AuthOutcome::Rejected);
+            let e = "手机上的登录确认没有通过，已停止重连。确认手机能上网后点「重新连接」".to_string();
+            c.last_error = Some(e.clone());
+            self.report(c, &e);
+            self.finish_terminal(c, Terminal::ApprovalDeclined, &e);
             return;
         }
         if c.saw_login_failed {

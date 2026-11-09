@@ -315,6 +315,9 @@ struct HelperMain {
             case .authFailure:
                 print("TERMINAL auth-failure")
                 exitCode = 1
+            case .approvalDeclined:
+                print("TERMINAL approval-declined")
+                exitCode = 5
             case .componentMissing:
                 print("TERMINAL component-missing")
                 exitCode = 4
