@@ -2423,7 +2423,7 @@ Cisco 全隧道过滤器可能挡住物理探针；自建连接封网时非本�
 
 ### 42.5 收尾竞态与验证入口
 手动连接、关开关、换网络时取消旧探针，代次检查丢弃迟到结果。
-若规则变化或用户「仍然连接」发生在异步断开收尾中，先等待既有 disconnect 回调再连接，
+若规则变化或用户「仍然连接」发生在异步断开收尾中，先等待断开收尾核对完成（见 §42.7）再连接，
 不以新的轮询等待收尾，防止 Cisco 的迟到卸载停止新会话。用户手动断开也取消待恢复请求。
 configd 物理服务变更和接口/地址指纹用于区分真实换网与 VPN 自身通知。
 域名探针按需查询 A/AAAA；HTTPS 用原始域名验证证书。全部探针共用一个 3 秒截止。
@@ -2437,15 +2437,20 @@ list-rules harness 同时覆盖旧 AppSettings 缺少新增字段的迁移。
 未完成的探针不会把网络标成「已判定」，避免相同事实的下一次事件误跳过判定。
 
 
-### 42.6 本批验证记录
-- 脚本级断言：Rust 98 项单测通过，其中按需连接 9 项；Swift 编排 harness 20 项断言通过；
-  list-rules harness（含旧设置缺字段迁移）通过。
+### 42.6 验证记录与当前状态
+- 脚本级断言：第一轮 Rust 98 项单测（按需连接 9 项）和 Swift 编排 20 项断言通过。
+  交叉验证修复后，Rust 103 项、原编排 20 项、实际接线 29 项断言及旧设置迁移均通过（见 §42.7）。
 - 编译：macOS 13 目标 App 与后台服务编译、链接、ad-hoc 组装和验签通过；没有运行 App。
-  本地包因构建机缺少 openconnect 不含该组件，仅供构建验证，不作交付安装包。
-- CI harness（本地运行）：local-checks 结束 FAILS=5。模拟网关与经转接的真实引擎缺少 openconnect；
-  helper-client、admin-parent、install-script 的临时签名身份不可用（独立检查 no identity found）。
-  上述为本机历史记录。相同 HEAD 的 fork CI run 42576246697 已在 Linux/macOS 全部通过，涵盖五组本机受阻检查；本轮交叉验证修复后的 CI 需按新 HEAD 重新核对。
-- 本机实测：定位授权、SSID、真实物理探针、两种 VPN 的断开/恢复和开销均需实测（I32）。
+  本地构建机缺少 openconnect，本地包仅供编译验证，不作交付安装包。
+- 本机环境缺口以 fork CI 为准：第一轮本地 local-checks 曾结束 FAILS=5，分别为缺 openconnect 的
+  模拟网关/转接引擎，以及测试签名身份不可用的 helper-client、admin-parent、install-script
+  （独立检查 no identity found）。这些历史失败不代表修复后代码或完整 CI 的结论。
+- 远端 CI：第一轮 run 42576246697 的 Linux/macOS 均通过；交叉验证修复后的 HEAD 48af5c2
+  在 [fork CI run 42581692918](https://github.com/ZhangIvan1/always-connect/actions/runs/42581692918)
+  两路全部通过，包含上述五组本机受阻检查、103 项 Rust、20 项编排和 29 项实际接线断言。
+  后续仅文档提交仍以 fork PR #2 当前 HEAD 的检查为准，不把历史绿灯当作新提交的验证。
+- 本机实测：定位授权、SSID、真实物理探针、两种 VPN 的断开/恢复、真实服务失联和开销均需实测（I32）；
+  离线断言与 CI harness 不替代真实 Mac 上的功能及资源验收。
 
 
 ### 42.7 交叉验证修复（2026-11-09）
