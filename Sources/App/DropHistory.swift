@@ -199,7 +199,7 @@ extension DropRecord {
 
     /// The terminal reason the engine reports after "disconnected"
     /// (DESIGN.md §十九: 1 manual stop, 2 credentials rejected,
-    /// 3 attempts exhausted) refines a failed / stopped record.
+    /// 3 attempts exhausted, 5 phone confirmation failed twice, §43) refines a failed / stopped record.
     func applyingTerminal(_ code: Int) -> DropRecord {
         var record = self
         switch code {
@@ -211,6 +211,9 @@ extension DropRecord {
         case 3:
             record.outcome = .failed
             record.failureReason = "重试次数用完"
+        case 5:
+            record.outcome = .failed
+            record.failureReason = "手机上的登录确认没有通过"
         default:
             break
         }

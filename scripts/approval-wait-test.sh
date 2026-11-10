@@ -12,6 +12,9 @@
 #   quick     answer at once             -> never awaiting-approval
 #   expired   "Login failed." after 4 s  -> asked again, not stopped
 #   rejected  "Login failed." at once    -> stops (anti-lockout)
+#   declined  "Login failed." 4 s after the held password, before an
+#             approval could expire -> asked once more, then stops as a
+#             failed phone confirmation, never as a wrong password (§43)
 set -uo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 HELPER=${1:-$REPO/.local-build/AlwaysConnectHelper}
@@ -36,7 +39,7 @@ run() {
     local mp=$!
     for _ in $(seq 1 20); do nc -z 127.0.0.1 "$port" 2>/dev/null && break; sleep 0.3; done
     mkdir -p "$W/$name"
-    ( printf 'testpass\n' | ALWAYSCONNECT_TEST_APPROVAL_MIN=2 ALWAYSCONNECT_TEST_PUSH_BACKOFF=1 \
+    ( printf 'testpass\n' | ALWAYSCONNECT_TEST_APPROVAL_MIN=${APPROVAL_MIN:-2} ALWAYSCONNECT_TEST_PUSH_BACKOFF=1 \
         "$HELPER" run-once --server "https://127.0.0.1:$port" --user testuser --cafile "$W/ca.pem" \
         --max-attempts "$attempts" --no-routes --cookie-store "$W/$name/session.json" --support-dir "$W/$name" \
         > "$W/$name.out" 2>&1 ) &
@@ -63,6 +66,14 @@ run rejected 4474 3 --reject-password
 check "rejected: a wrong password still stops at once" "$(has 'TERMINAL auth-failure' rejected)"
 check "rejected: never shown as an approval wait" "$(hasnt 'awaiting-approval' rejected)"
 check "rejected: no second try (anti-lockout)" "$(hasnt 'attempt 2' rejected)"
+
+APPROVAL_MIN=60 run declined 4475 3 --approval-expire 4
+check "declined: shown as waiting first" "$(has '^STATE awaiting-approval' declined)"
+check "declined: asked once more" "$(has '手机上的登录确认没有通过，' declined)"
+check "declined: a second login follows" "$(has 'spawning openconnect (attempt 2' declined)"
+check "declined: stops after the second failure" "$(has 'TERMINAL approval-declined' declined)"
+check "declined: never called a wrong password" "$(hasnt 'TERMINAL auth-failure' declined)"
+check "declined: no third push" "$(hasnt 'attempt 3' declined)"
 
 grep -q testpass "$W"/*.out && check "password never in the output" no || check "password never in the output" yes
 [ $FAILS -eq 0 ] || for f in "$W"/*.out; do echo "== $f"; grep -E '^(STATE|TERMINAL)' "$f"; done

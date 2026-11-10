@@ -46,7 +46,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     @Published private(set) var dropHistory: [DropRecord] = []
     /// Terminal reason code from getSessionInfo (DESIGN.md §十九):
     /// 0 = none/ongoing, 1 = manual stop, 2 = credentials rejected,
-    /// 3 = attempts exhausted. 0 also means "old Helper / unknown".
+    /// 3 = attempts exhausted, 4 = component missing, 5 = phone
+    /// confirmation failed (§43). 0 also means "old Helper / unknown".
     @Published private(set) var terminalReasonCode = 0
     /// Retries in the current drop episode (0 when connected or
     /// never dropped). Drives the panel's "第 N 次重连" line.

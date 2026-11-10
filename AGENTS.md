@@ -118,5 +118,5 @@ scripts/drop-test.sh                # 真实断线测：需已连 VPN、App 在�
   KillSwitch）、诊断
 - `Sources/Shared/` App 与后台服务共用的模型与 XPC 协议
 - `core/` Rust 核心：规则引擎、pf 文本生成、会话驱动、FFI；`core/scripts/` 测试用的假网关与桩
-- `scripts/` 本机构建、检查、安装、实测脚本；`docs/` 研究输入、实测清单、README 截图
+- `scripts/` 本机构建、检查、安装、实测脚本；`docs/` 研究输入、实测清单、README 截图与架构图（`scripts/make-overview-diagram.py` 生成）
 - `project.yml` 是 Xcode 工程定义的唯一来源（生成物不进仓库）

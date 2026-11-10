@@ -69,7 +69,8 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// Session info for the panel and notifications (DESIGN.md
     /// §十九): terminal reason code (0 = none/ongoing, 1 = manual
     /// stop, 2 = credentials rejected, 3 = attempts exhausted,
-    /// 4 = trusted bundled component missing) and
+    /// 4 = trusted bundled component missing, 5 = phone confirmation
+    /// failed twice after the password was taken, DESIGN.md §43) and
     /// retries in the current drop episode (0 when connected or
     /// never dropped). The App queries this after a push lands on
     /// Reconnecting or on a terminal Disconnected, so the panel's
