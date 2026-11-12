@@ -9,7 +9,7 @@ struct StatusLook {
     var color: NSColor
     var headline: String
 
-    static func of(_ state: HelperClient.State, held: Bool, hasCredentials: Bool) -> StatusLook {
+    static func of(_ state: HelperClient.State, held: Bool, hasCredentials: Bool, onDemand: Bool = false) -> StatusLook {
         switch state {
         case .connected:
             return StatusLook(symbol: "checkmark.shield.fill", color: .systemGreen, headline: "已连接")
@@ -26,7 +26,7 @@ struct StatusLook {
                               headline: "未连接，网络仍处暂停")
         case .disconnected:
             return StatusLook(symbol: "shield.slash", color: .secondaryLabelColor,
-                              headline: hasCredentials ? "未连接（直连网络）" : "还没填账号")
+                              headline: onDemand ? "已断开 · 按需连接" : (hasCredentials ? "未连接（直连网络）" : "还没填账号"))
         }
     }
 

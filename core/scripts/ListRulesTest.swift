@@ -11,6 +11,9 @@ struct ListRulesTest {
             print("\(ok ? "PASS" : "FAIL") \(name)")
             if !ok { fails += 1 }
         }
+        let oldSettings = Data(#"{"notificationAggregation":true,"globalHotkeyEnabled":false}"#.utf8)
+        let migrated = try! JSONDecoder().decode(AppSettings.self, from: oldSettings)
+        check("old settings decode with on-demand disabled", migrated.onDemandEnabled == nil && migrated.onDemandRules == nil)
         check("a web address becomes its domain", ListRule.parse("https://www.Example.com/path") == .domain("www.example.com"))
         check("geosite list by name", ListRule.parse("geosite:GitHub") == .geosite("github", attribute: nil))
         check("geosite with an attribute", ListRule.parse("geosite:google@cn") == .geosite("google", attribute: "cn"))

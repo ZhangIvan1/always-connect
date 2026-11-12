@@ -119,7 +119,8 @@ final class SettingsLink {
         case "clearDropHistory": client.clearDropHistory()
         case "dropProtectionChanged": client.dropProtectionChanged()
         case "credentialsChanged": client.credentialsChanged()
-        case "connect": reply(id, client.connectWithStoredCredentials() ? "1" : "0"); return
+        case "onDemandChanged": client.onDemandSettingsChanged()
+        case "connect": reply(id, client.connectWithStoredCredentials(manual: true) ? "1" : "0"); return
         case "refreshStatus": client.refreshStatus()
         case "hotkey": HotkeyManager.shared.apply(ProfileStore.loadAppSettings())
         case "approvalCard": ApprovalPrompt.shared.settingsChanged()

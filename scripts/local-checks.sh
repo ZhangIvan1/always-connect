@@ -9,6 +9,7 @@ set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 HELPER=$REPO/.local-build/AlwaysConnectHelper
 pass(){ echo "PASS $1"; }; fail(){ echo "FAIL $1"; FAILS=$((FAILS+1)); }; FAILS=0
+"$REPO/scripts/on-demand-test.sh" && pass on-demand || fail on-demand
 # 1 smoke
 rm -rf /tmp/ac-engine-test && mkdir -p /tmp/ac-engine-test
 OUT=$(printf 'x\n' | "$HELPER" run-once --server https://127.0.0.1:9 --user nobody --max-attempts 2 --no-routes --cookie-store /tmp/ac-engine-test/session.json --support-dir /tmp/ac-engine-test 2>&1); E=$?
