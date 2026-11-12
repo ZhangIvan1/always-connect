@@ -685,6 +685,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         DispatchQueue.main.async { [weak self] in
             closing.contentView = nil
             if self?.panel === closing { self?.panel = nil }
+            MemoryRelief.soon()  // what the panel used goes back (§45.5)
         }
     }
 
