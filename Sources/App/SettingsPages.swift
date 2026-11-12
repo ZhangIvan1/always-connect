@@ -642,6 +642,36 @@ struct LocalLanStatus: View {
 /// picks the connection (on = AlwaysConnect connects itself with the
 /// keychain certificate, off = through Cisco), the certificate, and the
 /// user's own list of sites that skip the VPN.
+/// Saving the "不走 VPN" list and making it take effect, for the 分流
+/// page and the 连接 page alike (DESIGN.md §26.12, §四十四): stored,
+/// networks to the drop-protection allowlist in either mode, names to
+/// the split forwarder unless Cisco carries the traffic.
+enum DirectList {
+    /// Networks (and the local one) to the drop-protection allowlist.
+    static func pushNetworks() {
+        HelperClient.shared.updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
+    }
+
+    /// Stores `sites`, pushes them, and returns the stored settings.
+    /// `note` gets a line for the user when the background service is
+    /// too old to take the names (nil when it took them).
+    @discardableResult
+    static func save(_ sites: [DirectSite], note: ((String?) -> Void)? = nil) -> AppSettings {
+        var stored = ProfileStore.loadAppSettings()
+        stored.directSites = sites
+        stored.directGroups = nil
+        stored.directCustom = nil
+        ProfileStore.saveAppSettings(stored)
+        pushNetworks()
+        if !HelperClient.shared.usesCisco {
+            HelperClient.shared.pushDirectDomains { taken in
+                note?(taken == nil ? "已保存；后台服务版本过旧，更新后生效。" : nil)
+            }
+        }
+        return stored
+    }
+}
+
 struct SplitPage: View {
     @ObservedObject private var manager = HelperClient.shared
     @State private var settings = ProfileStore.loadAppSettings()
@@ -772,6 +802,9 @@ struct SplitPage: View {
         .onAppear {
             certificates = CertificateRelay.loginCandidates()
             localNetworks = LocalNetwork.current()
+            // The 连接 page may have changed the list meanwhile (§四十四).
+            settings = ProfileStore.loadAppSettings()
+            sites = DirectSites.sites(settings)
             if settings.directSites == nil { saveSites() }  // migrate once
         }
     }
@@ -817,24 +850,10 @@ struct SplitPage: View {
         saveSites()
     }
 
-    /// Networks (and the local one) to the drop-protection allowlist,
-    /// in either mode.
-    private func pushNetworks() {
-        HelperClient.shared.updateAllowNetworks(ProfileStore.loadAppSettings().effectiveAllowNetworks) { _ in }
-    }
+    private func pushNetworks() { DirectList.pushNetworks() }
 
     private func saveSites() {
-        var stored = ProfileStore.loadAppSettings()
-        stored.directSites = sites
-        stored.directGroups = nil
-        stored.directCustom = nil
-        ProfileStore.saveAppSettings(stored)
-        settings = stored
-        pushNetworks()
-        guard !manager.usesCisco else { return }
-        HelperClient.shared.pushDirectDomains { taken in
-            siteNote = taken == nil ? "已保存；后台服务版本过旧，更新后生效。" : nil
-        }
+        settings = DirectList.save(sites) { note in siteNote = note }
     }
 
     /// One line, automatic by default (DESIGN.md §23.10); the choice is

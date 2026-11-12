@@ -5,10 +5,15 @@ import SwiftUI
 /// forwarder saw it), and whether it goes through the VPN or out the
 /// local network, with the reason. Same program + address + way are one
 /// row with a count, so a browser's dozen sockets read as one line.
+/// With 按网站分流 on, a row going through the VPN can be put on the
+/// "不走 VPN" list in one click (§四十四).
 struct ConnectionsPage: View {
     struct Row: Identifiable, Hashable {
         var process: String
         var address: String
+        /// The name the forwarder saw, and the bare address.
+        var host: String? = nil
+        var remote: String = ""
         /// "HTTPS (TCP 443)", "QUIC (UDP 443)", "DNS (UDP 53)", ...
         var protocolName: String
         var via: String
@@ -29,6 +34,17 @@ struct ConnectionsPage: View {
     @State private var search = ""
     @State private var message: String?
     @State private var updated: Date?
+    @ObservedObject private var manager = HelperClient.shared
+    /// The "不走 VPN" list, read on appear and after each change here.
+    @State private var sites: [DirectSite] = []
+    @State private var notice: Notice?
+
+    /// The line after an add or remove, with its undo.
+    struct Notice: Equatable {
+        var id = UUID()
+        var text: String
+        var before: [DirectSite]
+    }
     private let timer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -51,18 +67,18 @@ struct ConnectionsPage: View {
                 TableColumn("程序") { row in
                     Text(row.process).lineLimit(1)
                 }
-                .width(105)
+                .width(92)
                 TableColumn("地址") { row in
                     Text(row.address + (row.count > 1 ? "  ×\(row.count)" : ""))
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(row.address)
                 }
-                .width(min: 120, ideal: 165)
+                .width(min: 100, ideal: 140)
                 TableColumn("协议") { row in
                     Text(row.protocolName).lineLimit(1).help(row.protocolName)
                 }
-                .width(125)
+                .width(110)
                 TableColumn("走向") { row in
                     Text(row.via == "vpn" ? "VPN" : row.via == "local" ? "本机" : "直连")
                         .foregroundStyle(row.via == "vpn" ? Color.green : row.via == "local" ? Color.secondary : Color.orange)
@@ -71,21 +87,116 @@ struct ConnectionsPage: View {
                 TableColumn("原因") { row in
                     Text(row.reason).foregroundStyle(.secondary).lineLimit(1)
                 }
-                .width(min: 60, ideal: 80)
+                .width(min: 50, ideal: 62)
+                TableColumn("") { row in
+                    action(row)
+                }
+                .width(50)
+            }
+            if let notice {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text(notice.text).font(.caption).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("撤销") { save(notice.before, notice: nil) }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
             }
             if let message {
                 Text(message).font(.caption).foregroundStyle(.orange)
             }
-            Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。每 5 秒自动刷新。")
+            Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。每 5 秒自动刷新。"
+                 + (manager.ownConnection ? "点「加直连」把网站加入不走 VPN 的名单，在「分流」页也能改。"
+                    : manager.usesCisco ? "经 Cisco 时走向由公司的名单决定；打开按网站分流后，这里可以一键加直连。"
+                    : "打开按网站分流后，这里可以一键加直连。"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
         .onAppear {
+            sites = DirectSites.sites(ProfileStore.loadAppSettings())
             if let preview { rows = Self.group(preview); updated = Date() } else { refresh() }
         }
         .onReceive(timer) { _ in if preview == nil { refresh() } }
+    }
+
+    /// The last column: "加直连" on a VPN row, "已加入" when the list
+    /// already covers it (it moves once the program reconnects), "移除"
+    /// on a row the list sends direct. Nothing when the split is off:
+    /// then Cisco and the company's list decide (§四十四).
+    @ViewBuilder
+    private func action(_ row: Row) -> some View {
+        if manager.ownConnection, row.via != "local" {
+            if let line = DirectSites.covering(sites, host: row.host, address: row.remote) {
+                if row.via == "direct" {
+                    Menu("移除") {
+                        Button("从不走 VPN 的名单删除 \(line)") { remove(line) }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .controlSize(.small)
+                    .menuIndicator(.hidden)
+                    .font(.caption)
+                    .fixedSize()
+                } else {
+                    Text("已加入").font(.caption).foregroundStyle(.secondary)
+                        .help("已在不走 VPN 的名单里：等程序重新连接后直连")
+                }
+            } else if row.via == "vpn" {
+                let choices = DirectSites.choices(host: row.host, address: row.remote)
+                if !choices.isEmpty {
+                    Menu("加直连") {
+                        Section(row.host == nil ? "加入不走 VPN 的名单" : "加入不走 VPN 的名单（含子域名）") {
+                            ForEach(choices, id: \.rule) { choice in
+                                Button(choice.label) { add(choice.rule) }
+                            }
+                        }
+                        if row.host == nil {
+                            Text("这个程序没经过系统查域名，只能按地址加；对方换了地址就不再生效。")
+                        }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .controlSize(.small)
+                    .font(.caption)
+                    .fixedSize()
+                    .help("加入不走 VPN 的名单")
+                }
+            }
+        }
+    }
+
+    private func add(_ rule: String) {
+        let before = sites
+        let after = DirectSites.adding(rule, to: sites)
+        guard after != before else { return }
+        let name = ListRule.parse(rule)?.text ?? rule
+        save(after, notice: Notice(text: "已把 \(name) 加入不走 VPN 的名单。新连接马上直连；已开着的等程序重新连接（通常一两分钟内）。",
+                                   before: before))
+    }
+
+    private func remove(_ line: String) {
+        let before = sites
+        save(DirectSites.removing(line, from: sites),
+             notice: Notice(text: "已把 \(line) 从不走 VPN 的名单删除。新连接改走 VPN。", before: before))
+    }
+
+    /// Stores and pushes the list (the same path as the 分流 page), shows
+    /// the line for a while, and re-reads the connections.
+    private func save(_ list: [DirectSite], notice next: Notice?) {
+        sites = list
+        notice = next
+        if preview != nil { return }
+        DirectList.save(list) { note in if let note { message = note } }
+        if let next {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                if notice?.id == next.id { notice = nil }
+            }
+        }
+        refresh()
     }
 
     private var shown: [Row] {
@@ -134,8 +245,8 @@ struct ConnectionsPage: View {
                 row.count += 1
                 grouped[key] = row
             } else {
-                grouped[key] = Row(process: c.process, address: address, protocolName: proto,
-                                   via: c.via, reason: c.reason, count: 1)
+                grouped[key] = Row(process: c.process, address: address, host: c.host, remote: c.remote,
+                                   protocolName: proto, via: c.via, reason: c.reason, count: 1)
             }
         }
         // VPN-less first is what people look for: direct, then VPN, then local.
