@@ -65,7 +65,7 @@ scripts/drop-test.sh                # 真实断线测：需已连 VPN、App 在�
 ## 硬规则（违反即返工）
 
 - **常驻逻辑用 Rust，Swift 只做界面与系统外壳**（用户约定，2026-11-06 重申："后续不要再犯，不要劣化"）：长时间运行、
-  逐包/逐请求执行的逻辑（转发、分包、解析、规则匹配、DNS、编排决策）写在 `core/`（Rust，经 C ABI 调用），由 cargo test 覆盖；
+  逐包/逐请求执行的逻辑（转发、分包、解析、规则匹配、DNS、编排决策，包括暂停/恢复、代次、重试、收尾核验这类状态机）写在 `core/`（Rust，经 C ABI 调用），由 cargo test 覆盖；
   Swift 只放 SwiftUI/AppKit 界面、XPC、钥匙串与 Security.framework（证书私钥签名、TLS 握手）、Network.framework/系统 API 的薄壳。
   新功能不许把常驻逻辑写进 Swift；改到现有的 Swift 常驻逻辑时顺手迁移或先在 DESIGN §32.5 的迁移清单里登记。
 - **开销不劣化**：用功能时可以占内存，用完必须归还——窗口、面板、气泡关上即释放（不是只 orderOut），循环动画、`Timer.publish`、
@@ -73,6 +73,8 @@ scripts/drop-test.sh                # 真实断线测：需已连 VPN、App 在�
   汇报里写出改前改后的 `footprint` / CPU / 每秒唤醒（`top -stats cpu,idlew`），基线见 DESIGN §三十二；变差即返工。
 - **故障关闭优先**：掉线时封网，只有用户手动断开、退出 App 或关掉"断线保护"才恢复直连（唯一例外：自建连接刚连上两分钟内 30 秒不通的自检自动断开，用户选定，DESIGN §26.11）；
   任何时候面板都要有一键恢复直连的出口，不能把用户困住。
+  新增任何会自动断开 VPN 或撤掉断线保护的功能：必须默认关闭、由用户主动开启，界面写明影响；
+  触发条件能被伪造的（Wi-Fi 名称、DNS 搜索域/服务器与应答、明文 http）必须在界面上提示，并提供经 TLS 证书校验的条件可选（PR #4 审查）。
 - **退出 = 不开 VPN**：退出 App 断开 VPN、恢复直连，后台服务空闲自退；只有崩溃才保持封网，且最多 2 分钟
   （网络闸门的宽限期，期间尝试把 App 拉起来；DESIGN §25.2）。关机/重启等同退出：别的开机留下的封网记录一律作废，
   开机时绝不封网（DESIGN §23.12，用户曾因此整机断网）。pf 只能经 NetworkGuard 写，不许另开写入点。
@@ -90,6 +92,15 @@ scripts/drop-test.sh                # 真实断线测：需已连 VPN、App 在�
   - 提交身份用仓库本地配置的个人身份，`git log` 不得出现公司邮箱。
   - 推送前对 `git log -p origin/main..HEAD`（含提交信息）和新增的图片、二进制做一次关键词审查；
     关键词清单只放在本地，不写进仓库。发现已经推上去了，先停下来告诉用户，不要自己改写历史。
+- **提权与进程边界**（DESIGN §36.3、§三十九；违反即提权漏洞）：
+  - root 只执行 root 私有、验过签名的东西：不从用户可写位置（App 包、`/opt/homebrew`、`/usr/local`、`/tmp`、用户目录）
+    执行脚本或程序；需要管理员密码的操作先把 App 复制到 root 私有目录、用 App 自己的证书 `codesign --verify --strict --deep -R` 验签，
+    只执行副本（PrivilegedBundle）。root 不写可预测路径的临时文件，数据走 stdin 或 root 私有目录。
+  - 后台服务只接受与它同一张证书签名的 App（按审计令牌逐条消息校验），一次生命周期只服务一个登录用户；新增 XPC 方法同样受此约束。
+  - 进程之间不用广播（DistributedNotification 之类）或环境变量传状态和令牌，用父子继承的私有通道；
+    管理员脚本子进程先校验父进程是本 App。
+  - 安装与更新：签名者固定（已装那份的证书，首装为 RELEASE_SIGNER）、包内版本必须等于发布标签、默认拒绝降级、复制后复检；
+    install.sh 不得新增下载源，curl 只走 https。发布包不得含构建机的路径或用户名（package-release.sh 会拒绝）。
 - Phase 1 三个 XPC 方法（connect/disconnect/getStatus）签名不动；新增 XPC 方法一律 App 侧
   3 秒超时回落。XPC 客户端必须导出 AlwaysConnectHelperClientProtocol，否则 Helper 的状态推送会让连接失效。
 - 钥匙串：判断"有没有存密码"只用 KeychainStore.exists（不取数据、不弹授权）；真正读密码只在连接时，
@@ -98,6 +109,17 @@ scripts/drop-test.sh                # 真实断线测：需已连 VPN、App 在�
   webvpn=、webvpncontext=、`<password>`，且掩码后搜索起点移到掩码值之后。
 - 不猜真实网关行为：批准超时表现、退出码文案等一律等实测，不编造默认值。
 - 二手资料说的 API 与开关，以编译器、头文件与实测为准。
+
+## 外部贡献与 PR（贡献者和审 PR 的人都要看）
+
+- 开工前和提 PR 前都 rebase 到最新 main。DESIGN 新小节号、mac-proof 实测清单编号取当时最大值加一，提交前 `grep` 确认没被占用。
+- 本仓库文档里的"用户"专指维护者本人，引号里的话必须是维护者原话。贡献者自己提出的需求写"外部贡献（PR #N）"，
+  维护者同意后补上同意的日期与范围；不得替维护者编写引述。
+- PR 描述按上面的验证级别写清楚哪些是 CI/脚本级、哪些需实测；未实测项列进 docs/mac-proof-checklist.md；
+  涉及常驻路径的附改前改后开销数据；同样遵守"公开仓库零敏感信息"，推送前做关键词审查。
+- 审外部 PR：先看 CI 配置、install.sh、依赖与下载源、签名与发布脚本、后台服务 / XPC / pf 的改动，确认没有供应链风险，
+  再批准 fork 的 CI 运行；本机测试只在 `git archive` 解出的临时目录里跑，不在共享 checkout 里执行未审过的代码。
+  合并必须由维护者确认。Dependabot 升级 Rust crate 后要重跑 `scripts/make-rust-notices.sh`。
 
 ## 已知的坑
 
