@@ -84,14 +84,16 @@ struct ConnectionsPage: View {
                         .foregroundStyle(row.via == "vpn" ? Color.green : row.via == "local" ? Color.secondary : Color.orange)
                 }
                 .width(42)
+                // The action sits at the end of the reason cell: a column
+                // of its own cut "VPN 隧道本身" short in the 620 pt window.
                 TableColumn("原因") { row in
-                    Text(row.reason).foregroundStyle(.secondary).lineLimit(1)
+                    HStack(spacing: 4) {
+                        Text(reason(row)).foregroundStyle(.secondary).lineLimit(1).help(reason(row))
+                        Spacer(minLength: 0)
+                        action(row)
+                    }
                 }
-                .width(min: 50, ideal: 62)
-                TableColumn("") { row in
-                    action(row)
-                }
-                .width(50)
+                .width(min: 90, ideal: 112)
             }
             if let notice {
                 HStack(spacing: 8) {
@@ -124,7 +126,18 @@ struct ConnectionsPage: View {
         .onReceive(timer) { _ in if preview == nil { refresh() } }
     }
 
-    /// The last column: "加直连" on a VPN row, "已加入" when the list
+    /// The background service calls every network it was given "局域网":
+    /// it gets the list's networks and the detected local ones as one
+    /// allowlist. A network the user put on the list is the list's doing
+    /// (user, 2026-11-12: an added server address showed as 局域网).
+    private func reason(_ row: Row) -> String {
+        if row.reason == "局域网", DirectSites.covering(sites, host: nil, address: row.remote) != nil {
+            return "名单直连"
+        }
+        return row.reason
+    }
+
+    /// The end of the reason cell: "加直连" on a VPN row, "已加入" when the list
     /// already covers it (it moves once the program reconnects), "移除"
     /// on a row the list sends direct. Nothing when the split is off:
     /// then Cisco and the company's list decide (§四十四).
