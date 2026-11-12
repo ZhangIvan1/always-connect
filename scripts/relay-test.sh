@@ -11,6 +11,9 @@
 #   3b DTLS        the CONNECT's DTLS offer loses PSK-NEGOTIATE, the
 #                  answer's X-DTLS-Port points at the relay, datagrams
 #                  go through both ways unchanged (§26.10)
+#   3c renewal     an expired automatic choice is swapped for the newest
+#                  valid certificate at the next connection; one still
+#                  valid is kept (§45)
 #   4 engine       the Helper's openconnect engine through the relay
 #                  against the mock gateway that demands a client
 #                  certificate: login, cookie capture and cookie reuse
@@ -61,15 +64,18 @@ issue() { # name usage
 issue gateway serverAuth
 issue company clientAuth
 issue stranger clientAuth
-ssl pkcs12 -export -inkey company.key -in company.pem -out company.p12 -passout pass:test \
-    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+for who in company stranger; do
+    ssl pkcs12 -export -inkey "$who.key" -in "$who.pem" -out "$who.p12" -passout pass:test \
+        -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+done
 # The certificate the Helper gives openconnect (and the App's relay).
 "$HELPER" relay-client-cert --support-dir "$W/support" > relay-client.pem
 cp "$W/support/relay/client.key" relay-client.key
 [ -s relay-client.pem ] && [ -s relay-client.key ] || { echo "FAIL relay client identity"; exit 1; }
 
-start_relay() { # listen upstream -> sets RELAY_IP RELAY_PIN
-    "$W/RelayHarness" relay company.p12 test ca.der "$1" "$2" relay-client.pem > "$W/relay-$1.out" 2>&1 &
+start_relay() { # listen upstream [identity.p12 [renewal.p12]] -> sets RELAY_IP RELAY_PIN
+    "$W/RelayHarness" relay "${3:-company.p12}" test ca.der "$1" "$2" relay-client.pem ${4:+"$4"} \
+        > "$W/relay-$1.out" 2>&1 &
     PIDS+=($!)
     for _ in $(seq 1 40); do grep -q "^READY\|^SKIP" "$W/relay-$1.out" && break; sleep 0.25; done
     if grep -q "^SKIP" "$W/relay-$1.out"; then echo "SKIP relay: $(cat "$W/relay-$1.out")"; exit 0; fi
@@ -84,6 +90,16 @@ python3 -I "$ROOT/core/scripts/relay-framing-check.py" dtls 4461 4462 "$D" || FA
 for who in relay-client none stranger company; do
     python3 -I "$ROOT/core/scripts/relay-framing-check.py" access 4461 4462 "$D" "$who" || FAILS=$((FAILS + 1))
 done
+
+# 3c: the relay starts with "stranger" standing in for the certificate
+# that has since expired; "company" is the renewal in the keychain.
+start_relay 4465 4466 stranger.p12 company.p12
+python3 -I "$ROOT/core/scripts/relay-framing-check.py" presents 4465 4466 "$D" company || FAILS=$((FAILS + 1))
+grep -q "client certificate expired: switched" "$W/relay.log" &&
+    pass "relay log records the switch" || fail "relay log: no switch recorded"
+# Control: a certificate that has not expired is kept.
+start_relay 4467 4468 stranger.p12
+python3 -I "$ROOT/core/scripts/relay-framing-check.py" presents 4467 4468 "$D" stranger || FAILS=$((FAILS + 1))
 
 # 4
 python3 -I "$ROOT/core/scripts/mock-anyconnect.py" 4464 gateway.pem gateway.key ca.pem \

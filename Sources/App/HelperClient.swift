@@ -843,8 +843,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 return
             }
             guard let address = GatewayAddress(server) else { finish("服务器地址无效"); return }
+            // The automatic choice follows renewals while connected (§45);
+            // a manual one stays the user's choice.
             let relay = CertificateRelay(host: address.host, port: address.port,
-                                         identity: identity.identity)
+                                         identity: identity.identity, expires: identity.expires,
+                                         renewal: choice == nil ? { CertificateRelay.loginCandidates().first } : nil)
             let memory = GatewayMemory.load(address.host)
             let avoid = DispatchQueue.main.sync { () -> String? in
                 defer { self.gatewayToAvoid = nil }

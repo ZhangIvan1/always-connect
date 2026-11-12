@@ -8,6 +8,9 @@
 //       Runs the relay with a test "company" identity (memory-only
 //       import), trusting only the mock gateway's CA, and accepting
 //       only client.pem. Prints "READY <gateway ip> <pin>".
+//   RelayHarness relay ... <client.pem> <renewal.p12>
+//       The same, but the first identity counts as expired and the
+//       renewal (same passphrase) is the newest valid one (§45).
 import Foundation
 import Security
 
@@ -17,10 +20,10 @@ struct RelayHarness {
         let args = CommandLine.arguments
         if args.count == 2, args[1] == "framing" {
             framing()
-        } else if args.count == 8, args[1] == "relay" {
+        } else if args.count == 8 || args.count == 9, args[1] == "relay" {
             relay(Array(args.dropFirst(2)))
         } else {
-            fputs("usage: RelayHarness framing | relay <p12> <pass> <ca.der> <listen> <upstream> <client.pem>\n", stderr)
+            fputs("usage: RelayHarness framing | relay <p12> <pass> <ca.der> <listen> <upstream> <client.pem> [<renewal.p12>]\n", stderr)
             exit(2)
         }
     }
@@ -64,14 +67,29 @@ struct RelayHarness {
         else { fputs("bad arguments\n", stderr); exit(2) }
         let der = Data(base64Encoded: pem.components(separatedBy: "\n")
             .filter { !$0.hasPrefix("-----") }.joined())
-        var items: CFArray?
-        let options = [kSecImportExportPassphrase as String: a[1],
-                       kSecImportToMemoryOnly as String: true] as CFDictionary
-        guard let der, SecPKCS12Import(p12 as CFData, options, &items) == errSecSuccess,
-              let value = (items as? [[String: Any]])?.first?[kSecImportItemIdentity as String]
-        else { fputs("identity import failed\n", stderr); exit(2) }
-        let relay = CertificateRelay(host: "localhost", port: listen, identity: value as! SecIdentity,
-                                     upstreamPort: upstream, anchor: ca)
+        func identity(_ data: Data) -> SecIdentity? {
+            var items: CFArray?
+            let options = [kSecImportExportPassphrase as String: a[1],
+                           kSecImportToMemoryOnly as String: true] as CFDictionary
+            guard SecPKCS12Import(data as CFData, options, &items) == errSecSuccess,
+                  let value = (items as? [[String: Any]])?.first?[kSecImportItemIdentity as String]
+            else { return nil }
+            return (value as! SecIdentity)
+        }
+        guard let der, let first = identity(p12) else { fputs("identity import failed\n", stderr); exit(2) }
+        var renewal: (() -> CertificateRelay.ClientIdentity?)?
+        if a.count == 7 {
+            guard let data = FileManager.default.contents(atPath: a[6]), let fresh = identity(data)
+            else { fputs("renewal import failed\n", stderr); exit(2) }
+            renewal = {
+                CertificateRelay.ClientIdentity(identity: fresh, name: "renewal",
+                                                expires: Date(timeIntervalSinceNow: 86_400), issued: Date(),
+                                                selfSigned: false, digest: "renewal")
+            }
+        }
+        let relay = CertificateRelay(host: "localhost", port: listen, identity: first,
+                                     expires: renewal == nil ? nil : Date(timeIntervalSinceNow: -60),
+                                     renewal: renewal, upstreamPort: upstream, anchor: ca)
         let prepared: CertificateRelay.Prepared
         do {
             prepared = try relay.prepare()
