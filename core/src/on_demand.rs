@@ -1,4 +1,5 @@
 //! Pure on-demand policy and probe wire formats. System I/O stays in the App.
+pub mod runtime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 /// One ordered rule: conditions are ANDed, values within a condition are ORed.

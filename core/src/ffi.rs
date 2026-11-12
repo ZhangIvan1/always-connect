@@ -1761,3 +1761,13 @@ pub extern "C" fn ac_on_demand_validate(request: *const c_char) -> *mut c_char {
     CString::new(result.to_string()).unwrap().into_raw()
 }
 
+/// Pure on-demand lifecycle reducer. Free the returned JSON with ac_string_free.
+#[no_mangle]
+pub extern "C" fn ac_on_demand_step(request: *const c_char) -> *mut c_char {
+    c_str(request)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .map(crate::on_demand::runtime::step)
+        .and_then(|v| CString::new(v.to_string()).ok())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
