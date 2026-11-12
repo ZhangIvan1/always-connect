@@ -66,6 +66,38 @@ struct ListRulesTest {
               settings.effectiveAllowNetworks == ["10.9.0.0/16"] + local.filter { $0 != "10.9.0.0/16" })
         check("local networks are real CIDRs no wider than /16", local.allSatisfy { isValidCIDR($0)
               && (Int($0.split(separator: "/")[1]) ?? 0) >= 16 })
+        // Adding from the 连接 page (DESIGN.md §四十四).
+        check("site of a name", DirectSites.site(of: "www.example.com") == "example.com"
+              && DirectSites.site(of: "a.b.example.com.cn") == "example.com.cn"
+              && DirectSites.site(of: "files.example.co.uk") == "example.co.uk"
+              && DirectSites.site(of: "example.com") == "example.com")
+        let menu = DirectSites.choices(host: "a.b.example.com", address: "93.184.215.14")
+        check("menu: whole site first, each level, the name, then the address",
+              menu.map(\.rule) == ["example.com", "b.example.com", "a.b.example.com", "93.184.215.14/32"]
+              && menu.first?.label.contains("整个网站") == true && menu[2].label.contains("只这一个"))
+        check("menu for a bare site has no duplicate",
+              DirectSites.choices(host: "example.com", address: "93.184.215.14").map(\.rule) == ["example.com", "93.184.215.14/32"])
+        check("menu without a name offers only the address",
+              DirectSites.choices(host: nil, address: "203.0.113.10").map(\.rule) == ["203.0.113.10/32"])
+        check("every menu line is a valid list line", menu.allSatisfy { ListRule.parse($0.rule) != nil })
+        let list = [DirectSite(name: "example.com", domains: ["example.com"]),
+                    DirectSite(name: "198.51.100.0/24", domains: ["198.51.100.0/24"]),
+                    DirectSite(name: "geosite:github", domains: ["geosite:github"])]
+        check("a name under a list domain is covered",
+              DirectSites.covering(list, host: "mail.example.com", address: "203.0.113.1") == "example.com")
+        check("a look-alike name is not covered",
+              DirectSites.covering(list, host: "badexample.com", address: "203.0.113.1") == nil)
+        check("an address in a list network is covered",
+              DirectSites.covering(list, host: nil, address: "198.51.100.77") == "198.51.100.0/24")
+        check("site lists are not looked into", DirectSites.covering(list, host: "github.com", address: "203.0.113.1") == nil)
+        let added = DirectSites.adding("203.0.113.10/32", to: list)
+        check("adding appends once", added.count == 4 && DirectSites.adding("203.0.113.10/32", to: added) == added
+              && DirectSites.adding("example.com", to: list) == list)
+        check("removing takes out only that line", DirectSites.removing("example.com", from: list) == Array(list.dropFirst()))
+        let group = [DirectSite(name: "Old group", domains: ["example.com", "example.org"])]
+        check("removing from a migrated group keeps the rest",
+              DirectSites.removing("example.org", from: group) == [DirectSite(name: "Old group", domains: ["example.com"])])
+
         print("list-rules FAILS=\(fails)")
         exit(fails == 0 ? 0 : 1)
     }

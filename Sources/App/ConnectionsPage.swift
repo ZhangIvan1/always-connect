@@ -1,19 +1,38 @@
 import SwiftUI
 
+@_silgen_name("ac_traffic_sample")
+private func ac_traffic_sample(_ rows: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_traffic_stop")
+private func ac_traffic_stop()
+@_silgen_name("ac_string_free")
+private func traffic_string_free(_ s: UnsafeMutablePointer<CChar>?)
+
 /// Settings → 连接 (DESIGN.md §28.7, UI-DESIGN.md): every live connection
 /// on this Mac, which program, which address (the name when the split
 /// forwarder saw it), and whether it goes through the VPN or out the
 /// local network, with the reason. Same program + address + way are one
 /// row with a count, so a browser's dozen sockets read as one line.
+/// With 按网站分流 on, a row going through the VPN can be put on the
+/// "不走 VPN" list in one click (§四十四). Speeds per row and for the two
+/// ways come from the Rust core while the page is open (§四十五).
 struct ConnectionsPage: View {
     struct Row: Identifiable, Hashable {
         var process: String
         var address: String
+        /// The name the forwarder saw, and the bare address.
+        var host: String? = nil
+        var remote: String = ""
         /// "HTTPS (TCP 443)", "QUIC (UDP 443)", "DNS (UDP 53)", ...
         var protocolName: String
         var via: String
         var reason: String
         var count: Int
+        /// Bytes per second since the previous refresh (§四十五).
+        var down: Int = 0
+        var up: Int = 0
+        var speed: Int { down + up }
+        /// The sort key: the first click on 速度 puts the busiest first.
+        var busiest: Int { -speed }
         var id: String { process + "|" + address + "|" + protocolName + "|" + via + "|" + reason }
     }
 
@@ -29,6 +48,28 @@ struct ConnectionsPage: View {
     @State private var search = ""
     @State private var message: String?
     @State private var updated: Date?
+    @ObservedObject private var manager = HelperClient.shared
+    /// The "不走 VPN" list, read on appear and after each change here.
+    @State private var sites: [DirectSite] = []
+    @State private var notice: Notice?
+    /// Totals since the previous refresh; nil until there are two samples.
+    @State private var totals: (vpn: [Int], direct: [Int])?
+    @State private var sortOrder: [KeyPathComparator<Row>] = []
+
+    /// What the Rust core returns (traffic.rs `Speeds`).
+    struct Speeds: Decodable {
+        var ready: Bool
+        var rows: [[Int]]
+        var vpn: [Int]
+        var direct: [Int]
+    }
+
+    /// The line after an add or remove, with its undo.
+    struct Notice: Equatable {
+        var id = UUID()
+        var text: String
+        var before: [DirectSite]
+    }
     private let timer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -47,49 +88,167 @@ struct ConnectionsPage: View {
             Text(summary)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Table(shown) {
+            Table(shown, sortOrder: $sortOrder) {
                 TableColumn("程序") { row in
                     Text(row.process).lineLimit(1)
                 }
-                .width(105)
+                .width(92)
                 TableColumn("地址") { row in
                     Text(row.address + (row.count > 1 ? "  ×\(row.count)" : ""))
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(row.address)
                 }
-                .width(min: 120, ideal: 165)
+                .width(min: 120, ideal: 170)
                 TableColumn("协议") { row in
                     Text(row.protocolName).lineLimit(1).help(row.protocolName)
                 }
-                .width(125)
+                .width(110)
+                // Click the header to put the busiest first (§四十五).
+                TableColumn("速度", value: \.busiest) { row in
+                    Text(row.speed == 0 ? "—" : "↓" + Self.rate(row.down) + " ↑" + Self.rate(row.up))
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(row.speed == 0 ? Color.secondary : Color.primary)
+                        .lineLimit(1)
+                }
+                .width(84)
                 TableColumn("走向") { row in
                     Text(row.via == "vpn" ? "VPN" : row.via == "local" ? "本机" : "直连")
                         .foregroundStyle(row.via == "vpn" ? Color.green : row.via == "local" ? Color.secondary : Color.orange)
                 }
                 .width(42)
+                // The action sits at the end of the reason cell: a column
+                // of its own cut "VPN 隧道本身" short (§44.3).
                 TableColumn("原因") { row in
-                    Text(row.reason).foregroundStyle(.secondary).lineLimit(1)
+                    HStack(spacing: 4) {
+                        Text(reason(row)).foregroundStyle(.secondary).lineLimit(1).help(reason(row))
+                        Spacer(minLength: 0)
+                        action(row)
+                    }
                 }
-                .width(min: 60, ideal: 80)
+                .width(min: 90, ideal: 112)
+            }
+            if let notice {
+                HStack(spacing: 8) {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text(notice.text).font(.caption).fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("撤销") { save(notice.before, notice: nil) }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
             }
             if let message {
                 Text(message).font(.caption).foregroundStyle(.orange)
             }
-            Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。每 5 秒自动刷新。")
+            Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。每 5 秒自动刷新，速度是这 5 秒的平均，点「速度」标题按速度排。"
+                 + (manager.ownConnection ? "点「加直连」把网站加入不走 VPN 的名单，在「分流」页也能改。"
+                    : manager.usesCisco ? "经 Cisco 时走向由公司的名单决定；打开按网站分流后，这里可以一键加直连。"
+                    : "打开按网站分流后，这里可以一键加直连。"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
         .onAppear {
+            sites = DirectSites.sites(ProfileStore.loadAppSettings())
             if let preview { rows = Self.group(preview); updated = Date() } else { refresh() }
         }
         .onReceive(timer) { _ in if preview == nil { refresh() } }
+        .onDisappear { if preview == nil { DispatchQueue.global(qos: .utility).async { ac_traffic_stop() } } }
+    }
+
+    /// The background service calls every network it was given "局域网":
+    /// it gets the list's networks and the detected local ones as one
+    /// allowlist. A network the user put on the list is the list's doing
+    /// (user, 2026-11-12: an added server address showed as 局域网).
+    private func reason(_ row: Row) -> String {
+        if row.reason == "局域网", DirectSites.covering(sites, host: nil, address: row.remote) != nil {
+            return "名单直连"
+        }
+        return row.reason
+    }
+
+    /// The end of the reason cell: "加直连" on a VPN row, "已加入" when the list
+    /// already covers it (it moves once the program reconnects), "移除"
+    /// on a row the list sends direct. Nothing when the split is off:
+    /// then Cisco and the company's list decide (§四十四).
+    @ViewBuilder
+    private func action(_ row: Row) -> some View {
+        if manager.ownConnection, row.via != "local" {
+            if let line = DirectSites.covering(sites, host: row.host, address: row.remote) {
+                if row.via == "direct" {
+                    Menu("移除") {
+                        Button("从不走 VPN 的名单删除 \(line)") { remove(line) }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .controlSize(.small)
+                    .menuIndicator(.hidden)
+                    .font(.caption)
+                    .fixedSize()
+                } else {
+                    Text("已加入").font(.caption).foregroundStyle(.secondary)
+                        .help("已在不走 VPN 的名单里：等程序重新连接后直连")
+                }
+            } else if row.via == "vpn" {
+                let choices = DirectSites.choices(host: row.host, address: row.remote)
+                if !choices.isEmpty {
+                    Menu("加直连") {
+                        Section(row.host == nil ? "加入不走 VPN 的名单" : "加入不走 VPN 的名单（含子域名）") {
+                            ForEach(choices, id: \.rule) { choice in
+                                Button(choice.label) { add(choice.rule) }
+                            }
+                        }
+                        if row.host == nil {
+                            Text("这个程序没经过系统查域名，只能按地址加；对方换了地址就不再生效。")
+                        }
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .controlSize(.small)
+                    .font(.caption)
+                    .fixedSize()
+                    .help("加入不走 VPN 的名单")
+                }
+            }
+        }
+    }
+
+    private func add(_ rule: String) {
+        let before = sites
+        let after = DirectSites.adding(rule, to: sites)
+        guard after != before else { return }
+        let name = ListRule.parse(rule)?.text ?? rule
+        save(after, notice: Notice(text: "已把 \(name) 加入不走 VPN 的名单。新连接马上直连；已开着的等程序重新连接（通常一两分钟内）。",
+                                   before: before))
+    }
+
+    private func remove(_ line: String) {
+        let before = sites
+        save(DirectSites.removing(line, from: sites),
+             notice: Notice(text: "已把 \(line) 从不走 VPN 的名单删除。新连接改走 VPN。", before: before))
+    }
+
+    /// Stores and pushes the list (the same path as the 分流 page), shows
+    /// the line for a while, and re-reads the connections.
+    private func save(_ list: [DirectSite], notice next: Notice?) {
+        sites = list
+        notice = next
+        if preview != nil { return }
+        DirectList.save(list) { note in if let note { message = note } }
+        if let next {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+                if notice?.id == next.id { notice = nil }
+            }
+        }
+        refresh()
     }
 
     private var shown: [Row] {
-        rows.filter { row in
+        let list = sortOrder.isEmpty ? rows : rows.sorted(using: sortOrder)
+        return list.filter { row in
             switch filter {
             case .all: return true
             case .vpn: return row.via == "vpn"
@@ -107,7 +266,9 @@ struct ConnectionsPage: View {
         let direct = rows.filter { $0.via == "direct" }.reduce(0) { $0 + $1.count }
         let local = rows.filter { $0.via == "local" }.reduce(0) { $0 + $1.count }
         guard updated != nil else { return "读取中…" }
-        return "走 VPN \(vpn) 条 · 直连 \(direct) 条 · 本机内部 \(local) 条"
+        guard let totals else { return "走 VPN \(vpn) 条 · 直连 \(direct) 条 · 本机内部 \(local) 条" }
+        func pair(_ v: [Int]) -> String { "↓" + Self.rate(v[0]) + "/s ↑" + Self.rate(v[1]) + "/s" }
+        return "走 VPN \(vpn) 条  \(pair(totals.vpn))   ·   直连 \(direct) 条  \(pair(totals.direct))   ·   本机内部 \(local) 条"
     }
 
     private func refresh() {
@@ -117,14 +278,44 @@ struct ConnectionsPage: View {
                 return
             }
             message = nil
-            updated = Date()
-            rows = Self.group(result)
+            // nettop takes a few tens of ms: off the main thread.
+            DispatchQueue.global(qos: .utility).async {
+                let speeds = Self.sample(result)
+                DispatchQueue.main.async {
+                    updated = Date()
+                    rows = Self.group(result, speeds: speeds?.ready == true ? speeds?.rows : nil)
+                    if let speeds, speeds.ready, speeds.vpn.count == 2, speeds.direct.count == 2 {
+                        totals = (speeds.vpn, speeds.direct)
+                    } else {
+                        totals = nil
+                    }
+                }
+            }
         }
     }
 
-    static func group(_ connections: [ConnectionRow]) -> [Row] {
+    /// The Rust core's speeds for these rows (traffic.rs).
+    private static func sample(_ connections: [ConnectionRow]) -> Speeds? {
+        guard let input = try? JSONEncoder().encode(connections),
+              let raw = String(data: input, encoding: .utf8)?.withCString({ ac_traffic_sample($0) }) else { return nil }
+        defer { traffic_string_free(raw) }
+        return try? JSONDecoder().decode(Speeds.self, from: Data(String(cString: raw).utf8))
+    }
+
+    /// "980", "12K", "1.8M" bytes (per second).
+    static func rate(_ bytes: Int) -> String {
+        switch bytes {
+        case ..<1000: return "\(bytes)"
+        case ..<1_000_000: return "\(bytes / 1000)K"
+        case ..<10_000_000: return String(format: "%.1fM", Double(bytes) / 1_000_000)
+        default: return "\(bytes / 1_000_000)M"
+        }
+    }
+
+    static func group(_ connections: [ConnectionRow], speeds: [[Int]]? = nil) -> [Row] {
         var grouped: [String: Row] = [:]
-        for c in connections {
+        for (index, c) in connections.enumerated() {
+            let rate = speeds.flatMap { $0.indices.contains(index) && $0[index].count == 2 ? $0[index] : nil } ?? [0, 0]
             // One row per program and address; ports would split a
             // browser's parallel connections into many lines.
             let address = c.host.map { "\($0) (\(c.remote))" } ?? c.remote
@@ -132,10 +323,13 @@ struct ConnectionsPage: View {
             let key = c.process + "|" + address + "|" + proto + "|" + c.via + "|" + c.reason
             if var row = grouped[key] {
                 row.count += 1
+                row.down += rate[0]
+                row.up += rate[1]
                 grouped[key] = row
             } else {
-                grouped[key] = Row(process: c.process, address: address, protocolName: proto,
-                                   via: c.via, reason: c.reason, count: 1)
+                grouped[key] = Row(process: c.process, address: address, host: c.host, remote: c.remote,
+                                   protocolName: proto, via: c.via, reason: c.reason, count: 1,
+                                   down: rate[0], up: rate[1])
             }
         }
         // VPN-less first is what people look for: direct, then VPN, then local.

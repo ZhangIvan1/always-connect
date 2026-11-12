@@ -16,7 +16,7 @@ import SwiftUI
 /// exits when it closes.
 final class SettingsWindow: NSObject, NSWindowDelegate {
     static let shared = SettingsWindow()
-    static let size = NSSize(width: 620, height: 560)
+    static let size = NSSize(width: 760, height: 560)
 
     private var window: NSWindow?
 

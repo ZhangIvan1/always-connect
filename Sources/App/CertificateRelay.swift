@@ -96,7 +96,12 @@ final class CertificateRelay {
 
     let host: String
     let port: UInt16
-    private let clientIdentity: SecIdentity
+    /// The keychain certificate the next gateway connection presents;
+    /// read and swapped on `queue` only (§45).
+    private var clientIdentity: SecIdentity
+    private var clientExpires: Date?
+    private let renewal: (() -> ClientIdentity?)?
+    private var reportedNoRenewal = false
     private let upstreamPort: UInt16
     private let anchor: SecCertificate?
     private let queue = DispatchQueue(label: "com.alwaysconnect.app.relay")
@@ -109,11 +114,16 @@ final class CertificateRelay {
     /// `upstreamPort` and `anchor` exist for the harness only (a mock
     /// gateway on another loopback port, trusted through its test CA);
     /// the App keeps the gateway's own port and the system trust store.
-    init(host: String, port: UInt16, identity: SecIdentity,
+    /// `renewal` (the automatic choice only) names the certificate to
+    /// use once `expires` has passed (§45).
+    init(host: String, port: UInt16, identity: SecIdentity, expires: Date? = nil,
+         renewal: (() -> ClientIdentity?)? = nil,
          upstreamPort: UInt16? = nil, anchor: SecCertificate? = nil) {
         self.host = host
         self.port = port
         self.clientIdentity = identity
+        self.clientExpires = expires
+        self.renewal = renewal
         self.upstreamPort = upstreamPort ?? port
         self.anchor = anchor
     }
@@ -322,11 +332,32 @@ final class CertificateRelay {
         pairs.removeAll()
     }
 
+    /// The certificate for the next gateway connection (§45). The relay
+    /// lives as long as the session, reconnects included, so a
+    /// certificate that expires on the way would be presented on every
+    /// retry and refused. With the automatic choice, an expired one is
+    /// swapped for the newest valid one (a renewal the device
+    /// management put in the keychain) at the next connection. A date
+    /// comparison per connection; the keychain is read only after expiry.
+    private func identityForNextConnection() -> SecIdentity {
+        guard let expires = clientExpires, expires <= Date(), let renewal else { return clientIdentity }
+        if let fresh = renewal(), (fresh.expires ?? .distantFuture) > Date() {
+            clientIdentity = fresh.identity
+            clientExpires = fresh.expires
+            reportedNoRenewal = false
+            RelayLog.write("client certificate expired: switched to the newest valid one in the keychain")
+        } else if !reportedNoRenewal {
+            reportedNoRenewal = true
+            RelayLog.write("client certificate expired and the keychain has no valid one")
+        }
+        return clientIdentity
+    }
+
     private func accept(_ incoming: NWConnection) {
         guard let ip = gatewayIp else { incoming.cancel(); return }
         let tls = NWProtocolTLS.Options()
         let options = tls.securityProtocolOptions
-        sec_protocol_options_set_local_identity(options, sec_identity_create(clientIdentity)!)
+        sec_protocol_options_set_local_identity(options, sec_identity_create(identityForNextConnection())!)
         sec_protocol_options_set_tls_server_name(options, host)
         let anchor = self.anchor
         sec_protocol_options_set_verify_block(options, { _, trust, complete in

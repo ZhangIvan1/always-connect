@@ -70,7 +70,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         HelperClient.shared.$state
             .combineLatest(HelperClient.shared.$networkHeld, HelperClient.shared.$onDemandPaused)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] state, held, _ in self?.updateStatusIcon(state: state, held: held) }
+            .sink { [weak self] state, held, _ in
+                self?.updateStatusIcon(state: state, held: held)
+                // Connecting leaves freed buffers behind (§45.5).
+                if state == .connected { MemoryRelief.soon(after: 10) }
+            }
             .store(in: &cancellables)
         // Attach to the Helper first: a session it kept running while
         // the App was closed must show up even without auto-connect.

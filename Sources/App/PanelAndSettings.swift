@@ -35,6 +35,8 @@ struct PanelView: View {
     /// Read once per panel open (it compares two binaries).
     @State private var helperOutdated = HelperInstaller.installedHelperOutdated
     @State private var installMessage: String?
+    /// The 网速 card's reader, only while the panel is open (§45.4).
+    @StateObject private var speed = PanelSpeed()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -56,6 +58,9 @@ struct PanelView: View {
                 Spacer()
             }
             primaryButton
+            if manager.state == .connected {
+                speedCard
+            }
             quickSettings
             if let on = confirmSplit {
                 VStack(alignment: .leading, spacing: 6) {
@@ -81,10 +86,12 @@ struct PanelView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let drop = manager.lastDrop {
-                Label("上次掉线 \(dropTime(drop.latestDropAt))，\(drop.panelSummary)",
+                Label("上次掉线 \(dropTime(drop.latestDropAt)) · \(drop.panelSummary)",
                       systemImage: "clock.arrow.circlepath")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if showConfirmDisconnect {
                 HStack {
@@ -203,11 +210,12 @@ struct PanelView: View {
                 }
             }
             UpdateBanner(onOpen: onClose)
-            networkResetRow
+            networkResetConfirm
             Divider()
             // One quiet toolbar row: Settings (server, account, network),
-            // diagnostics, quit.
-            HStack(spacing: 4) {
+            // diagnostics, the way back to the direct network (always
+            // there, §24.6), quit.
+            HStack(spacing: 0) {
                 PanelToolButton(title: "设置", symbol: "gearshape") {
                     onOpenSettings(nil)
                 }
@@ -216,7 +224,13 @@ struct PanelView: View {
                     DiagnosticsExporter.export(manager: manager, profile: profile)
                 }
                 .help("导出诊断信息（不含密码与账号）")
-                Spacer()
+                PanelToolButton(title: resettingNetwork ? "恢复中…" : "恢复网络",
+                                symbol: "arrow.uturn.backward.circle") {
+                    showConfirmReset = true
+                }
+                .disabled(resettingNetwork)
+                .help("上不了网、被 AlwaysConnect 卡住时：断开 VPN，清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连")
+                Spacer(minLength: 0)
                 // Quit = VPN off, direct network, nothing of ours left
                 // running (DESIGN.md §21.5); confirm only when that
                 // actually ends a connection.
@@ -243,9 +257,10 @@ struct PanelView: View {
             }
         }
         .padding(16)
-        .frame(width: 300)
+        .frame(width: 320)
         .toggleStyle(.always)
         .onAppear {
+            speed.start()
             manager.refreshSplitActivity()
             let active = manager.state != .disconnected
             let cisco = manager.usesCisco
@@ -257,62 +272,109 @@ struct PanelView: View {
             }
         }
         .onReceive(activityTimer) { _ in manager.refreshSplitActivity() }
+        .onDisappear { speed.stop() }
+    }
+
+    /// 网速 (DESIGN.md §45.4): the VPN and the direct part side by side,
+    /// only while connected; "连接详情" opens the per-connection page.
+    private var speedCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("网速").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                Button("连接详情 ›") { onOpenSettings("connections") }
+                    .buttonStyle(.link)
+                    .font(.caption)
+            }
+            HStack(spacing: 12) {
+                speedColumn("走 VPN", color: .green, speed.totals?.vpn)
+                Divider().frame(height: 40)
+                speedColumn("直连", color: .orange, speed.totals?.direct)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
+    }
+
+    private func speedColumn(_ title: String, color: Color, _ rate: [Int]?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Circle().fill(color).frame(width: 7, height: 7)
+                Text(title).font(.caption).foregroundStyle(.secondary)
+            }
+            Text("↓ " + (rate.map { PanelSpeed.text($0[0]) } ?? "…"))
+                .font(.system(size: 15, weight: .semibold).monospacedDigit())
+                .lineLimit(1)
+            Text("↑ " + (rate.map { PanelSpeed.text($0[1]) } ?? "…"))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// One row of the settings card: icon, name, a line under it, and
+    /// whatever sits on the right.
+    private func rowLabel(_ symbol: String, _ title: String, _ caption: String?) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                if let caption {
+                    Text(caption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
     }
 
     /// 按网站分流 in the panel (§26.12): the switch, and in one line what
     /// it is doing right now.
     private var splitRow: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack {
-                Toggle(isOn: Binding(
-                    get: { manager.ownConnection },
-                    set: { on in
-                        if manager.switchIsOn { confirmSplit = on } else { manager.setSplit(on: on) }
-                    })) {
-                    Label("按网站分流", systemImage: "arrow.triangle.branch")
-                }
-                .disabled(manager.splitSwitchPending)
-            }
-            HStack(spacing: 4) {
-                Text(splitCaption)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
+        Toggle(isOn: Binding(
+            get: { manager.ownConnection },
+            set: { on in
+                if manager.switchIsOn { confirmSplit = on } else { manager.setSplit(on: on) }
+            })) {
+            HStack(spacing: 6) {
+                rowLabel("arrow.triangle.branch", "按网站分流", splitCaption)
+                    .help(splitHelp)
                 Spacer(minLength: 4)
                 Button("名单") { onOpenSettings("split") }
                     .buttonStyle(.link)
                     .font(.caption)
             }
         }
-        .padding(.vertical, 6)
+        .disabled(manager.splitSwitchPending)
+        .padding(.vertical, 8)
+    }
+
+    /// The sites the split is sending direct right now, on hover.
+    private var splitHelp: String {
+        guard let activity = manager.splitActivity, !activity.entries.isEmpty else { return "" }
+        return "正在直连：" + activity.entries.joined(separator: "、")
     }
 
     private var splitCaption: String {
         if manager.splitSwitchPending { return "正在切换，稍候会重新连接…" }
         guard manager.ownConnection else { return "关：全部走 VPN（经 Cisco）" }
-        if siteCount == 0 { return "开：名单还是空的，点「名单」添加" }
-        guard manager.state == .connected else { return "开：名单里 \(siteCount) 条不走 VPN" }
-        guard let activity = manager.splitActivity else { return "开：名单里 \(siteCount) 条不走 VPN" }
-        if activity.entries.isEmpty { return "生效中：还没打开名单里的网站" }
-        let names = activity.entries.prefix(2).joined(separator: "、")
-        let more = activity.entries.count > 2 ? " 等 \(activity.entries.count) 个网站" : ""
-        return "生效中：\(names)\(more)直连（\(activity.addresses) 个地址）"
+        if siteCount == 0 { return "名单还是空的，点「名单」添加" }
+        guard manager.state == .connected, let activity = manager.splitActivity else {
+            return "名单里 \(siteCount) 条不走 VPN"
+        }
+        if activity.entries.isEmpty { return "还没打开名单里的网站" }
+        return "\(activity.entries.count) 个网站直连 · \(activity.addresses) 个地址"
     }
 
     /// The way back when the Mac has no network because of us (DESIGN.md
     /// §24.6): always there, works offline, asks once for the Mac password.
-    @ViewBuilder private var networkResetRow: some View {
-        HStack {
-            Text("上不了网、被 AlwaysConnect 卡住时")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Button(resettingNetwork ? "恢复中…" : "恢复网络") { showConfirmReset = true }
-                .controlSize(.small)
-                .disabled(resettingNetwork)
-                .help("断开 VPN，清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连")
-        }
+    /// The button itself is in the bottom toolbar (§45.4); its confirm
+    /// and its outcome show here.
+    @ViewBuilder private var networkResetConfirm: some View {
         if showConfirmReset {
             VStack(alignment: .leading, spacing: 6) {
                 Text("会断开 VPN，并清掉 AlwaysConnect 改过的路由、DNS 和防火墙设置，回到直连。需要输入一次开机密码。")
@@ -353,7 +415,7 @@ struct PanelView: View {
     private var quickSettings: some View {
         VStack(spacing: 0) {
             HStack {
-                Label("服务器", systemImage: "server.rack")
+                rowLabel("server.rack", "服务器", nil)
                 Spacer()
                 Menu {
                     ForEach(servers) { entry in
@@ -376,7 +438,7 @@ struct PanelView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
             }
-            .padding(.vertical, 7)
+            .padding(.vertical, 9)
             Divider()
             splitRow
             // Both connection ways (DESIGN.md §26.19): off = a drop uses
@@ -391,13 +453,14 @@ struct PanelView: View {
                     ProfileStore.saveAppSettings(settings)
                     manager.dropProtectionChanged()
                 })) {
-                Label("断线保护", systemImage: protectionOn ? "lock.shield" : "lock.open")
+                rowLabel(protectionOn ? "lock.shield" : "lock.open", "断线保护",
+                         protectionOn ? "掉线时暂停上网，不漏走直连" : "关：掉线时改走本地网络")
             }
-            .padding(.vertical, 6)
+            .padding(.vertical, 8)
         }
         .font(.callout)
-        .padding(.horizontal, 10)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
+        .padding(.horizontal, 12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
     }
 
     /// The engine's own words under the headline (retry count, last
@@ -410,7 +473,23 @@ struct PanelView: View {
         if manager.onDemandPaused, manager.state == .disconnected, !manager.networkHeld { return manager.stateLine }
         if manager.state == .disconnected, !manager.networkHeld { return "VPN 已关，正在用本地网络上网" }
         if manager.state == .reconnecting { return manager.stateLine }
+        if manager.state == .connected {
+            // Which server and for how long (§45.4), not the engine's words.
+            let server = servers.first { $0.target == selectedServer }?.name ?? selectedServer
+            guard let since = manager.connectedSince else { return server }
+            return "\(server) · 已连接 \(Self.duration(Date().timeIntervalSince(since)))"
+        }
         return manager.detail.isEmpty ? manager.stateLine : manager.detail
+    }
+
+    /// "不到 1 分钟", "12 分钟", "2 小时 13 分", "3 天 4 小时".
+    static func duration(_ seconds: TimeInterval) -> String {
+        let minutes = Int(seconds) / 60
+        if minutes < 1 { return "不到 1 分钟" }
+        if minutes < 60 { return "\(minutes) 分钟" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours) 小时 \(minutes % 60) 分" }
+        return "\(hours / 24) 天 \(hours % 24) 小时"
     }
 
     /// One button, labelled with what it does next.
@@ -607,6 +686,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         DispatchQueue.main.async { [weak self] in
             closing.contentView = nil
             if self?.panel === closing { self?.panel = nil }
+            MemoryRelief.soon()  // what the panel used goes back (§45.5)
         }
     }
 
@@ -627,7 +707,7 @@ private struct PanelToolButton: View {
         Button(action: action) {
             Label(title, systemImage: symbol)
                 .font(.callout)
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 6)
                 .padding(.vertical, 4)
                 .contentShape(Rectangle())
         }

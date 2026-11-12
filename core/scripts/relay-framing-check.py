@@ -21,6 +21,10 @@ a RelayHarness relay already listening on <relay-port> and forwarding to
       With a fixture gateway answering every request, a client without
       the Helper's relay certificate must get nothing back; the relay
       certificate itself (the positive control) must get the answer.
+  relay-framing-check.py presents <relay-port> <fixture-port> <dir> <name>
+      One relayed connection; the fixture reads which client
+      certificate the relay presented and expects <name> (its CN):
+      an expired automatic choice is swapped for the renewal (§45).
 
 <dir> holds ca.pem, gateway.pem/.key (fixture identity) and
 relay-client.pem/.key (what the Helper hands openconnect).
@@ -263,6 +267,52 @@ def access(relay_port, fixture_port, d, name):
     return good
 
 
+def presents(relay_port, fixture_port, d, expected):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(d / "gateway.pem", d / "gateway.key")
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.load_verify_locations(d / "ca.pem")
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", fixture_port))
+    listener.listen()
+    listener.settimeout(8)
+    seen = []
+
+    def serve():
+        try:
+            conn, _ = listener.accept()
+            with ctx.wrap_socket(conn, server_side=True) as conn:
+                conn.settimeout(8)
+                subject = dict(item[0] for item in conn.getpeercert().get("subject", ()))
+                seen.append(subject.get("commonName", ""))
+                request = b""
+                while b"\r\n\r\n" not in request:
+                    request += conn.recv(4096)
+                conn.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+                time.sleep(0.3)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        with client_context(d, "relay-client").wrap_socket(
+                socket.create_connection(("127.0.0.1", relay_port), timeout=8),
+                server_hostname="localhost") as conn:
+            conn.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            conn.recv(4096)
+    except (ssl.SSLError, ConnectionError, OSError):
+        pass
+    thread.join(timeout=3)
+    listener.close()
+    got = seen[0] if seen else "nothing"
+    good = got == expected
+    print(("PASS " if good else "FAIL ") + "relay presented the " + expected
+          + " certificate" + ("" if good else " (got " + got + ")"))
+    return good
+
+
 def main():
     mode = sys.argv[1]
     if mode == "frames":
@@ -271,6 +321,8 @@ def main():
         ok = dtls(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]))
     elif mode == "access":
         ok = access(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), sys.argv[5])
+    elif mode == "presents":
+        ok = presents(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), sys.argv[5])
     else:
         sys.exit(2)
     sys.exit(0 if ok else 1)
