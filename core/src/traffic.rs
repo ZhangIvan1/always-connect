@@ -1,4 +1,4 @@
-//! Speeds for the Settings 连接 page (DESIGN.md §四十五): how fast each
+//! Speeds for the Settings 连接 page and the menu-bar panel (DESIGN.md §四十五): how fast each
 //! connection moves data, and the totals through the VPN and out the
 //! local network.
 //!
@@ -207,7 +207,7 @@ pub fn speeds(before: Option<&Snapshot>, now: &Snapshot, rows: &[RowIn]) -> Spee
     Speeds { ready: true, rows: row_rates, vpn, direct }
 }
 
-/// Totals for the menu bar (§四十五), bytes per second: everything on the
+/// Totals for the menu-bar panel's 网速 card (§45.4), bytes per second: everything on the
 /// wired/Wi-Fi interfaces, the tunnel interfaces, and the direct part.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Totals {
@@ -219,8 +219,8 @@ pub struct Totals {
 
 /// Bytes a tunnelled packet costs on the wire beyond its own size: IP
 /// and UDP headers, the DTLS record and the AES-GCM nonce and tag
-/// (20 + 8 + 13 + 8 + 16, plus the 1-byte type). An estimate: the menu
-/// bar cannot see the carrier socket without nettop (§45.1).
+/// (20 + 8 + 13 + 8 + 16, plus the 1-byte type). An estimate: the panel
+/// does not run nettop, so it cannot see the carrier socket (§45.1).
 pub const TUNNEL_OVERHEAD: u64 = 66;
 
 fn is_physical(name: &str) -> bool {
@@ -263,7 +263,7 @@ pub fn totals(before: Option<&HashMap<String, IfCount>>, now: &HashMap<String, I
 
 static PREVIOUS_TOTALS: Mutex<Option<(Instant, HashMap<String, IfCount>)>> = Mutex::new(None);
 
-/// The menu bar's totals since its previous call (no process, one sysctl).
+/// The panel's totals since its previous call (no process, one sysctl).
 pub fn sample_totals() -> Totals {
     let now = (Instant::now(), interface_counters());
     let mut previous = PREVIOUS_TOTALS.lock().unwrap();
@@ -275,7 +275,7 @@ pub fn sample_totals() -> Totals {
     result
 }
 
-/// The menu-bar speed was switched off: the snapshot goes.
+/// The panel closed: the snapshot goes.
 pub fn stop_totals() {
     *PREVIOUS_TOTALS.lock().unwrap() = None;
 }

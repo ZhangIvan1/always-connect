@@ -137,20 +137,6 @@ struct GeneralPage: View {
                         ProfileStore.saveAppSettings(settings)
                         ApprovalPrompt.shared.settingsChanged()
                     }))
-                Toggle(isOn: Binding(
-                    get: { settings.isMenuBarSpeedOn },
-                    set: { on in
-                        settings.menuBarSpeed = on
-                        ProfileStore.saveAppSettings(settings)
-                        MenuBarSpeed.settingsChanged()
-                    })) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("菜单栏显示网速")
-                        Text("图标旁显示这台 Mac 的总速度，面板里分走 VPN 和直连。每 2 秒读一次网卡计数。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
                 if let loginError {
                     Text(loginError).foregroundStyle(.red)
                 }

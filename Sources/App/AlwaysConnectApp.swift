@@ -67,9 +67,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.button?.target = self
         statusItem?.button?.action = #selector(togglePanel(_:))
         updateStatusIcon(state: HelperClient.shared.state, held: false)
-        // "菜单栏显示网速" (§四十五): off by default; nothing runs then.
-        MenuBarSpeed.shared.onChange = { [weak self] in self?.updateSpeedTitle() }
-        MenuBarSpeed.shared.apply()
         HelperClient.shared.$state
             .combineLatest(HelperClient.shared.$networkHeld)
             .receive(on: DispatchQueue.main)
@@ -257,24 +254,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A crash never gets here: then the Helper keeps whatever kill
         // switch was in force (fail closed), and reopening the App
         // shows it with the restore button.
-    }
-
-    /// The speed next to the icon when "菜单栏显示网速" is on. A fixed
-    /// width (the widest text) so the menu bar does not shift each time.
-    private func updateSpeedTitle() {
-        guard let item = statusItem, let button = item.button else { return }
-        let speed = MenuBarSpeed.shared
-        guard speed.isOn else {
-            button.title = ""
-            button.imagePosition = .imageOnly
-            item.length = NSStatusItem.squareLength
-            return
-        }
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-        let widest = ("↓8.8M ↑888K" as NSString).size(withAttributes: [.font: font]).width
-        item.length = ceil(widest) + 30
-        button.imagePosition = .imageLeft
-        button.attributedTitle = NSAttributedString(string: speed.menuBarText, attributes: [.font: font])
     }
 
     /// Color + shape double encoding (UI-DESIGN.md §一.2/§三): green

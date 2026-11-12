@@ -289,9 +289,6 @@ struct AppSettings: Codable, Equatable {
 
     var isDropProtectionOn: Bool { dropProtection ?? true }
     var isApprovalCardOn: Bool { approvalCard ?? true }
-    /// "菜单栏显示网速" (DESIGN.md §四十五): off unless switched on.
-    var menuBarSpeed: Bool?
-    var isMenuBarSpeedOn: Bool { menuBarSpeed ?? false }
     var usesOwnConnection: Bool { connectionMode == "own" }
     /// 按网站分流 is on (the same switch as the own connection, §26.12).
     var splitOn: Bool { usesOwnConnection }

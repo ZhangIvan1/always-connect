@@ -1028,7 +1028,7 @@ pub extern "C" fn ac_traffic_stop() {
     crate::traffic::stop();
 }
 
-/// Menu-bar speed totals (DESIGN.md §四十五): Totals JSON (free with
+/// The panel's speed totals (DESIGN.md §45.4): Totals JSON (free with
 /// ac_string_free). One sysctl, no process; keeps one snapshot until
 /// ac_speed_totals_stop.
 #[no_mangle]
