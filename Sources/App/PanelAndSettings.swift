@@ -35,6 +35,7 @@ struct PanelView: View {
     /// Read once per panel open (it compares two binaries).
     @State private var helperOutdated = HelperInstaller.installedHelperOutdated
     @State private var installMessage: String?
+    @ObservedObject private var speed = MenuBarSpeed.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -79,6 +80,13 @@ struct PanelView: View {
                     .font(.caption)
                     .foregroundStyle(notice.level == .warning ? Color.orange : Color.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            if speed.isOn, let t = speed.totals {
+                // §四十五: the menu bar shows the total, here its parts.
+                Label("走 VPN ↓\(MenuBarSpeed.rate(t.vpn[0]))/s ↑\(MenuBarSpeed.rate(t.vpn[1]))/s · 直连 ↓\(MenuBarSpeed.rate(t.direct[0]))/s ↑\(MenuBarSpeed.rate(t.direct[1]))/s",
+                      systemImage: "speedometer")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
             if let drop = manager.lastDrop {
                 Label("上次掉线 \(dropTime(drop.latestDropAt))，\(drop.panelSummary)",

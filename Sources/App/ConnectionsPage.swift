@@ -1,12 +1,20 @@
 import SwiftUI
 
+@_silgen_name("ac_traffic_sample")
+private func ac_traffic_sample(_ rows: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_traffic_stop")
+private func ac_traffic_stop()
+@_silgen_name("ac_string_free")
+private func traffic_string_free(_ s: UnsafeMutablePointer<CChar>?)
+
 /// Settings → 连接 (DESIGN.md §28.7, UI-DESIGN.md): every live connection
 /// on this Mac, which program, which address (the name when the split
 /// forwarder saw it), and whether it goes through the VPN or out the
 /// local network, with the reason. Same program + address + way are one
 /// row with a count, so a browser's dozen sockets read as one line.
 /// With 按网站分流 on, a row going through the VPN can be put on the
-/// "不走 VPN" list in one click (§四十四).
+/// "不走 VPN" list in one click (§四十四). Speeds per row and for the two
+/// ways come from the Rust core while the page is open (§四十五).
 struct ConnectionsPage: View {
     struct Row: Identifiable, Hashable {
         var process: String
@@ -19,6 +27,12 @@ struct ConnectionsPage: View {
         var via: String
         var reason: String
         var count: Int
+        /// Bytes per second since the previous refresh (§四十五).
+        var down: Int = 0
+        var up: Int = 0
+        var speed: Int { down + up }
+        /// The sort key: the first click on 速度 puts the busiest first.
+        var busiest: Int { -speed }
         var id: String { process + "|" + address + "|" + protocolName + "|" + via + "|" + reason }
     }
 
@@ -38,6 +52,17 @@ struct ConnectionsPage: View {
     /// The "不走 VPN" list, read on appear and after each change here.
     @State private var sites: [DirectSite] = []
     @State private var notice: Notice?
+    /// Totals since the previous refresh; nil until there are two samples.
+    @State private var totals: (vpn: [Int], direct: [Int])?
+    @State private var sortOrder: [KeyPathComparator<Row>] = []
+
+    /// What the Rust core returns (traffic.rs `Speeds`).
+    struct Speeds: Decodable {
+        var ready: Bool
+        var rows: [[Int]]
+        var vpn: [Int]
+        var direct: [Int]
+    }
 
     /// The line after an add or remove, with its undo.
     struct Notice: Equatable {
@@ -63,7 +88,7 @@ struct ConnectionsPage: View {
             Text(summary)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Table(shown) {
+            Table(shown, sortOrder: $sortOrder) {
                 TableColumn("程序") { row in
                     Text(row.process).lineLimit(1)
                 }
@@ -74,18 +99,26 @@ struct ConnectionsPage: View {
                         .truncationMode(.middle)
                         .help(row.address)
                 }
-                .width(min: 100, ideal: 140)
+                .width(min: 120, ideal: 170)
                 TableColumn("协议") { row in
                     Text(row.protocolName).lineLimit(1).help(row.protocolName)
                 }
                 .width(110)
+                // Click the header to put the busiest first (§四十五).
+                TableColumn("速度", value: \.busiest) { row in
+                    Text(row.speed == 0 ? "—" : "↓" + Self.rate(row.down) + " ↑" + Self.rate(row.up))
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(row.speed == 0 ? Color.secondary : Color.primary)
+                        .lineLimit(1)
+                }
+                .width(84)
                 TableColumn("走向") { row in
                     Text(row.via == "vpn" ? "VPN" : row.via == "local" ? "本机" : "直连")
                         .foregroundStyle(row.via == "vpn" ? Color.green : row.via == "local" ? Color.secondary : Color.orange)
                 }
                 .width(42)
                 // The action sits at the end of the reason cell: a column
-                // of its own cut "VPN 隧道本身" short in the 620 pt window.
+                // of its own cut "VPN 隧道本身" short (§44.3).
                 TableColumn("原因") { row in
                     HStack(spacing: 4) {
                         Text(reason(row)).foregroundStyle(.secondary).lineLimit(1).help(reason(row))
@@ -110,7 +143,7 @@ struct ConnectionsPage: View {
             if let message {
                 Text(message).font(.caption).foregroundStyle(.orange)
             }
-            Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。每 5 秒自动刷新。"
+            Text("只列正在通信的连接（含所有程序）。开着按网站分流时，地址会显示访问的域名；其他情况显示 IP。每 5 秒自动刷新，速度是这 5 秒的平均，点「速度」标题按速度排。"
                  + (manager.ownConnection ? "点「加直连」把网站加入不走 VPN 的名单，在「分流」页也能改。"
                     : manager.usesCisco ? "经 Cisco 时走向由公司的名单决定；打开按网站分流后，这里可以一键加直连。"
                     : "打开按网站分流后，这里可以一键加直连。"))
@@ -124,6 +157,7 @@ struct ConnectionsPage: View {
             if let preview { rows = Self.group(preview); updated = Date() } else { refresh() }
         }
         .onReceive(timer) { _ in if preview == nil { refresh() } }
+        .onDisappear { if preview == nil { DispatchQueue.global(qos: .utility).async { ac_traffic_stop() } } }
     }
 
     /// The background service calls every network it was given "局域网":
@@ -213,7 +247,8 @@ struct ConnectionsPage: View {
     }
 
     private var shown: [Row] {
-        rows.filter { row in
+        let list = sortOrder.isEmpty ? rows : rows.sorted(using: sortOrder)
+        return list.filter { row in
             switch filter {
             case .all: return true
             case .vpn: return row.via == "vpn"
@@ -231,7 +266,9 @@ struct ConnectionsPage: View {
         let direct = rows.filter { $0.via == "direct" }.reduce(0) { $0 + $1.count }
         let local = rows.filter { $0.via == "local" }.reduce(0) { $0 + $1.count }
         guard updated != nil else { return "读取中…" }
-        return "走 VPN \(vpn) 条 · 直连 \(direct) 条 · 本机内部 \(local) 条"
+        guard let totals else { return "走 VPN \(vpn) 条 · 直连 \(direct) 条 · 本机内部 \(local) 条" }
+        func pair(_ v: [Int]) -> String { "↓" + Self.rate(v[0]) + "/s ↑" + Self.rate(v[1]) + "/s" }
+        return "走 VPN \(vpn) 条  \(pair(totals.vpn))   ·   直连 \(direct) 条  \(pair(totals.direct))   ·   本机内部 \(local) 条"
     }
 
     private func refresh() {
@@ -241,14 +278,44 @@ struct ConnectionsPage: View {
                 return
             }
             message = nil
-            updated = Date()
-            rows = Self.group(result)
+            // nettop takes a few tens of ms: off the main thread.
+            DispatchQueue.global(qos: .utility).async {
+                let speeds = Self.sample(result)
+                DispatchQueue.main.async {
+                    updated = Date()
+                    rows = Self.group(result, speeds: speeds?.ready == true ? speeds?.rows : nil)
+                    if let speeds, speeds.ready, speeds.vpn.count == 2, speeds.direct.count == 2 {
+                        totals = (speeds.vpn, speeds.direct)
+                    } else {
+                        totals = nil
+                    }
+                }
+            }
         }
     }
 
-    static func group(_ connections: [ConnectionRow]) -> [Row] {
+    /// The Rust core's speeds for these rows (traffic.rs).
+    private static func sample(_ connections: [ConnectionRow]) -> Speeds? {
+        guard let input = try? JSONEncoder().encode(connections),
+              let raw = String(data: input, encoding: .utf8)?.withCString({ ac_traffic_sample($0) }) else { return nil }
+        defer { traffic_string_free(raw) }
+        return try? JSONDecoder().decode(Speeds.self, from: Data(String(cString: raw).utf8))
+    }
+
+    /// "980", "12K", "1.8M" bytes (per second).
+    static func rate(_ bytes: Int) -> String {
+        switch bytes {
+        case ..<1000: return "\(bytes)"
+        case ..<1_000_000: return "\(bytes / 1000)K"
+        case ..<10_000_000: return String(format: "%.1fM", Double(bytes) / 1_000_000)
+        default: return "\(bytes / 1_000_000)M"
+        }
+    }
+
+    static func group(_ connections: [ConnectionRow], speeds: [[Int]]? = nil) -> [Row] {
         var grouped: [String: Row] = [:]
-        for c in connections {
+        for (index, c) in connections.enumerated() {
+            let rate = speeds.flatMap { $0.indices.contains(index) && $0[index].count == 2 ? $0[index] : nil } ?? [0, 0]
             // One row per program and address; ports would split a
             // browser's parallel connections into many lines.
             let address = c.host.map { "\($0) (\(c.remote))" } ?? c.remote
@@ -256,10 +323,13 @@ struct ConnectionsPage: View {
             let key = c.process + "|" + address + "|" + proto + "|" + c.via + "|" + c.reason
             if var row = grouped[key] {
                 row.count += 1
+                row.down += rate[0]
+                row.up += rate[1]
                 grouped[key] = row
             } else {
                 grouped[key] = Row(process: c.process, address: address, host: c.host, remote: c.remote,
-                                   protocolName: proto, via: c.via, reason: c.reason, count: 1)
+                                   protocolName: proto, via: c.via, reason: c.reason, count: 1,
+                                   down: rate[0], up: rate[1])
             }
         }
         // VPN-less first is what people look for: direct, then VPN, then local.

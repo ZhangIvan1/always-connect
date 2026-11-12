@@ -22,6 +22,7 @@ pub mod route_watch;
 pub mod rules;
 pub mod session;
 pub mod state_machine;
+pub mod traffic;
 pub mod update_check;
 
 #[cfg(feature = "openconnect")]

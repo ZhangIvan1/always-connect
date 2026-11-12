@@ -1008,6 +1008,43 @@ pub extern "C" fn ac_connections_json(
     CString::new(json).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
 }
 
+/// Speeds for the connections page (DESIGN.md §四十五): `rows` is the
+/// ConnectionRow JSON array the page shows; returns the Speeds JSON (free
+/// with ac_string_free), null on bad input. Keeps one snapshot until
+/// ac_traffic_stop.
+#[no_mangle]
+pub extern "C" fn ac_traffic_sample(rows: *const c_char) -> *mut c_char {
+    c_str(rows)
+        .map(|rows| crate::traffic::sample_json(&rows))
+        .filter(|json| !json.is_empty())
+        .and_then(|json| CString::new(json).ok())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// The connections page closed: the snapshot goes.
+#[no_mangle]
+pub extern "C" fn ac_traffic_stop() {
+    crate::traffic::stop();
+}
+
+/// Menu-bar speed totals (DESIGN.md §四十五): Totals JSON (free with
+/// ac_string_free). One sysctl, no process; keeps one snapshot until
+/// ac_speed_totals_stop.
+#[no_mangle]
+pub extern "C" fn ac_speed_totals() -> *mut c_char {
+    serde_json::to_string(&crate::traffic::sample_totals())
+        .ok()
+        .and_then(|json| CString::new(json).ok())
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_speed_totals_stop() {
+    crate::traffic::stop_totals();
+}
+
 /// The interface the kernel routes `ip` through, or null.
 #[no_mangle]
 pub extern "C" fn ac_route_interface(ip: *const c_char) -> *mut c_char {
