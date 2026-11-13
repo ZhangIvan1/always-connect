@@ -39,7 +39,7 @@ import Foundation
         check(!c.state.paused && starts == baseline + 2, "leaving matched network restores previously active session")
         live = false; facts.ssid = "Office-WiFi"; c.networkChanged()
         facts.ssid = "Home"; c.networkChanged()
-        check(starts == baseline + 2, "inactive session with auto-connect off stays off")
+        check(starts == baseline + 3, "leaving a policy pause resumes with launch auto-connect off")
         r.probe = OnDemandProbe(kind: "dns", target: "intranet.example.com")
         c.configure(enabled: true, rules: [r])
         check(probes == 0, "unmatched offline condition does not probe")
@@ -81,6 +81,11 @@ import Foundation
         check(startupStarts == 0, "launch waits for initial physical facts")
         collected?(OnDemandFacts(network: "wired"))
         check(startupStarts == 1, "pending automatic connections coalesced")
+        check(OnDemandRuleInput.merge(["Custom", "Office-WiFi"], ["Office-WiFi", "Current"]) == ["Custom", "Office-WiFi", "Current"],
+              "fill retains original SSIDs and appends only absent values")
+        check(OnDemandRuleInput.merge(["Corp.Example.COM"], ["corp.example.com", "example.net"], caseInsensitive: true)
+              == ["Corp.Example.COM", "example.net"], "fill deduplicates DNS names without changing input spelling")
+        check(OnDemandRuleInput.merge(["192.0.2.53"], []) == ["192.0.2.53"], "missing facts never erase input")
         print("\(count) on-demand assertions passed")
     }
 }

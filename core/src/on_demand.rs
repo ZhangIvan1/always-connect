@@ -209,8 +209,9 @@ pub fn transition(t: Transition) -> Effect {
                 effect = "disconnect";
             }
             "connect" => {
-                if (s.paused || (t.rule_id.is_some() && !t.active)) && (s.resume || t.auto_connect)
-                {
+                // Leaving a policy pause resumes even when launch auto-connect is off:
+                // a pause entered before login must not become a permanent manual stop.
+                if s.paused || (t.rule_id.is_some() && !t.active && t.auto_connect) {
                     effect = "connect";
                 }
                 s = Runtime::default();
@@ -679,8 +680,8 @@ mod tests {
         );
     }
     #[test]
-    fn auto_connect_resumes_and_idle_off_does_not() {
-        for (auto, expected) in [(true, "connect"), (false, "none")] {
+    fn leaving_policy_pause_resumes_with_launch_auto_connect_off() {
+        for (auto, expected) in [(true, "connect"), (false, "connect")] {
             let e = transition(Transition {
                 state: Runtime {
                     paused: true,

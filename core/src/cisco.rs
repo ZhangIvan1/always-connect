@@ -699,6 +699,10 @@ mod tests {
         let out = "  >> state: Connecting\n  >> notice: x\n  >> state: Connected\n";
         assert_eq!(parse_state(out).as_deref(), Some("Connected"));
         assert_eq!(parse_state("nothing"), None);
+        assert_eq!(
+            parse_state("\r  >> state: Unknown\n\r  >> state: Disconnected\nVPN> ").as_deref(),
+            Some("Disconnected")
+        );
         assert_eq!(parse_server_address("  Server Address:   198.51.100.9\n").as_deref(), Some("198.51.100.9"));
         assert_eq!(parse_server_address("  Server Address: gw.example\n"), None);
         assert_eq!(last_error("  >> error: one\n  >> error: two \n").as_deref(), Some("two"));

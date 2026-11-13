@@ -14,6 +14,16 @@ struct OnDemandRule: Codable, Equatable, Identifiable {
     var probe: OnDemandProbe?
     var action = "disconnect"
 }
+/// Editing only: retain original spelling/order and append previously absent facts.
+enum OnDemandRuleInput {
+    static func merge(_ existing: [String], _ added: [String], caseInsensitive: Bool = false) -> [String] {
+        var seen = Set<String>()
+        return (existing + added).filter { value in
+            guard !value.isEmpty else { return false }
+            return seen.insert(caseInsensitive ? value.lowercased() : value).inserted
+        }
+    }
+}
 struct OnDemandFacts: Codable, Equatable {
     var network: String?
     var ssid: String?
@@ -81,6 +91,50 @@ final class OnDemandMachine {
         self.state = state  // Install before executing callbacks, which may re-enter.
         for action in reply["actions"] as? [[String: Any]] ?? [] { execute(action) }
         return reply["allowed"] as? Bool ?? false
+    }
+}
+
+/// Opaque Rust tickets; no Swift generation counters or validity decisions.
+final class OnDemandProtection {
+    struct Ticket {
+        let session: UInt64
+        let intent: UInt64
+    }
+    enum Boundary: String {
+        case manualStop = "manual_stop", forcedRestore = "forced_restore"
+        case modeChanged = "mode_changed", serverChanged = "server_changed"
+        case onDemandStop = "on_demand_stop", disconnect
+    }
+    private let machine = OnDemandMachine("protection")
+    @discardableResult
+    func invalidate(_ reason: Boundary) -> UInt64 {
+        machine.send(["kind": reason.rawValue])
+        return machine.state["session"] as? UInt64 ?? 0
+    }
+    func startSession(usesCisco: Bool) {
+        machine.send(["kind": "session_start", "uses_cisco": usesCisco])
+    }
+    func restoreAbandoned(managing: Bool, usesCisco: Bool, rearm: () -> Void) {
+        machine.send(["kind": "restore_abandoned", "managing": managing, "uses_cisco": usesCisco]) { action in
+            if action["kind"] as? String == "rearm" { rearm() }
+        }
+    }
+    func request(_ mode: Int) -> Ticket? {
+        var ticket: Ticket?
+        machine.send(["kind": "request", "mode": mode]) { action in
+            if let session = action["session"] as? UInt64, let intent = action["intent"] as? UInt64 {
+                ticket = Ticket(session: session, intent: intent)
+            }
+        }
+        return ticket
+    }
+    func claim(_ ticket: Ticket) -> Bool { query("claim", ticket) }
+    func isCurrent(_ ticket: Ticket) -> Bool { query("is_current", ticket) }
+    func isSessionCurrent(_ session: UInt64) -> Bool {
+        machine.send(["kind": "session_current", "session": session])
+    }
+    private func query(_ kind: String, _ ticket: Ticket) -> Bool {
+        machine.send(["kind": kind, "session": ticket.session, "intent": ticket.intent])
     }
 }
 

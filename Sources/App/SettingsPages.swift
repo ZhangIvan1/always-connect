@@ -22,12 +22,13 @@ struct SettingsView: View {
             SplitPage()
                 .tabItem { Label("分流", systemImage: "arrow.triangle.branch") }
                 .tag("split")
-            ScrollView {
-                VStack(spacing: 12) {
-                    OnDemandSettings()
+            Form {
+                OnDemandSettings()
+                Section("当前连接") {
                     ConnectionsPage().frame(height: 360)
-                }.padding(16)
+                }
             }
+                .formStyle(.grouped)
                 .tabItem { Label("连接", systemImage: "point.3.filled.connected.trianglepath.dotted") }
                 .tag("connections")
             DiagnosticsPage()

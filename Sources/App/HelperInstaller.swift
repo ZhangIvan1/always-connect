@@ -124,6 +124,15 @@ enum HelperInstaller {
         return installed != current
     }
 
+    /// Only a matching installed binary is known to serialize protection RPCs.
+    /// Unknown/older services retain the client's acknowledged queue barrier.
+    static var installedHelperMatchesBundle: Bool {
+        guard let bundled = bundledHelperPath,
+              let installed = codeHash(atPath: "/Library/PrivilegedHelperTools/com.alwaysconnect.app.helper"),
+              let current = codeHash(atPath: bundled) else { return false }
+        return installed == current
+    }
+
     private static func codeHash(atPath path: String) -> Data? {
         var code: SecStaticCode?
         guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess,

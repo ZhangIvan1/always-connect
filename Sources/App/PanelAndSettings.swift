@@ -122,7 +122,9 @@ struct PanelView: View {
                 // The restore got no answer (DESIGN.md §25.5): the way
                 // out that needs no background service at all.
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("后台服务没有响应，网络可能仍被暂停")
+                    Text(manager.networkHeld
+                         ? "后台服务没有响应，网络仍被暂停"
+                         : "后台服务状态未确认，可尝试恢复网络")
                         .font(.caption)
                         .foregroundStyle(.red)
                     Button("强制恢复网络（需电脑密码）") {

@@ -3,6 +3,85 @@ use super::{decide, transition, Request, Rule, Runtime, Transition};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Revocable protection intent. Swift holds only the returned session/intent ticket.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Protection {
+    /// Changes at connection boundaries, including explicit stops and mode switches.
+    pub session: u64,
+    /// Changes for every new protection request, including off requests.
+    pub intent: u64,
+    /// Whether this intent may still report a result or warning.
+    pub live: bool,
+    /// Exactly one callback may submit this intent to the service.
+    pub pending: bool,
+    /// Startup may adopt an owned Cisco session; a stop closes this until a new start.
+    pub accepts_nonzero: bool,
+}
+impl Default for Protection {
+    fn default() -> Self {
+        Self {
+            session: 0,
+            intent: 0,
+            live: false,
+            pending: false,
+            accepts_nonzero: true,
+        }
+    }
+}
+impl Protection {
+    fn current(&self, event: &Value) -> bool {
+        self.live
+            && event["session"].as_u64() == Some(self.session)
+            && event["intent"].as_u64() == Some(self.intent)
+    }
+    fn boundary(&mut self, accepts_nonzero: bool) {
+        self.session = self.session.wrapping_add(1);
+        self.intent = self.intent.wrapping_add(1);
+        self.live = false;
+        self.pending = false;
+        self.accepts_nonzero = accepts_nonzero;
+    }
+    /// Claim before sending an RPC; later invalidation cannot recall an RPC already sent.
+    pub fn event(&mut self, event: &Value, actions: &mut Vec<Value>) -> bool {
+        match event["kind"].as_str().unwrap_or("") {
+            "session_start" => self.boundary(event["uses_cisco"].as_bool().unwrap_or(false)),
+            "restore_abandoned" => {
+                self.boundary(
+                    event["managing"].as_bool().unwrap_or(false)
+                        && event["uses_cisco"].as_bool().unwrap_or(false),
+                );
+                if self.accepts_nonzero {
+                    actions.push(json!({"kind":"rearm"}));
+                }
+            }
+            "manual_stop" | "forced_restore" | "mode_changed" | "server_changed"
+            | "on_demand_stop" | "disconnect" => self.boundary(false),
+            "request" => {
+                self.intent = self.intent.wrapping_add(1);
+                self.live = false;
+                self.pending = false;
+                if let Some(mode @ 0..=2) = event["mode"].as_i64() {
+                    if mode == 0 || self.accepts_nonzero {
+                        self.live = true;
+                        self.pending = true;
+                        actions.push(json!({"kind":"ticket", "session":self.session,
+                            "intent":self.intent, "mode":mode}));
+                    }
+                }
+            }
+            "claim" if self.current(event) && self.pending => {
+                self.pending = false;
+                return true;
+            }
+            "is_current" => return self.current(event),
+            "session_current" => return event["session"].as_u64() == Some(self.session),
+            _ => (),
+        }
+        false
+    }
+}
+
 /// One disconnect's lifetime, including the local Cisco stop and status observation.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,6 +98,8 @@ pub struct Disconnect {
     pub checking: bool,
     /// Forced recovery owns the system until cancelled or completed.
     pub suspended: bool,
+    /// The bounded observation window starts only after every stop was sent.
+    pub expired: bool,
 }
 impl Disconnect {
     fn current(&self, event: &Value) -> bool {
@@ -33,28 +114,48 @@ impl Disconnect {
             self.checking = true;
             self.verification = self.verification.wrapping_add(1);
             actions.push(
-                json!({"kind":"verify", "token":self.generation, "observation":self.verification, "seconds":3}),
+                json!({"kind":"verify", "token":self.generation, "observation":self.verification, "seconds":6, "cli_seconds":5}),
             );
         }
     }
-    /// Reduce one callback or recovery event; a deadline never grants permission.
+    fn finish(&mut self, actions: &mut Vec<Value>, uncertain: bool) {
+        self.waiting = false;
+        self.invalidate();
+        actions.push(json!({"kind":"settled"}));
+        if uncertain {
+            actions.push(json!({"kind":"attention"}));
+        }
+    }
+    /// Prefer confirmed idle; missing observations cannot veto a new connection forever.
     pub fn event(&mut self, event: &Value, actions: &mut Vec<Value>) -> bool {
         match event["kind"].as_str().unwrap_or("") {
             "begin" if !self.waiting => {
                 self.generation = self.generation.wrapping_add(1);
                 self.waiting = true;
                 self.local_stopped = false;
+                self.expired = false;
                 actions.push(json!({"kind":"stop", "token":self.generation}));
                 actions.push(json!({"kind":"deadline", "token":self.generation, "seconds":3}));
             }
             "local_stopped" if self.current(event) => {
-                self.local_stopped = true;
+                if !self.local_stopped {
+                    self.local_stopped = true;
+                    actions.push(
+                        json!({"kind":"release_deadline", "token":self.generation, "seconds":10}),
+                    );
+                }
                 self.reconcile(actions);
             }
             "reply" if self.current(event) => self.reconcile(actions),
             "deadline" if self.current(event) => {
-                actions.push(json!({"kind":"attention"}));
+                // A slow local Cisco stop is not evidence of an unresponsive service.
                 self.reconcile(actions);
+            }
+            "release_deadline" if self.current(event) && self.local_stopped => {
+                self.expired = true;
+                if !self.suspended {
+                    self.finish(actions, true);
+                }
             }
             "transport_lost" => {
                 self.invalidate();
@@ -73,7 +174,11 @@ impl Disconnect {
                     self.suspended = false;
                 }
                 self.invalidate();
-                self.reconcile(actions);
+                if self.expired && self.waiting && !self.suspended {
+                    self.finish(actions, true);
+                } else {
+                    self.reconcile(actions);
+                }
             }
             "result" | "verify_timeout"
                 if self.current(event)
@@ -87,8 +192,7 @@ impl Disconnect {
                     && (!event["uses_cisco"].as_bool().unwrap_or(true)
                         || event["cisco"].as_str() == Some("Disconnected"));
                 if idle && !self.suspended {
-                    self.waiting = false;
-                    actions.push(json!({"kind":"settled"}));
+                    self.finish(actions, false);
                 }
             }
             "is_current" => return self.current(event),
@@ -369,6 +473,11 @@ pub fn step(request: Value) -> Value {
             serde_json::from_value(request["state"].clone()).unwrap_or_default();
         let allowed = state.event(event, &mut actions);
         json!({"state":state,"actions":actions,"allowed":allowed})
+    } else if request["kind"] == "protection" {
+        let mut state: Protection =
+            serde_json::from_value(request["state"].clone()).unwrap_or_default();
+        let allowed = state.event(event, &mut actions);
+        json!({"state":state,"actions":actions,"allowed":allowed})
     } else {
         let mut state: Controller =
             serde_json::from_value(request["state"].clone()).unwrap_or_default();
@@ -407,7 +516,7 @@ mod tests {
         assert!(has(&begin(&mut s), "verify"));
         let token = s.generation;
         let out = d(&mut s, json!({"kind":"deadline","token":token}));
-        assert!(has(&out, "attention"));
+        assert!(!has(&out, "attention"));
         assert!(s.waiting);
         assert!(!has(&out, "settled"));
         let observation = result(&s, 0, false, None);
@@ -415,6 +524,111 @@ mod tests {
         assert!(!s.waiting);
         assert!(d(&mut s, observation).is_empty());
         assert!(d(&mut s, json!({"kind":"reply","token":token})).is_empty());
+    }
+    #[test]
+    fn missing_verification_releases_once_after_local_stop_and_ignores_late_callbacks() {
+        let mut s = Disconnect::default();
+        let actions = begin(&mut s);
+        assert!(has(&actions, "release_deadline"));
+        let token = s.generation;
+        let late_result = result(&s, 0, false, Some("Disconnected"));
+        let actions = d(&mut s, json!({"kind":"release_deadline", "token":token}));
+        assert!(has(&actions, "settled"));
+        assert!(!s.waiting);
+        // Neither callback may dispatch another stop/unload against the new session.
+        assert!(d(&mut s, json!({"kind":"reply", "token":token})).is_empty());
+        assert!(d(&mut s, late_result).is_empty());
+        assert!(d(&mut s, json!({"kind":"release_deadline", "token":token})).is_empty());
+        d(&mut s, json!({"kind":"begin"}));
+        assert!(d(&mut s, json!({"kind":"release_deadline", "token":token})).is_empty());
+        assert!(s.waiting);
+    }
+    #[test]
+    fn slow_local_stop_is_not_helper_failure_and_recovery_owns_expired_release() {
+        let mut s = Disconnect::default();
+        d(&mut s, json!({"kind":"begin"}));
+        let token = s.generation;
+        assert!(!has(
+            &d(&mut s, json!({"kind":"deadline", "token":token})),
+            "attention"
+        ));
+        assert!(d(&mut s, json!({"kind":"release_deadline", "token":token})).is_empty());
+        d(&mut s, json!({"kind":"local_stopped", "token":token}));
+        d(&mut s, json!({"kind":"suspend"}));
+        assert!(!has(
+            &d(&mut s, json!({"kind":"release_deadline", "token":token})),
+            "settled"
+        ));
+        assert!(s.waiting);
+        assert!(has(&d(&mut s, json!({"kind":"recover"})), "settled"));
+        assert!(!s.waiting);
+    }
+    #[test]
+    fn network_connect_waits_boundedly_then_flushes_one_start_without_auto_connect() {
+        let mut s = Controller::default();
+        configure(&mut s, false);
+        let generation = s.generation;
+        c(
+            &mut s,
+            json!({"kind":"facts", "token":generation, "reason":"settings",
+            "facts":{"network":"wifi","ssid":"Example-WiFi"}}),
+            json!({}),
+        );
+        assert!(s.policy.paused && !s.policy.resume);
+        c(&mut s, json!({"kind":"network"}), json!({"waiting":true}));
+        let generation = s.generation;
+        let actions = c(
+            &mut s,
+            json!({"kind":"facts", "token":generation, "reason":"network",
+            "facts":{"network":"wifi","ssid":"Home"}}),
+            json!({"waiting":true}),
+        );
+        assert!(has(&actions, "recheck") && !has(&actions, "start"));
+        let mut stop = Disconnect::default();
+        begin(&mut stop);
+        let token = stop.generation;
+        assert!(has(
+            &d(&mut stop, json!({"kind":"release_deadline", "token":token})),
+            "settled"
+        ));
+        assert!(has(
+            &c(
+                &mut s,
+                json!({"kind":"disconnect_settled"}),
+                json!({"waiting":stop.waiting})
+            ),
+            "start"
+        ));
+        assert!(!has(
+            &c(&mut s, json!({"kind":"disconnect_settled"}), json!({})),
+            "start"
+        ));
+    }
+    #[test]
+    fn normal_state_cli_exit_grace_fits_verification_window() {
+        let mut s = Disconnect::default();
+        let actions = begin(&mut s);
+        let verify = actions.iter().find(|a| a["kind"] == "verify").unwrap();
+        let seconds = verify["cli_seconds"].as_u64().unwrap();
+        assert!(verify["seconds"].as_u64().unwrap() > seconds);
+        // The real state command can print Disconnected yet take >2 s to exit.
+        // Use a shell substitute, never the installed Cisco CLI in cargo test.
+        let reply = crate::cisco::run(
+            "/bin/sh",
+            &[
+                "-c",
+                "printf '>> state: Unknown\n>> state: Disconnected\n'; sleep 2.25",
+            ],
+            None,
+            std::time::Duration::from_secs(seconds),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(reply.status, 0);
+        assert_eq!(
+            crate::cisco::parse_state(&reply.output).as_deref(),
+            Some("Disconnected")
+        );
     }
     #[test]
     fn active_held_unknown_and_cisco_not_stopped_never_release() {
@@ -736,7 +950,7 @@ mod controller_sequences {
         ));
     }
     #[test]
-    fn inactive_session_does_not_resume_but_active_intent_does() {
+    fn leaving_trusted_network_resumes_even_if_pause_preceded_login() {
         for active in [false, true] {
             let mut s = Controller::default();
             rules(&mut s, active);
@@ -744,7 +958,7 @@ mod controller_sequences {
             send(&mut s, json!({"kind":"network"}), false, false);
             assert_eq!(
                 has(&facts(&mut s, "Home", "network", false, false), "start"),
-                active
+                true
             );
         }
     }
@@ -782,5 +996,106 @@ mod controller_sequences {
         let late = json!({"kind":"probe","token":p["token"],"probe_epoch":p["probe_epoch"],"rule_id":p["rule_id"],"facts":p["facts"],"matched":true});
         assert!(send(&mut s, late, true, false).is_empty());
         assert!(s.policy.manual && !s.policy.paused);
+    }
+}
+
+#[cfg(test)]
+mod protection_tests {
+    use super::*;
+    fn request(state: &mut Protection, mode: i32) -> Value {
+        let mut out = vec![];
+        state.event(&json!({"kind":"request","mode":mode}), &mut out);
+        out.into_iter().next().unwrap_or(Value::Null)
+    }
+    fn check(state: &mut Protection, ticket: &Value, kind: &str) -> bool {
+        state.event(
+            &json!({"kind":kind,"session":ticket["session"],"intent":ticket["intent"]}),
+            &mut vec![],
+        )
+    }
+    #[test]
+    fn every_stop_boundary_cancels_arm_off_and_stale_warning() {
+        for kind in [
+            "manual_stop",
+            "forced_restore",
+            "mode_changed",
+            "server_changed",
+            "on_demand_stop",
+            "disconnect",
+        ] {
+            for mode in [0, 1, 2] {
+                let mut state = Protection::default();
+                let old = request(&mut state, mode);
+                state.event(&json!({"kind":kind}), &mut vec![]);
+                assert!(!check(&mut state, &old, "claim"), "{kind} / {mode}");
+                assert!(!check(&mut state, &old, "is_current"));
+                assert!(
+                    request(&mut state, 2).is_null(),
+                    "late engine hook after {kind}"
+                );
+                assert!(!request(&mut state, 0).is_null());
+            }
+        }
+    }
+    #[test]
+    fn latest_intent_wins_in_both_callback_orders_and_claims_once() {
+        for (first, last) in [(0, 2), (2, 0), (2, 1), (1, 2)] {
+            for newest_first in [false, true] {
+                let mut state = Protection::default();
+                let old = request(&mut state, first);
+                let new = request(&mut state, last);
+                if newest_first {
+                    assert!(check(&mut state, &new, "claim"));
+                }
+                assert!(!check(&mut state, &old, "claim"));
+                assert!(!check(&mut state, &old, "is_current"));
+                if !newest_first {
+                    assert!(check(&mut state, &new, "claim"));
+                }
+                assert!(!check(&mut state, &new, "claim"));
+                assert!(check(&mut state, &new, "is_current"));
+            }
+        }
+    }
+    #[test]
+    fn cancelled_restore_rearms_a_surviving_cisco_session_with_a_new_ticket_only() {
+        for managing in [false, true] {
+            for cisco in [false, true] {
+                let mut state = Protection::default();
+                let old = request(&mut state, 2);
+                state.event(&json!({"kind":"forced_restore"}), &mut vec![]);
+                let mut actions = vec![];
+                state.event(
+                    &json!({"kind":"restore_abandoned","managing":managing,"uses_cisco":cisco}),
+                    &mut actions,
+                );
+                assert!(!check(&mut state, &old, "claim"));
+                assert_eq!(!actions.is_empty(), managing && cisco);
+                assert_eq!(!request(&mut state, 2).is_null(), managing && cisco);
+            }
+        }
+    }
+    #[test]
+    fn new_session_rejects_old_off_and_queries_but_allows_new_arm() {
+        let mut state = Protection::default();
+        let old = request(&mut state, 0);
+        let session = state.session;
+        state.event(
+            &json!({"kind":"session_start","uses_cisco":true}),
+            &mut vec![],
+        );
+        assert!(!state.event(
+            &json!({"kind":"session_current","session":session}),
+            &mut vec![]
+        ));
+        assert!(!check(&mut state, &old, "claim"));
+        let new = request(&mut state, 2);
+        assert!(check(&mut state, &new, "claim"));
+        state.event(
+            &json!({"kind":"session_start","uses_cisco":false}),
+            &mut vec![],
+        );
+        assert!(request(&mut state, 1).is_null());
+        assert!(!request(&mut state, 0).is_null());
     }
 }

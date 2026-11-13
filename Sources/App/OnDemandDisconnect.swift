@@ -4,7 +4,7 @@ import Foundation
 final class OnDemandDisconnect {
     typealias Token = UInt64
     var stop: (Token, @escaping () -> Void, @escaping () -> Void) -> Void = { _, _, _ in }
-    var verifyIdle: (@escaping (Int, Bool, String?) -> Void) -> Void = { done in done(-1, true, nil) }
+    var verifyIdle: (TimeInterval, @escaping (Int, Bool, String?) -> Void) -> Void = { _, done in done(-1, true, nil) }
     var settled: () -> Void = {}
     var needsAttention: () -> Void = {}
     var restartRecovery: (Bool) -> Void = { _ in }
@@ -32,16 +32,19 @@ final class OnDemandDisconnect {
         case "stop":
             stop(token, { [weak self] in self?.send(["kind": "local_stopped", "token": token]) },
                  { [weak self] in self?.send(["kind": "reply", "token": token]) })
-        case "deadline":
-            schedule(action["seconds"] as? Double ?? 3) { [weak self] in self?.send(["kind": "deadline", "token": token]) }
+        case "deadline", "release_deadline":
+            let kind = action["kind"] as? String ?? "deadline"
+            schedule(action["seconds"] as? Double ?? 3) { [weak self] in
+                self?.send(["kind": kind, "token": token])
+            }
         case "verify":
             let observation = action["observation"]!
             let cisco = usesCisco()
-            verifyIdle { [weak self] status, held, state in
+            verifyIdle(action["cli_seconds"] as? Double ?? 5) { [weak self] status, held, state in
                 self?.send(["kind": "result", "token": token, "observation": observation,
                             "status": status, "held": held, "uses_cisco": cisco, "cisco": state as Any? ?? NSNull()])
             }
-            schedule(action["seconds"] as? Double ?? 3) { [weak self] in
+            schedule(action["seconds"] as? Double ?? 6) { [weak self] in
                 self?.send(["kind": "verify_timeout", "token": token, "observation": observation])
             }
         case "attention": needsAttention()

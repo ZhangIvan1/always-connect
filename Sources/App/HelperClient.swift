@@ -117,6 +117,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private let onDemand = OnDemandController()
     private var onDemandProbe: OnDemandNetworkProbe?
     private let onDemandDisconnect = OnDemandDisconnect()
+    private let protection = OnDemandProtection()
     private var onDemandDebounce: DispatchWorkItem?
     private var onDemandPathReady = false
     private var pendingOnDemandFacts: (Bool, (OnDemandFacts) -> Void)?
@@ -149,6 +150,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         setupOnDemandDisconnection()
         onDemand.disconnect = { [weak self] in
             self?.awaitingRestartRecovery = false
+            self?.protection.invalidate(.onDemandStop)
             self?.onDemandDisconnect.begin()
         }
         onDemand.holdLaunch()
@@ -186,7 +188,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 isCurrent: { [weak self] in self?.onDemandDisconnect.isCurrent(token) == true })
         }
         onDemandDisconnect.usesCisco = { [weak self] in self?.usesCisco == true }
-        onDemandDisconnect.verifyIdle = { [weak self] done in self?.verifyOnDemandIdle(done) }
+        onDemandDisconnect.verifyIdle = { [weak self] timeout, done in self?.verifyOnDemandIdle(timeout: timeout, done) }
         onDemandDisconnect.needsAttention = { [weak self] in self?.helperUnresponsive = true }
         onDemandDisconnect.restartRecovery = { [weak self] active in
             self?.scheduleRestartRecovery(wasActive: active)
@@ -199,7 +201,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Report raw observations. Rust checks the generation, deadline and idle conditions.
     /// Both RPCs use one proxy, fencing the preceding disconnect on the service queue.
-    private func verifyOnDemandIdle(_ done: @escaping (Int, Bool, String?) -> Void) {
+    private func verifyOnDemandIdle(timeout: TimeInterval, _ done: @escaping (Int, Bool, String?) -> Void) {
         ensureConnection { proxy in
             proxy.getStatus { code, _ in
                 proxy.getNetworkHeld { held in
@@ -208,7 +210,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         // Only the bounded CLI I/O itself runs on the utility queue.
                         if self.usesCisco {
                             DispatchQueue.global(qos: .utility).async {
-                                let result = CiscoEngine.run(["state"], timeout: 2)
+                                let result = CiscoEngine.run(["state"], timeout: timeout)
                                 let state = result.status == 0 ? CiscoEngine.parseState(result.output) : "Unknown"
                                 DispatchQueue.main.async { done(code, held, state) }
                             }
@@ -271,6 +273,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         guard profile.server != target else { return }
         profile.server = target
         ProfileStore.saveProfile(profile)
+        protection.invalidate(.serverChanged)
         guard state != .disconnected || networkHeld else { return }
         if let cisco {
             cisco.disconnect { [weak self] in
@@ -365,32 +368,45 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private func markHelperReachable() {
         helperAvailable = true
         lastError = nil
+        helperUnresponsive = false
     }
 
     /// Cisco engine → Helper pf (DESIGN.md §二十一). A missing or old
     /// Helper means no kill switch: say so on the panel, never hide it.
     private func setKillSwitch(_ mode: Int, tunnelIf: String, gatewayIps: [String]) {
-        // Drop protection off (DESIGN.md §21.6): pf stays unloaded, a
-        // drop lets traffic out the local network like plain Cisco.
-        let mode = ProfileStore.loadAppSettings().isDropProtectionOn && onDemand.permitsConnection() ? mode : 0
+        guard let ticket = protection.request(mode) else { return }
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                if !finished {
+                if !finished && self.protection.isCurrent(ticket) {
                     finished = true
                     self.pfWarning = "后台服务未响应：断线封网未生效"
                 }
             }
-            proxy.setKillSwitch(mode, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
-                DispatchQueue.main.async {
-                    guard !finished else { return }
+            let apply = {
+                guard self.protection.claim(ticket) else {
                     finished = true
-                    self.markHelperReachable()
-                    // Cisco's line only while Cisco is the engine: a late
-                    // answer after the switch to the own connection left a
-                    // stale red line on the panel (2026-11-06).
-                    self.pfWarning = ok || !self.usesCisco ? nil : message
+                    return
                 }
+                let mode = ProfileStore.loadAppSettings().isDropProtectionOn
+                    && self.onDemand.permitsConnection() && self.usesCisco ? mode : 0
+                proxy.setKillSwitch(mode, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
+                    DispatchQueue.main.async {
+                        // A reply may update only the latest session's intent.
+                        guard self.protection.isCurrent(ticket) else { return }
+                        finished = true
+                        self.markHelperReachable()
+                        self.pfWarning = ok || !self.usesCisco ? nil : message
+                    }
+                }
+            }
+            if HelperInstaller.installedHelperMatchesBundle {
+                // This service serializes disconnect and protection on one queue.
+                // No status reply is needed to submit protection after a lost reply.
+                apply()
+            } else {
+                // Older/unknown service: its protection uses a different queue.
+                proxy.getStatus { _, _ in DispatchQueue.main.async(execute: apply) }
             }
         }
     }
@@ -406,6 +422,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     func connect(server: String, group: String, username: String, password: String, onAccepted: (() -> Void)? = nil) {
         guard onDemand.permitsConnection() else { return }
+        protection.startSession(usesCisco: usesCisco)
         autoStopNotice = nil
         ensureConnection { proxy in
             guard self.onDemand.permitsConnection() else { return }
@@ -493,15 +510,19 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// The restore must visibly do something: no answer from the
     /// background service in 5 s offers the forced restore (F9).
-    private func watchRestore(isCurrent: @escaping () -> Bool = { true }, _ send: (@escaping () -> Void) -> Void) {
+    private func watchRestore(
+        managed: Bool = false,
+        isCurrent: @escaping () -> Bool = { true },
+        _ send: (@escaping () -> Void) -> Void
+    ) {
         var answered = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            if !answered && isCurrent() { self?.helperUnresponsive = true }
+            if !managed && !answered && isCurrent() { self?.helperUnresponsive = true }
         }
         send {
             DispatchQueue.main.async {
                 answered = true
-                if isCurrent() { self.helperUnresponsive = false }
+                if !managed && isCurrent() { self.helperUnresponsive = false }
             }
         }
     }
@@ -511,6 +532,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// connect again" — that turned the VPN back on right after the
     /// user asked for the network back (§30.4).
     func prepareForForcedRestore() {
+        protection.invalidate(.forcedRestore)
         dropTracker.noteUserStop()
         resettingNetwork = true
         onDemand.cancelResume()
@@ -520,6 +542,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// Panel: the forced restore was cancelled or failed.
     func forcedRestoreAbandoned() {
         resettingNetwork = false
+        protection.restoreAbandoned(managing: cisco?.isManaging == true, usesCisco: usesCisco) { [weak self] in
+            self?.cisco?.rearm()
+        }
         onDemandDisconnect.recover()
     }
 
@@ -533,6 +558,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     }
 
     func disconnectByUser() {
+        protection.invalidate(.manualStop)
         onDemand.userStop()
     }
 
@@ -541,13 +567,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         onLocalStopped: (() -> Void)? = nil,
         isCurrent: @escaping () -> Bool = { true }
     ) {
+        let protectionSession = protection.invalidate(.disconnect)
         dropTracker.noteUserStop()
         if let cisco {
             // Network first: "断开 VPN，恢复直连网络" must restore the
             // direct network at once, not after Cisco has wound down a
             // login that may still be trying (DESIGN.md §21.10).
             pfWarning = nil
-            watchRestore(isCurrent: isCurrent) { answered in
+            watchRestore(managed: onLocalStopped != nil, isCurrent: isCurrent) { answered in
                 ensureConnection { proxy in
                     proxy.disconnect {
                         answered()
@@ -557,6 +584,13 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             }
             cisco.disconnect { [weak self] in
                 guard let self, isCurrent() else { return }
+                // A superseding start/mode change owns protection now. Still report
+                // local stop completion so the separate disconnect reducer can settle.
+                guard self.protection.isSessionCurrent(protectionSession) else {
+                    onLocalStopped?()
+                    completion?()
+                    return
+                }
                 // Unload again in case the engine re-armed in between. But
                 // if the user has meanwhile switched to the own connection
                 // (按网站分流 on), a full disconnect would stop the session
@@ -583,7 +617,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         let relay = takeRelay()
         if onLocalStopped != nil { retire(relay) }
-        watchRestore(isCurrent: isCurrent) { answered in
+        watchRestore(managed: onLocalStopped != nil, isCurrent: isCurrent) { answered in
             ensureConnection { proxy in
                 proxy.disconnect { [weak self] in
                     answered()
@@ -645,6 +679,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     func setConnectionMode(own: Bool) {
         guard own != ownConnection else { return }
         if switchIsOn { disconnect() }
+        protection.invalidate(.modeChanged)
         var settings = ProfileStore.loadAppSettings()
         settings.connectionMode = own ? "own" : "cisco"
         ProfileStore.saveAppSettings(settings)
@@ -940,6 +975,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         let profile = ProfileStore.loadProfile()
         guard hasCredentials, let username = ProfileStore.loadUsername() else { return false }
+        protection.startSession(usesCisco: usesCisco)
         if let cisco {
             // The engine reads the password itself, once, when it logs in.
             // Allowlist first, so the kill switch's first load has it.
