@@ -105,7 +105,7 @@ enum CiscoEngine {
     static var observedState = "Disconnected"
     struct Result { var status: Int32; var output: String }
     static func run(_ args: [String], timeout: TimeInterval) -> Result {
-        precondition(args == ["state"] && timeout == 2)
+        precondition(args == ["state"] && timeout == 5)
         return Result(status: 0, output: observedState)
     }
     static func parseState(_ text: String) -> String? { text }

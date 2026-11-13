@@ -35,7 +35,7 @@ impl Disconnect {
             self.checking = true;
             self.verification = self.verification.wrapping_add(1);
             actions.push(
-                json!({"kind":"verify", "token":self.generation, "observation":self.verification, "seconds":3}),
+                json!({"kind":"verify", "token":self.generation, "observation":self.verification, "seconds":6, "cli_seconds":5}),
             );
         }
     }
@@ -519,6 +519,32 @@ mod tests {
             &c(&mut s, json!({"kind":"disconnect_settled"}), json!({})),
             "start"
         ));
+    }
+    #[test]
+    fn normal_state_cli_exit_grace_fits_verification_window() {
+        let mut s = Disconnect::default();
+        let actions = begin(&mut s);
+        let verify = actions.iter().find(|a| a["kind"] == "verify").unwrap();
+        let seconds = verify["cli_seconds"].as_u64().unwrap();
+        assert!(verify["seconds"].as_u64().unwrap() > seconds);
+        // The real state command can print Disconnected yet take >2 s to exit.
+        // Use a shell substitute, never the installed Cisco CLI in cargo test.
+        let reply = crate::cisco::run(
+            "/bin/sh",
+            &[
+                "-c",
+                "printf '>> state: Unknown\n>> state: Disconnected\n'; sleep 2.25",
+            ],
+            None,
+            std::time::Duration::from_secs(seconds),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(reply.status, 0);
+        assert_eq!(
+            crate::cisco::parse_state(&reply.output).as_deref(),
+            Some("Disconnected")
+        );
     }
     #[test]
     fn active_held_unknown_and_cisco_not_stopped_never_release() {

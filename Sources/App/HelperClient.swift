@@ -186,7 +186,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 isCurrent: { [weak self] in self?.onDemandDisconnect.isCurrent(token) == true })
         }
         onDemandDisconnect.usesCisco = { [weak self] in self?.usesCisco == true }
-        onDemandDisconnect.verifyIdle = { [weak self] done in self?.verifyOnDemandIdle(done) }
+        onDemandDisconnect.verifyIdle = { [weak self] timeout, done in self?.verifyOnDemandIdle(timeout: timeout, done) }
         onDemandDisconnect.needsAttention = { [weak self] in self?.helperUnresponsive = true }
         onDemandDisconnect.restartRecovery = { [weak self] active in
             self?.scheduleRestartRecovery(wasActive: active)
@@ -199,7 +199,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// Report raw observations. Rust checks the generation, deadline and idle conditions.
     /// Both RPCs use one proxy, fencing the preceding disconnect on the service queue.
-    private func verifyOnDemandIdle(_ done: @escaping (Int, Bool, String?) -> Void) {
+    private func verifyOnDemandIdle(timeout: TimeInterval, _ done: @escaping (Int, Bool, String?) -> Void) {
         ensureConnection { proxy in
             proxy.getStatus { code, _ in
                 proxy.getNetworkHeld { held in
@@ -208,7 +208,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         // Only the bounded CLI I/O itself runs on the utility queue.
                         if self.usesCisco {
                             DispatchQueue.global(qos: .utility).async {
-                                let result = CiscoEngine.run(["state"], timeout: 2)
+                                let result = CiscoEngine.run(["state"], timeout: timeout)
                                 let state = result.status == 0 ? CiscoEngine.parseState(result.output) : "Unknown"
                                 DispatchQueue.main.async { done(code, held, state) }
                             }
