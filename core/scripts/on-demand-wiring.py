@@ -32,7 +32,7 @@ methods = [
     'private func setupOnDemandDisconnection()', 'private func verifyOnDemandIdle(',
     'func connectWithStoredCredentials(', 'func disconnect(\n', 'private func watchRestore(',
     'func onDemandSettingsChanged()', 'func prepareForForcedRestore()',
-    'func forcedRestoreAbandoned()', 'func forcedRestoreDone()', 'func disconnectByUser()', 'private func setKillSwitch('
+    'func forcedRestoreAbandoned()', 'func forcedRestoreDone()', 'func disconnectByUser()', 'private func setKillSwitch(', 'func setConnectionMode('
 ]
 body = '\n'.join(block(source, marker).replace('private func ', 'func ', 1) for marker in methods)
 callbacks = '\n'.join(block(source, marker) for marker in [
@@ -63,10 +63,11 @@ final class Queue {
 }
 struct AppRole { static let isSettings = false }
 final class SettingsLink { static let shared = SettingsLink(); func send(_ action: String) {} }
-struct Settings { var onDemandEnabled: Bool?; var onDemandRules: [OnDemandRule]?; var isDropProtectionOn = true }
+struct Settings { var onDemandEnabled: Bool?; var onDemandRules: [OnDemandRule]?; var isDropProtectionOn = true; var connectionMode = "cisco" }
 enum ProfileStore {
     static var settings = Settings(onDemandEnabled: true, onDemandRules: [])
     static func loadAppSettings() -> Settings { settings }
+    static func saveAppSettings(_ value: Settings) { settings = value }
 }
 enum HelperInstaller { static var installedHelperMatchesBundle = true }
 struct Tracker { func noteUserStop() {} }
@@ -99,7 +100,13 @@ struct FactsReader { func watch(enabled: Bool) {} }
 final class Relay {}
 final class Cisco {
     var completion: (() -> Void)?
-    func disconnect(completion: @escaping () -> Void) { self.completion = completion }
+    var isManaging = true
+    var rearms = 0
+    func rearm() { rearms += 1 }
+    func disconnect(completion: @escaping () -> Void) {
+        isManaging = false
+        self.completion = completion
+    }
 }
 enum CiscoEngine {
     static var observedState = "Disconnected"
@@ -115,6 +122,7 @@ final class Proxy {
     var held = false
     var blocked = false
     var dropsStatus = false
+    var delayedStatus: [() -> Void] = []
     var queue: [() -> Void] = []
     var replies: [() -> Void] = []
     var calls: [String] = []
@@ -124,7 +132,7 @@ final class Proxy {
         enqueue { self.calls.append("disconnect"); self.code = 0; self.held = false; self.replies.append(reply) }
     }
     func getStatus(_ reply: @escaping (Int, String) -> Void) {
-        enqueue { self.calls.append("status"); if !self.dropsStatus { reply(self.code, "") } }
+        enqueue { self.calls.append("status"); if !self.dropsStatus { reply(self.code, "") } else { self.delayedStatus.append { reply(self.code, "") } } }
     }
     func getNetworkHeld(_ reply: @escaping (Bool) -> Void) {
         enqueue { self.calls.append("held"); reply(self.held) }
@@ -137,6 +145,7 @@ final class Proxy {
 final class Client {
     let onDemand = OnDemandController()
     let onDemandDisconnect = OnDemandDisconnect()
+    let protection = OnDemandProtection()
     var onDemandPaused = false
     var onDemandRuleName: String?
     var awaitingRestartRecovery = false
@@ -150,7 +159,10 @@ final class Client {
     var starts = 0
     var pfWarning: String?
     var cisco: Cisco?
-    var usesCisco: Bool { cisco != nil }
+    var ownConnection = false
+    var splitActivity: String?
+    var switchIsOn: Bool { proxy.code != 0 || proxy.held }
+    var usesCisco: Bool { cisco != nil && !ownConnection }
     let proxy = Proxy()
     init() {
         setupOnDemandDisconnection()
@@ -168,7 +180,13 @@ final class Client {
     func refreshStatus() { onDemandDisconnect.recheck() }
     func markHelperReachable() { helperUnresponsive = false }
     func scheduleRestartRecovery(wasActive: Bool) {}
-    func startStoredConnection() -> Bool { starts += 1; proxy.code = 1; return true }
+    func startStoredConnection() -> Bool {
+        protection.startSession(usesCisco: usesCisco)
+        cisco?.isManaging = true
+        starts += 1
+        proxy.code = 1
+        return true
+    }
     METHODS
 }
 final class NWPathMonitor {
@@ -303,6 +321,90 @@ final class ViewLifecycle {
         deadlines.forEach { $0() }
         DispatchQueue.main.timers.forEach { $0() }
         check(!slow.helperUnresponsive, "slow Cisco stop with a helper reply does not claim helper failure")
+
+        // Verify F4: the old service executes its status request but delays the reply.
+        HelperInstaller.installedHelperMatchesBundle = false
+        let lateArm = Client()
+        lateArm.cisco = Cisco()
+        lateArm.proxy.dropsStatus = true
+        lateArm.setKillSwitch(2, tunnelIf: "utun9", gatewayIps: ["192.0.2.1"])
+        lateArm.disconnectByUser()
+        lateArm.cisco?.completion?()
+        check(!lateArm.proxy.held, "F4 manual disconnect releases protection before the old status reply")
+        lateArm.proxy.delayedStatus.removeFirst()()
+        print("F4 observed held=\(lateArm.proxy.held) calls=\(lateArm.proxy.calls)")
+        check(!lateArm.proxy.held && !lateArm.proxy.calls.contains("arm"),
+              "F4 late old-service status reply cannot rearm after manual disconnect")
+
+        let lateOff = Client()
+        lateOff.cisco = Cisco()
+        lateOff.proxy.dropsStatus = true
+        lateOff.setKillSwitch(0, tunnelIf: "", gatewayIps: [])
+        _ = lateOff.connectWithStoredCredentials(manual: true)
+        lateOff.setKillSwitch(1, tunnelIf: "utun10", gatewayIps: ["192.0.2.2"])
+        lateOff.proxy.delayedStatus.removeLast()()
+        check(lateOff.proxy.held, "new session protection is installed before delivering old off")
+        lateOff.proxy.delayedStatus.removeFirst()()
+        check(lateOff.proxy.held && lateOff.proxy.calls.filter { $0 == "arm" }.count == 1,
+              "late old off cannot unload a new session's protection")
+
+        for reset in ["forced", "mode", "on-demand"] {
+            let c = Client()
+            c.cisco = Cisco()
+            c.proxy.dropsStatus = true
+            c.setKillSwitch(2, tunnelIf: "utun9", gatewayIps: ["192.0.2.1"])
+            if reset == "forced" { c.prepareForForcedRestore() }
+            if reset == "mode" { c.setConnectionMode(own: true) }
+            if reset == "on-demand" { c.onDemandSettingsChanged() }
+            c.proxy.delayedStatus.removeFirst()()
+            check(!c.proxy.held && !c.proxy.calls.contains("arm"), "production boundary cancels delayed protection: " + reset)
+        }
+        HelperInstaller.installedHelperMatchesBundle = true
+        let oldStop = Client()
+        oldStop.cisco = Cisco()
+        oldStop.disconnectByUser()
+        let oldCompletion = oldStop.cisco!.completion!
+        _ = oldStop.connectWithStoredCredentials(manual: true)
+        oldStop.setKillSwitch(1, tunnelIf: "utun10", gatewayIps: ["192.0.2.2"])
+        oldCompletion()
+        check(oldStop.proxy.held && oldStop.proxy.calls.filter { $0 == "disconnect" }.count == 1,
+              "old local-stop callback cannot submit another unload against a newer session")
+        DispatchQueue.main.timers.forEach { $0() }
+        check(lateArm.pfWarning == nil, "cancelled protection deadline cannot report a stale warning")
+        HelperInstaller.installedHelperMatchesBundle = false
+
+        let cancelled = Client()
+        cancelled.cisco = Cisco()
+        cancelled.proxy.dropsStatus = true
+        cancelled.setKillSwitch(2, tunnelIf: "utun9", gatewayIps: ["192.0.2.1"])
+        cancelled.prepareForForcedRestore()
+        cancelled.forcedRestoreAbandoned()
+        cancelled.setKillSwitch(1, tunnelIf: "utun10", gatewayIps: ["192.0.2.2"])
+        cancelled.proxy.delayedStatus.removeLast()()
+        cancelled.proxy.delayedStatus.removeFirst()()
+        check(cancelled.proxy.held && cancelled.cisco?.rearms == 1
+              && cancelled.proxy.calls.filter { $0 == "arm" }.count == 1,
+              "cancelled restore rearms surviving Cisco with a new intent and rejects the pre-restore reply")
+
+        let latest = Client()
+        latest.cisco = Cisco()
+        latest.proxy.dropsStatus = true
+        latest.setKillSwitch(2, tunnelIf: "utun9", gatewayIps: ["192.0.2.1"])
+        latest.setKillSwitch(0, tunnelIf: "", gatewayIps: [])
+        latest.proxy.delayedStatus.removeFirst()()
+        latest.proxy.delayedStatus.removeFirst()()
+        check(!latest.proxy.held && latest.proxy.calls.filter { $0 == "arm" }.count == 1,
+              "only the latest protection intent is submitted within one session")
+        HelperInstaller.installedHelperMatchesBundle = true
+        let fresh = Client()
+        fresh.cisco = Cisco()
+        fresh.proxy.blocked = true
+        fresh.setKillSwitch(2, tunnelIf: "utun9", gatewayIps: ["192.0.2.1"])
+        fresh.disconnectByUser()
+        fresh.cisco?.completion?()
+        fresh.proxy.blocked = false
+        fresh.proxy.drain()
+        check(!fresh.proxy.held, "new-service FIFO arm then manual disconnect still leaves direct networking")
 
         let editor = RuleEditor()
         editor.fillCurrentNetwork()

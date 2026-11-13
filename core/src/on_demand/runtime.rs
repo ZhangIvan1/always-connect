@@ -3,6 +3,85 @@ use super::{decide, transition, Request, Rule, Runtime, Transition};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Revocable protection intent. Swift holds only the returned session/intent ticket.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Protection {
+    /// Changes at connection boundaries, including explicit stops and mode switches.
+    pub session: u64,
+    /// Changes for every new protection request, including off requests.
+    pub intent: u64,
+    /// Whether this intent may still report a result or warning.
+    pub live: bool,
+    /// Exactly one callback may submit this intent to the service.
+    pub pending: bool,
+    /// Startup may adopt an owned Cisco session; a stop closes this until a new start.
+    pub accepts_nonzero: bool,
+}
+impl Default for Protection {
+    fn default() -> Self {
+        Self {
+            session: 0,
+            intent: 0,
+            live: false,
+            pending: false,
+            accepts_nonzero: true,
+        }
+    }
+}
+impl Protection {
+    fn current(&self, event: &Value) -> bool {
+        self.live
+            && event["session"].as_u64() == Some(self.session)
+            && event["intent"].as_u64() == Some(self.intent)
+    }
+    fn boundary(&mut self, accepts_nonzero: bool) {
+        self.session = self.session.wrapping_add(1);
+        self.intent = self.intent.wrapping_add(1);
+        self.live = false;
+        self.pending = false;
+        self.accepts_nonzero = accepts_nonzero;
+    }
+    /// Claim before sending an RPC; later invalidation cannot recall an RPC already sent.
+    pub fn event(&mut self, event: &Value, actions: &mut Vec<Value>) -> bool {
+        match event["kind"].as_str().unwrap_or("") {
+            "session_start" => self.boundary(event["uses_cisco"].as_bool().unwrap_or(false)),
+            "restore_abandoned" => {
+                self.boundary(
+                    event["managing"].as_bool().unwrap_or(false)
+                        && event["uses_cisco"].as_bool().unwrap_or(false),
+                );
+                if self.accepts_nonzero {
+                    actions.push(json!({"kind":"rearm"}));
+                }
+            }
+            "manual_stop" | "forced_restore" | "mode_changed" | "server_changed"
+            | "on_demand_stop" | "disconnect" => self.boundary(false),
+            "request" => {
+                self.intent = self.intent.wrapping_add(1);
+                self.live = false;
+                self.pending = false;
+                if let Some(mode @ 0..=2) = event["mode"].as_i64() {
+                    if mode == 0 || self.accepts_nonzero {
+                        self.live = true;
+                        self.pending = true;
+                        actions.push(json!({"kind":"ticket", "session":self.session,
+                            "intent":self.intent, "mode":mode}));
+                    }
+                }
+            }
+            "claim" if self.current(event) && self.pending => {
+                self.pending = false;
+                return true;
+            }
+            "is_current" => return self.current(event),
+            "session_current" => return event["session"].as_u64() == Some(self.session),
+            _ => (),
+        }
+        false
+    }
+}
+
 /// One disconnect's lifetime, including the local Cisco stop and status observation.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -391,6 +470,11 @@ pub fn step(request: Value) -> Value {
     let event = &request["event"];
     if request["kind"] == "disconnect" {
         let mut state: Disconnect =
+            serde_json::from_value(request["state"].clone()).unwrap_or_default();
+        let allowed = state.event(event, &mut actions);
+        json!({"state":state,"actions":actions,"allowed":allowed})
+    } else if request["kind"] == "protection" {
+        let mut state: Protection =
             serde_json::from_value(request["state"].clone()).unwrap_or_default();
         let allowed = state.event(event, &mut actions);
         json!({"state":state,"actions":actions,"allowed":allowed})
@@ -912,5 +996,106 @@ mod controller_sequences {
         let late = json!({"kind":"probe","token":p["token"],"probe_epoch":p["probe_epoch"],"rule_id":p["rule_id"],"facts":p["facts"],"matched":true});
         assert!(send(&mut s, late, true, false).is_empty());
         assert!(s.policy.manual && !s.policy.paused);
+    }
+}
+
+#[cfg(test)]
+mod protection_tests {
+    use super::*;
+    fn request(state: &mut Protection, mode: i32) -> Value {
+        let mut out = vec![];
+        state.event(&json!({"kind":"request","mode":mode}), &mut out);
+        out.into_iter().next().unwrap_or(Value::Null)
+    }
+    fn check(state: &mut Protection, ticket: &Value, kind: &str) -> bool {
+        state.event(
+            &json!({"kind":kind,"session":ticket["session"],"intent":ticket["intent"]}),
+            &mut vec![],
+        )
+    }
+    #[test]
+    fn every_stop_boundary_cancels_arm_off_and_stale_warning() {
+        for kind in [
+            "manual_stop",
+            "forced_restore",
+            "mode_changed",
+            "server_changed",
+            "on_demand_stop",
+            "disconnect",
+        ] {
+            for mode in [0, 1, 2] {
+                let mut state = Protection::default();
+                let old = request(&mut state, mode);
+                state.event(&json!({"kind":kind}), &mut vec![]);
+                assert!(!check(&mut state, &old, "claim"), "{kind} / {mode}");
+                assert!(!check(&mut state, &old, "is_current"));
+                assert!(
+                    request(&mut state, 2).is_null(),
+                    "late engine hook after {kind}"
+                );
+                assert!(!request(&mut state, 0).is_null());
+            }
+        }
+    }
+    #[test]
+    fn latest_intent_wins_in_both_callback_orders_and_claims_once() {
+        for (first, last) in [(0, 2), (2, 0), (2, 1), (1, 2)] {
+            for newest_first in [false, true] {
+                let mut state = Protection::default();
+                let old = request(&mut state, first);
+                let new = request(&mut state, last);
+                if newest_first {
+                    assert!(check(&mut state, &new, "claim"));
+                }
+                assert!(!check(&mut state, &old, "claim"));
+                assert!(!check(&mut state, &old, "is_current"));
+                if !newest_first {
+                    assert!(check(&mut state, &new, "claim"));
+                }
+                assert!(!check(&mut state, &new, "claim"));
+                assert!(check(&mut state, &new, "is_current"));
+            }
+        }
+    }
+    #[test]
+    fn cancelled_restore_rearms_a_surviving_cisco_session_with_a_new_ticket_only() {
+        for managing in [false, true] {
+            for cisco in [false, true] {
+                let mut state = Protection::default();
+                let old = request(&mut state, 2);
+                state.event(&json!({"kind":"forced_restore"}), &mut vec![]);
+                let mut actions = vec![];
+                state.event(
+                    &json!({"kind":"restore_abandoned","managing":managing,"uses_cisco":cisco}),
+                    &mut actions,
+                );
+                assert!(!check(&mut state, &old, "claim"));
+                assert_eq!(!actions.is_empty(), managing && cisco);
+                assert_eq!(!request(&mut state, 2).is_null(), managing && cisco);
+            }
+        }
+    }
+    #[test]
+    fn new_session_rejects_old_off_and_queries_but_allows_new_arm() {
+        let mut state = Protection::default();
+        let old = request(&mut state, 0);
+        let session = state.session;
+        state.event(
+            &json!({"kind":"session_start","uses_cisco":true}),
+            &mut vec![],
+        );
+        assert!(!state.event(
+            &json!({"kind":"session_current","session":session}),
+            &mut vec![]
+        ));
+        assert!(!check(&mut state, &old, "claim"));
+        let new = request(&mut state, 2);
+        assert!(check(&mut state, &new, "claim"));
+        state.event(
+            &json!({"kind":"session_start","uses_cisco":false}),
+            &mut vec![],
+        );
+        assert!(request(&mut state, 1).is_null());
+        assert!(!request(&mut state, 0).is_null());
     }
 }

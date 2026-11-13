@@ -94,6 +94,50 @@ final class OnDemandMachine {
     }
 }
 
+/// Opaque Rust tickets; no Swift generation counters or validity decisions.
+final class OnDemandProtection {
+    struct Ticket {
+        let session: UInt64
+        let intent: UInt64
+    }
+    enum Boundary: String {
+        case manualStop = "manual_stop", forcedRestore = "forced_restore"
+        case modeChanged = "mode_changed", serverChanged = "server_changed"
+        case onDemandStop = "on_demand_stop", disconnect
+    }
+    private let machine = OnDemandMachine("protection")
+    @discardableResult
+    func invalidate(_ reason: Boundary) -> UInt64 {
+        machine.send(["kind": reason.rawValue])
+        return machine.state["session"] as? UInt64 ?? 0
+    }
+    func startSession(usesCisco: Bool) {
+        machine.send(["kind": "session_start", "uses_cisco": usesCisco])
+    }
+    func restoreAbandoned(managing: Bool, usesCisco: Bool, rearm: () -> Void) {
+        machine.send(["kind": "restore_abandoned", "managing": managing, "uses_cisco": usesCisco]) { action in
+            if action["kind"] as? String == "rearm" { rearm() }
+        }
+    }
+    func request(_ mode: Int) -> Ticket? {
+        var ticket: Ticket?
+        machine.send(["kind": "request", "mode": mode]) { action in
+            if let session = action["session"] as? UInt64, let intent = action["intent"] as? UInt64 {
+                ticket = Ticket(session: session, intent: intent)
+            }
+        }
+        return ticket
+    }
+    func claim(_ ticket: Ticket) -> Bool { query("claim", ticket) }
+    func isCurrent(_ ticket: Ticket) -> Bool { query("is_current", ticket) }
+    func isSessionCurrent(_ session: UInt64) -> Bool {
+        machine.send(["kind": "session_current", "session": session])
+    }
+    private func query(_ kind: String, _ ticket: Ticket) -> Bool {
+        machine.send(["kind": kind, "session": ticket.session, "intent": ticket.intent])
+    }
+}
+
 /// System effects only: read facts, run a probe, or notify the App. Rust owns order and intent.
 final class OnDemandController {
     var collect: (Bool, @escaping (OnDemandFacts) -> Void) -> Void = { _, done in done(OnDemandFacts()) }
