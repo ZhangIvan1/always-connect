@@ -2024,7 +2024,7 @@ DNS 归 Cisco，我们不插手，§二十二）。
 ### 33.5 发布约定
 - Release 的标签必须是 `v` + Info.plist 的 CFBundleShortVersionString，否则新版装上后仍会提示"有新版"。
   `scripts/package-release.sh v<版本>` 先核对两者，再以固定的自签名身份（§35.5，原为 ad-hoc）构建并打出 `AlwaysConnect-<版本>-macos-<arch>.zip` 与 `.sha256`；
-  创建 Release 仍是手动一步（用户规则：只有大版本才发 Release）。
+  创建 Release 自 §47 起由版本标签触发 CI；普通 push 不发版。是否发布仍由维护者选择推送标签。
 
 ### 33.6 卸载
 - 新增的只是 App 自己偏好域里的几个键，`uninstall.sh` 删除该偏好域时一并清掉（勾"保留设置"时随设置保留）；
@@ -2728,3 +2728,35 @@ Rust `Protection` reducer 保存会话代次、意图代次、是否待提交以
 顺序操作放一个上下箭头菜单，节约条件摘要空间；卡片页脚一行，风险详情放既有 HoverHelp，编辑器只保留一句提醒。
 完整可伪造风险和 Cisco 物理探针限制见 §46.4，README 完整说明保留。
 验证级别：编译、合并输入断言和离屏示例渲染；定位与实际控件交互仍需 I36 实测。
+
+## 四十七、版本标签触发自动发布（2026-11-13）
+
+维护者选择把现有发布证书的私钥保存到 CI，并要求避免每次 push 都发布安装包。
+普通 main push / PR 仍只运行 `.github/workflows/ci.yml`；推送 `vMAJOR.MINOR.PATCH` 标签才触发 `release.yml`。
+版本号和构建号由维护者在准备发布时更新；标签必须与 App 版本一致，且指向已进入 main 的提交。
+
+### 47.1 检查与签名边界
+无秘密的 checks job 等待该提交的 main push CI，核对 `rust-linux`、`macos` 两项成功。
+旧提交、PR 或其他分支的成功记录不能代替；取消、失败、缺少任务或截止仍未完成都停止发布。
+之后的 publish job 使用 macOS 15 Apple Silicon runner，并在构建前确认 `uname -m` 为 arm64。
+
+固定身份仍为 §35.5 的 AlwaysConnect Local Dev，`install.sh` 的 RELEASE_SIGNER 不变。
+私钥和加密口令仅保存为 GitHub `release` 环境的两个 Actions secrets；环境只允许 `v*` 标签。
+普通 CI、fork PR 和 main 分支任务不能读取这些环境秘密。
+runner 在私有临时目录中解码、导入临时钥匙串，允许 codesign 使用，结束时无论成功失败都清理。
+本机仅按证书指纹导出这一项发布身份，临时加密容器在上传后删除，不导出 VPN 登录身份。
+
+### 47.2 打包与公开
+复用 `package-release.sh`：版本匹配、同一签名者、构建路径扫描、安装包和校验文件、第三方对应源码包。
+`verify-release.sh` 重新解开 ZIP，核对包内版本、固定证书、App/后台服务/openconnect 的 arm64 架构和独立运行所需的库。
+`release-ci.py` 先创建草稿、上传三个附件，重新下载并逐字节校验，通过后才公开并设为 Latest。
+公开前再次核对标签仍指向同一提交；`v*` 标签禁止更新和删除，新正式版本须高于已有正式版本。
+公开版本不覆盖，失败仅可重试同一提交的草稿。
+发布说明由 GitHub 从提交与 PR 自动生成，并保留真实网络待测清单的提示。
+此流程只发布安装包，不替换维护者机器上的 App，也不操作网络、钥匙串密码或后台服务安装状态。
+
+### 47.3 验证范围
+`scripts/release-ci-test.py` 用无网络替身注入错误版本、错误提交、失败或缺失 CI、已有公开版本、不同提交的草稿、附件损坏及多余附件等情况。
+断言同时检查：有效流程必须在下载核对后才公开，同一提交草稿可重试，较旧版本不能设为 Latest。
+workflow 的表达式、权限与 shell 经 actionlint 检查；签名导入、真实 runner 打包及 GitHub 上传由首次 v0.2.7 Release workflow 做端到端验收。
+CI 发布不代表真实 VPN 行为已经实测，原有 mac-proof 清单继续适用。

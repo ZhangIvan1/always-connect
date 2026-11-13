@@ -1,0 +1,88 @@
+name: Release
+
+# Ordinary pushes and pull requests only run ci.yml. A version tag is
+# the maintainer's explicit decision to publish a new version.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    if: github.repository == 'weiazm/always-connect'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require matching version, main ancestry and green CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release-ci.py check "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_REF_NAME"
+
+  publish:
+    needs: checks
+    runs-on: macos-15
+    timeout-minutes: 40
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require Apple Silicon and install build dependencies
+        run: |
+          test "$(uname -m)" = arm64
+          brew install openconnect
+      - name: Prepare a temporary keychain directory
+        run: |
+          set -euo pipefail
+          umask 077
+          signing_dir=$(mktemp -d "$RUNNER_TEMP/release-signing.XXXXXXXX")
+          echo "SIGNING_DIR=$signing_dir" >> "$GITHUB_ENV"
+          keychain="$signing_dir/release.keychain-db"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+      - name: Import the existing release identity
+        env:
+          CERTIFICATE_P12: ${{ secrets.RELEASE_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.RELEASE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export SIGNING_FILE="$SIGNING_DIR/identity.p12"
+          python3 -c 'import base64, os, pathlib; pathlib.Path(os.environ["SIGNING_FILE"]).write_bytes(base64.b64decode(os.environ["CERTIFICATE_P12"], validate=True))'
+          keychain_password=$(openssl rand -hex 24)
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$SIGNING_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$keychain_password" "$SIGNING_KEYCHAIN"
+          security import "$SIGNING_FILE" -k "$SIGNING_KEYCHAIN" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$SIGNING_KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$SIGNING_KEYCHAIN" >/dev/null
+          rm -f "$SIGNING_FILE"
+      - name: Build and verify the signed, self-contained package
+        run: |
+          scripts/package-release.sh "$GITHUB_REF_NAME"
+          scripts/verify-release.sh "$GITHUB_REF_NAME"
+      - name: Upload, verify downloads and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release-ci.py publish "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_REF_NAME"
+      - name: Delete the temporary signing keychain
+        if: always()
+        run: |
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then security delete-keychain "$SIGNING_KEYCHAIN" || true; fi
+          if [ -n "${SIGNING_DIR:-}" ]; then rm -rf "$SIGNING_DIR"; fi

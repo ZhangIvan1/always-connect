@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Release gate and publication failure cases (no secrets or network)
+        run: python3 scripts/release-ci-test.py
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y libopenconnect-dev ocserv openconnect
       - name: Start test gateway

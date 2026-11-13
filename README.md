@@ -210,6 +210,11 @@ scripts/install-app.sh                # 装到「应用程序」
 
 有 Xcode 时也可以先 `xcodegen generate` 生成工程。各脚本的用途见 [AGENTS.md](AGENTS.md)。
 
+**维护者发布：** 普通 push 和 PR 只跑检查。需要发版时，先更新 `Info.plist` 的版本和构建号、推送 main，
+再对该提交推送 `v<版本>` 标签。Release workflow 等待该提交的 Linux/macOS CI 通过，自动签名、打包并发布三个附件。
+签名使用 GitHub `release` 环境保存的原有证书；失败停在草稿，已公开的版本不覆盖，修复后使用新版本号。
+发布流程见 [DESIGN §47](DESIGN.md#四十七版本标签触发自动发布2026-11-13)。
+
 文档：[DESIGN.md](DESIGN.md)（设计与实测结论）· [UI-DESIGN.md](UI-DESIGN.md)（界面）·
 [HANDOVER.md](HANDOVER.md)（当前状态）· [AGENTS.md](AGENTS.md)（给贡献者和 AI 助手的约定）
 </details>
