@@ -39,7 +39,7 @@ import Foundation
         check(!c.state.paused && starts == baseline + 2, "leaving matched network restores previously active session")
         live = false; facts.ssid = "Office-WiFi"; c.networkChanged()
         facts.ssid = "Home"; c.networkChanged()
-        check(starts == baseline + 2, "inactive session with auto-connect off stays off")
+        check(starts == baseline + 3, "leaving a policy pause resumes with launch auto-connect off")
         r.probe = OnDemandProbe(kind: "dns", target: "intranet.example.com")
         c.configure(enabled: true, rules: [r])
         check(probes == 0, "unmatched offline condition does not probe")

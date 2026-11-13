@@ -32,8 +32,11 @@ final class OnDemandDisconnect {
         case "stop":
             stop(token, { [weak self] in self?.send(["kind": "local_stopped", "token": token]) },
                  { [weak self] in self?.send(["kind": "reply", "token": token]) })
-        case "deadline":
-            schedule(action["seconds"] as? Double ?? 3) { [weak self] in self?.send(["kind": "deadline", "token": token]) }
+        case "deadline", "release_deadline":
+            let kind = action["kind"] as? String ?? "deadline"
+            schedule(action["seconds"] as? Double ?? 3) { [weak self] in
+                self?.send(["kind": kind, "token": token])
+            }
         case "verify":
             let observation = action["observation"]!
             let cisco = usesCisco()

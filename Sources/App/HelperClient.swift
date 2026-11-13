@@ -365,14 +365,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private func markHelperReachable() {
         helperAvailable = true
         lastError = nil
+        helperUnresponsive = false
     }
 
     /// Cisco engine → Helper pf (DESIGN.md §二十一). A missing or old
     /// Helper means no kill switch: say so on the panel, never hide it.
     private func setKillSwitch(_ mode: Int, tunnelIf: String, gatewayIps: [String]) {
-        // Drop protection off (DESIGN.md §21.6): pf stays unloaded, a
-        // drop lets traffic out the local network like plain Cisco.
-        let mode = ProfileStore.loadAppSettings().isDropProtectionOn && onDemand.permitsConnection() ? mode : 0
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
@@ -381,15 +379,21 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     self.pfWarning = "后台服务未响应：断线封网未生效"
                 }
             }
-            proxy.setKillSwitch(mode, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
+            // Queue barrier: even an old service must finish any queued disconnect
+            // before arming this session. Never let a late unload follow the new arm.
+            proxy.getStatus { _, _ in
                 DispatchQueue.main.async {
-                    guard !finished else { return }
-                    finished = true
-                    self.markHelperReachable()
-                    // Cisco's line only while Cisco is the engine: a late
-                    // answer after the switch to the own connection left a
-                    // stale red line on the panel (2026-11-06).
-                    self.pfWarning = ok || !self.usesCisco ? nil : message
+                    let mode = ProfileStore.loadAppSettings().isDropProtectionOn
+                        && self.onDemand.permitsConnection() && self.usesCisco ? mode : 0
+                    proxy.setKillSwitch(mode, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
+                        DispatchQueue.main.async {
+                            // A late successful arm still updates the warning: a deadline
+                            // is not cancellation of the service's queued operation.
+                            finished = true
+                            self.markHelperReachable()
+                            self.pfWarning = ok || !self.usesCisco ? nil : message
+                        }
+                    }
                 }
             }
         }
@@ -493,15 +497,19 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     /// The restore must visibly do something: no answer from the
     /// background service in 5 s offers the forced restore (F9).
-    private func watchRestore(isCurrent: @escaping () -> Bool = { true }, _ send: (@escaping () -> Void) -> Void) {
+    private func watchRestore(
+        managed: Bool = false,
+        isCurrent: @escaping () -> Bool = { true },
+        _ send: (@escaping () -> Void) -> Void
+    ) {
         var answered = false
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            if !answered && isCurrent() { self?.helperUnresponsive = true }
+            if !managed && !answered && isCurrent() { self?.helperUnresponsive = true }
         }
         send {
             DispatchQueue.main.async {
                 answered = true
-                if isCurrent() { self.helperUnresponsive = false }
+                if !managed && isCurrent() { self.helperUnresponsive = false }
             }
         }
     }
@@ -547,7 +555,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             // direct network at once, not after Cisco has wound down a
             // login that may still be trying (DESIGN.md §21.10).
             pfWarning = nil
-            watchRestore(isCurrent: isCurrent) { answered in
+            watchRestore(managed: onLocalStopped != nil, isCurrent: isCurrent) { answered in
                 ensureConnection { proxy in
                     proxy.disconnect {
                         answered()
@@ -583,7 +591,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         let relay = takeRelay()
         if onLocalStopped != nil { retire(relay) }
-        watchRestore(isCurrent: isCurrent) { answered in
+        watchRestore(managed: onLocalStopped != nil, isCurrent: isCurrent) { answered in
             ensureConnection { proxy in
                 proxy.disconnect { [weak self] in
                     answered()

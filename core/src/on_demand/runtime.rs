@@ -19,6 +19,8 @@ pub struct Disconnect {
     pub checking: bool,
     /// Forced recovery owns the system until cancelled or completed.
     pub suspended: bool,
+    /// The bounded observation window starts only after every stop was sent.
+    pub expired: bool,
 }
 impl Disconnect {
     fn current(&self, event: &Value) -> bool {
@@ -37,24 +39,44 @@ impl Disconnect {
             );
         }
     }
-    /// Reduce one callback or recovery event; a deadline never grants permission.
+    fn finish(&mut self, actions: &mut Vec<Value>, uncertain: bool) {
+        self.waiting = false;
+        self.invalidate();
+        actions.push(json!({"kind":"settled"}));
+        if uncertain {
+            actions.push(json!({"kind":"attention"}));
+        }
+    }
+    /// Prefer confirmed idle; missing observations cannot veto a new connection forever.
     pub fn event(&mut self, event: &Value, actions: &mut Vec<Value>) -> bool {
         match event["kind"].as_str().unwrap_or("") {
             "begin" if !self.waiting => {
                 self.generation = self.generation.wrapping_add(1);
                 self.waiting = true;
                 self.local_stopped = false;
+                self.expired = false;
                 actions.push(json!({"kind":"stop", "token":self.generation}));
                 actions.push(json!({"kind":"deadline", "token":self.generation, "seconds":3}));
             }
             "local_stopped" if self.current(event) => {
-                self.local_stopped = true;
+                if !self.local_stopped {
+                    self.local_stopped = true;
+                    actions.push(
+                        json!({"kind":"release_deadline", "token":self.generation, "seconds":10}),
+                    );
+                }
                 self.reconcile(actions);
             }
             "reply" if self.current(event) => self.reconcile(actions),
             "deadline" if self.current(event) => {
-                actions.push(json!({"kind":"attention"}));
+                // A slow local Cisco stop is not evidence of an unresponsive service.
                 self.reconcile(actions);
+            }
+            "release_deadline" if self.current(event) && self.local_stopped => {
+                self.expired = true;
+                if !self.suspended {
+                    self.finish(actions, true);
+                }
             }
             "transport_lost" => {
                 self.invalidate();
@@ -73,7 +95,11 @@ impl Disconnect {
                     self.suspended = false;
                 }
                 self.invalidate();
-                self.reconcile(actions);
+                if self.expired && self.waiting && !self.suspended {
+                    self.finish(actions, true);
+                } else {
+                    self.reconcile(actions);
+                }
             }
             "result" | "verify_timeout"
                 if self.current(event)
@@ -87,8 +113,7 @@ impl Disconnect {
                     && (!event["uses_cisco"].as_bool().unwrap_or(true)
                         || event["cisco"].as_str() == Some("Disconnected"));
                 if idle && !self.suspended {
-                    self.waiting = false;
-                    actions.push(json!({"kind":"settled"}));
+                    self.finish(actions, false);
                 }
             }
             "is_current" => return self.current(event),
@@ -407,7 +432,7 @@ mod tests {
         assert!(has(&begin(&mut s), "verify"));
         let token = s.generation;
         let out = d(&mut s, json!({"kind":"deadline","token":token}));
-        assert!(has(&out, "attention"));
+        assert!(!has(&out, "attention"));
         assert!(s.waiting);
         assert!(!has(&out, "settled"));
         let observation = result(&s, 0, false, None);
@@ -415,6 +440,85 @@ mod tests {
         assert!(!s.waiting);
         assert!(d(&mut s, observation).is_empty());
         assert!(d(&mut s, json!({"kind":"reply","token":token})).is_empty());
+    }
+    #[test]
+    fn missing_verification_releases_once_after_local_stop_and_ignores_late_callbacks() {
+        let mut s = Disconnect::default();
+        let actions = begin(&mut s);
+        assert!(has(&actions, "release_deadline"));
+        let token = s.generation;
+        let late_result = result(&s, 0, false, Some("Disconnected"));
+        let actions = d(&mut s, json!({"kind":"release_deadline", "token":token}));
+        assert!(has(&actions, "settled"));
+        assert!(!s.waiting);
+        // Neither callback may dispatch another stop/unload against the new session.
+        assert!(d(&mut s, json!({"kind":"reply", "token":token})).is_empty());
+        assert!(d(&mut s, late_result).is_empty());
+        assert!(d(&mut s, json!({"kind":"release_deadline", "token":token})).is_empty());
+        d(&mut s, json!({"kind":"begin"}));
+        assert!(d(&mut s, json!({"kind":"release_deadline", "token":token})).is_empty());
+        assert!(s.waiting);
+    }
+    #[test]
+    fn slow_local_stop_is_not_helper_failure_and_recovery_owns_expired_release() {
+        let mut s = Disconnect::default();
+        d(&mut s, json!({"kind":"begin"}));
+        let token = s.generation;
+        assert!(!has(
+            &d(&mut s, json!({"kind":"deadline", "token":token})),
+            "attention"
+        ));
+        assert!(d(&mut s, json!({"kind":"release_deadline", "token":token})).is_empty());
+        d(&mut s, json!({"kind":"local_stopped", "token":token}));
+        d(&mut s, json!({"kind":"suspend"}));
+        assert!(!has(
+            &d(&mut s, json!({"kind":"release_deadline", "token":token})),
+            "settled"
+        ));
+        assert!(s.waiting);
+        assert!(has(&d(&mut s, json!({"kind":"recover"})), "settled"));
+        assert!(!s.waiting);
+    }
+    #[test]
+    fn network_connect_waits_boundedly_then_flushes_one_start_without_auto_connect() {
+        let mut s = Controller::default();
+        configure(&mut s, false);
+        let generation = s.generation;
+        c(
+            &mut s,
+            json!({"kind":"facts", "token":generation, "reason":"settings",
+            "facts":{"network":"wifi","ssid":"Example-WiFi"}}),
+            json!({}),
+        );
+        assert!(s.policy.paused && !s.policy.resume);
+        c(&mut s, json!({"kind":"network"}), json!({"waiting":true}));
+        let generation = s.generation;
+        let actions = c(
+            &mut s,
+            json!({"kind":"facts", "token":generation, "reason":"network",
+            "facts":{"network":"wifi","ssid":"Home"}}),
+            json!({"waiting":true}),
+        );
+        assert!(has(&actions, "recheck") && !has(&actions, "start"));
+        let mut stop = Disconnect::default();
+        begin(&mut stop);
+        let token = stop.generation;
+        assert!(has(
+            &d(&mut stop, json!({"kind":"release_deadline", "token":token})),
+            "settled"
+        ));
+        assert!(has(
+            &c(
+                &mut s,
+                json!({"kind":"disconnect_settled"}),
+                json!({"waiting":stop.waiting})
+            ),
+            "start"
+        ));
+        assert!(!has(
+            &c(&mut s, json!({"kind":"disconnect_settled"}), json!({})),
+            "start"
+        ));
     }
     #[test]
     fn active_held_unknown_and_cisco_not_stopped_never_release() {
@@ -736,7 +840,7 @@ mod controller_sequences {
         ));
     }
     #[test]
-    fn inactive_session_does_not_resume_but_active_intent_does() {
+    fn leaving_trusted_network_resumes_even_if_pause_preceded_login() {
         for active in [false, true] {
             let mut s = Controller::default();
             rules(&mut s, active);
@@ -744,7 +848,7 @@ mod controller_sequences {
             send(&mut s, json!({"kind":"network"}), false, false);
             assert_eq!(
                 has(&facts(&mut s, "Home", "network", false, false), "start"),
-                active
+                true
             );
         }
     }

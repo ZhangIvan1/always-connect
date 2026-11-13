@@ -31,7 +31,7 @@ methods = [
     'private func setupOnDemandDisconnection()', 'private func verifyOnDemandIdle(',
     'func connectWithStoredCredentials(', 'func disconnect(\n', 'private func watchRestore(',
     'func onDemandSettingsChanged()', 'func prepareForForcedRestore()',
-    'func forcedRestoreAbandoned()', 'func forcedRestoreDone()', 'func disconnectByUser()'
+    'func forcedRestoreAbandoned()', 'func forcedRestoreDone()', 'func disconnectByUser()', 'private func setKillSwitch('
 ]
 body = '\n'.join(block(source, marker).replace('private func ', 'func ', 1) for marker in methods)
 callbacks = '\n'.join(block(source, marker) for marker in [
@@ -53,7 +53,7 @@ final class Queue {
 }
 struct AppRole { static let isSettings = false }
 final class SettingsLink { static let shared = SettingsLink(); func send(_ action: String) {} }
-struct Settings { var onDemandEnabled: Bool?; var onDemandRules: [OnDemandRule]? }
+struct Settings { var onDemandEnabled: Bool?; var onDemandRules: [OnDemandRule]?; var isDropProtectionOn = true }
 enum ProfileStore {
     static var settings = Settings(onDemandEnabled: true, onDemandRules: [])
     static func loadAppSettings() -> Settings { settings }
@@ -98,7 +98,11 @@ final class Proxy {
         enqueue { self.calls.append("held"); reply(self.held) }
     }
     func setKillSwitch(_ mode: Int, tunnelIf: String, gatewayIps: [String], reply: @escaping (Bool, String) -> Void) {
-        enqueue { self.held = false; reply(true, "") }
+        // The old service applies this on its separate kill-switch queue.
+        // Only the production client's status barrier orders it after disconnect.
+        calls.append("arm")
+        held = mode != 0
+        reply(true, "")
     }
 }
 final class Client {
@@ -133,7 +137,7 @@ final class Client {
     func retire(_ relay: Relay?) {}
     func refreshHeld() {}
     func refreshStatus() { onDemandDisconnect.recheck() }
-    func markHelperReachable() {}
+    func markHelperReachable() { helperUnresponsive = false }
     func scheduleRestartRecovery(wasActive: Bool) {}
     func startStoredConnection() -> Bool { starts += 1; proxy.code = 1; return true }
     METHODS
@@ -154,6 +158,7 @@ final class ViewLifecycle {
         print("PASS " + name)
     }
     static func main() {
+        setbuf(stdout, nil)
         let client = Client()
         client.onDemandSettingsChanged()
         check(client.onDemandPaused && !client.onDemandDisconnect.waiting,
@@ -187,6 +192,35 @@ final class ViewLifecycle {
             cisco.refreshStatus()
             check(cisco.starts == 1, "Cisco CLI observation and recovery callback reach Rust")
         }
+        let delayed = Client()
+        delayed.cisco = Cisco()
+        delayed.proxy.blocked = true
+        var timers: [(Double, () -> Void)] = []
+        delayed.onDemandDisconnect.schedule = { timers.append(($0, $1)) }
+        delayed.onDemandSettingsChanged()
+        _ = delayed.connectWithStoredCredentials(manual: true)
+        delayed.cisco?.completion?()
+        timers.filter { $0.0 == 10 }.forEach { $0.1() }
+        check(delayed.starts == 1, "bounded release reaches the production connection entry without status replies")
+        delayed.setKillSwitch(1, tunnelIf: "utun9", gatewayIps: ["192.0.2.1"])
+        check(!delayed.proxy.calls.contains("arm"), "new Cisco protection waits behind the old server disconnect")
+        delayed.proxy.blocked = false
+        delayed.proxy.drain()
+        check(delayed.proxy.calls.firstIndex(of: "arm")! > delayed.proxy.calls.lastIndex(of: "disconnect")!
+              && delayed.proxy.held,
+              "old queued unload precedes rearm even on the old service")
+        delayed.proxy.replies.forEach { $0() }
+        check(delayed.starts == 1 && delayed.proxy.held, "late disconnect replies cannot unload new protection")
+
+        let slow = Client()
+        slow.cisco = Cisco()
+        var deadlines: [() -> Void] = []
+        slow.onDemandDisconnect.schedule = { _, done in deadlines.append(done) }
+        slow.onDemandSettingsChanged()
+        deadlines.forEach { $0() }
+        DispatchQueue.main.timers.forEach { $0() }
+        check(!slow.helperUnresponsive, "slow Cisco stop with a helper reply does not claim helper failure")
+
         let view = ViewLifecycle()
         let probe = view.testProbe!
         view.disappear()
