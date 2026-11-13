@@ -22,7 +22,12 @@ struct SettingsView: View {
             SplitPage()
                 .tabItem { Label("分流", systemImage: "arrow.triangle.branch") }
                 .tag("split")
-            ConnectionsPage()
+            ScrollView {
+                VStack(spacing: 12) {
+                    OnDemandSettings()
+                    ConnectionsPage().frame(height: 360)
+                }.padding(16)
+            }
                 .tabItem { Label("连接", systemImage: "point.3.filled.connected.trianglepath.dotted") }
                 .tag("connections")
             DiagnosticsPage()
@@ -534,7 +539,7 @@ struct CredentialForm: View {
                     Spacer()
                     if showsStatus {
                         Button("保存并连接") {
-                            if save() { _ = HelperClient.shared.connectWithStoredCredentials() }
+                            if save() { _ = HelperClient.shared.connectWithStoredCredentials(manual: true) }
                         }
                     }
                     Button("保存") { _ = save() }

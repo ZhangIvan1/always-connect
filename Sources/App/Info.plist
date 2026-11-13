@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSLocationUsageDescription</key>
+	<string>按需连接使用 Wi-Fi 名称匹配你保存的规则。</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>按需连接使用 Wi-Fi 名称匹配你保存的规则。</string>
 	<key>AlwaysConnectReleasesAPI</key>
 	<string>https://api.github.com/repos/weiazm/always-connect/releases?per_page=20</string>
 	<key>CFBundleDevelopmentRegion</key>

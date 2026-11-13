@@ -287,6 +287,10 @@ struct AppSettings: Codable, Equatable {
     /// on the phone (DESIGN.md §29). Nil = on.
     var approvalCard: Bool?
 
+    /// Nil preserves defaults when decoding settings written by older versions.
+    var onDemandEnabled: Bool?
+    var onDemandRules: [OnDemandRule]?
+
     var isDropProtectionOn: Bool { dropProtection ?? true }
     var isApprovalCardOn: Bool { approvalCard ?? true }
     var usesOwnConnection: Bool { connectionMode == "own" }
