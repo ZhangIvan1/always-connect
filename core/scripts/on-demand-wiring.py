@@ -38,11 +38,18 @@ callbacks = '\n'.join(block(source, marker) for marker in [
     'onDemand.disconnect =', 'onDemand.waiting =', 'onDemand.connect =',
     'onDemand.stopUser =', 'onDemand.recheck =', 'onDemand.changed =', 'onDemand.refreshService ='])
 view = (root / 'Sources/App/OnDemandSettings.swift').read_text()
+editor = view[view.index('private struct OnDemandRuleEditor'):]
+fill_methods = '\n'.join(block(editor, marker).replace('private func ', 'func ', 1) for marker in [
+    'private func fillCurrentNetwork()', 'private func stopFill()', 'private func values('])
+fill_methods = fill_methods.replace('monitor.pathUpdateHandler = { path in', 'monitor.pathUpdateHandler = { [self] path in')
+fill_methods = fill_methods.replace('DispatchQueue.main.async {', 'DispatchQueue.main.async { [self] in')
+fill_methods = fill_methods.replace('deadline: .now() + 3) {', 'deadline: .now() + 3) { [self] in')
 disappear = block(view, '.onDisappear')[len('.onDisappear'):].replace('{', '{ [self] in', 1)
 
 fixture = r'''
 import Foundation
 struct DispatchQueue {
+    init(label: String) {}
     static let main = Queue()
     static func global(qos: DispatchQoS.QoSClass) -> Queue { main }
 }
@@ -142,6 +149,33 @@ final class Client {
     func startStoredConnection() -> Bool { starts += 1; proxy.code = 1; return true }
     METHODS
 }
+final class NWPathMonitor {
+    static var latest: NWPathMonitor?
+    var pathUpdateHandler: ((Int) -> Void)?
+    var cancelled = false
+    init() { Self.latest = self }
+    func start(queue: DispatchQueue) {}
+    func cancel() { cancelled = true }
+}
+final class NetworkFacts {
+    static var authorizationRequested = false
+    func collect(path: Int, needsSSID: Bool, requestLocationAuthorization: Bool) -> OnDemandFacts {
+        Self.authorizationRequested = requestLocationAuthorization
+        return OnDemandFacts(network: "wifi", ssid: nil, domains: ["corp.example.com", "example.net"], servers: ["192.0.2.53"])
+    }
+}
+final class RuleEditor {
+    var rule = OnDemandRule(network: "wired")
+    var filling = false
+    var fillGeneration = 0
+    var fillMonitor: NWPathMonitor?
+    var fillReader: NetworkFacts?
+    var fillNote: String?
+    var ssids = "Custom"
+    var domains = "Corp.Example.COM"
+    var servers = "192.0.2.54"
+    EDITOR_FILL_BODY
+}
 final class ViewLifecycle {
     var testing = true
     var testGeneration = 1
@@ -221,6 +255,22 @@ final class ViewLifecycle {
         DispatchQueue.main.timers.forEach { $0() }
         check(!slow.helperUnresponsive, "slow Cisco stop with a helper reply does not claim helper failure")
 
+        let editor = RuleEditor()
+        editor.fillCurrentNetwork()
+        let monitor = NWPathMonitor.latest!
+        monitor.pathUpdateHandler?(0)
+        check(editor.rule.network == "wired" && editor.ssids == "Custom" && !NetworkFacts.authorizationRequested,
+              "production fill keeps explicit network and SSID input without requesting authorization")
+        check(editor.domains == "Corp.Example.COM, example.net" && editor.servers == "192.0.2.54, 192.0.2.53"
+              && monitor.cancelled && editor.fillMonitor == nil && !editor.filling,
+              "production fill merges facts and disposes the one-shot monitor")
+        editor.fillCurrentNetwork()
+        let lateFill = NWPathMonitor.latest!.pathUpdateHandler
+        editor.stopFill()
+        editor.domains = "custom.example"
+        lateFill?(0)
+        check(editor.domains == "custom.example", "cancelled editor rejects late network facts")
+
         let view = ViewLifecycle()
         let probe = view.testProbe!
         view.disappear()
@@ -230,6 +280,6 @@ final class ViewLifecycle {
     }
 }
 '''
-for key, value in [('CALLBACKS', callbacks), ('METHODS', body), ('DISAPPEAR', disappear)]:
+for key, value in [('CALLBACKS', callbacks), ('METHODS', body), ('DISAPPEAR', disappear), ('EDITOR_FILL_BODY', fill_methods)]:
     fixture = fixture.replace(key, value)
 output.write_text(fixture)

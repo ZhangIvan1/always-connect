@@ -46,7 +46,7 @@ final class NetworkFacts: NSObject, CLLocationManagerDelegate {
             if let source { CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes) }
         }
     }
-    func collect(path: NWPath, needsSSID: Bool) -> OnDemandFacts {
+    func collect(path: NWPath, needsSSID: Bool, requestLocationAuthorization: Bool = true) -> OnDemandFacts {
         // NWPath's default can be utun. Select a physical en* interface
         // with its own active service instead of using the default route.
         guard let store = SCDynamicStoreCreate(nil, "AlwaysConnect facts" as CFString, nil, nil),
@@ -95,7 +95,9 @@ final class NetworkFacts: NSObject, CLLocationManagerDelegate {
                 location = CLLocationManager()
                 location?.delegate = self
             }
-            if location?.authorizationStatus == .notDetermined { location?.requestWhenInUseAuthorization() }
+            if requestLocationAuthorization, location?.authorizationStatus == .notDetermined {
+                location?.requestWhenInUseAuthorization()
+            }
             if location?.authorizationStatus == .authorizedAlways || location?.authorizationStatus == .authorized {
                 facts.ssid = CWWiFiClient.shared().interface(withName: i.name)?.ssid()
             }

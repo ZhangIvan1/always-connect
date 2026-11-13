@@ -2550,7 +2550,7 @@ Rust 单测与脚本 harness 证明纯逻辑；编译证明链接。真实定位
 AppSettings 的可选字段由合成 Codable 的 decodeIfPresent 兼容旧数据，nil 为关闭/空列表；
 仍在既有 App Groups 偏好内，卸载无需新增清理位置。设置经既有私有 SettingsLink 通知菜单栏 App，
 暂停与命中规则名随 remoteSnapshot 同步；无新增后台服务 XPC 方法。
-只有开启且存在 SSID 条件才初始化 CLLocationManager 并请求 requestWhenInUseAuthorization；
+只有开启且存在 SSID 条件才请求 requestWhenInUseAuthorization；编辑器填入当前网络只读取已有授权状态，不请求授权（§46.11）；
 CoreWLAN 读取物理接口的 SSID，拒绝授权记未知。macOS 13 目标下 API 编译检查；真实授权需实测。
 DNS 只读 en* 服务的 SearchDomains/DomainName/ServerAddresses，不读 Global/DNS。
 URL 探针先问物理服务 DNS，再以地址连接，TLS 使用原主机名并保留系统证书校验；
@@ -2701,3 +2701,13 @@ Cisco 的新保护请求先经同一 proxy 的 getStatus 排队屏障，再 setK
 验证级别：Rust 事件序列复现登录前暂停与无核验回复，Swift 实际接线替身复现排队卸载后重新安装保护；
 正常签名、真实 Cisco 换网与断线保护需按 I35 实测。
 
+### 46.11 当前网络填入与设置样式（2026-11-13）
+规则编辑器的一次性 NWPathMonitor 复用 NetworkFacts，最多等 3 秒，切页/关闭即取消，不增加常驻采集。
+合并物理网络的搜索域、DNS 服务器和已授权的 SSID，保留原输入的顺序/拼写并去重；DNS 域名忽略大小写去重。
+网络类型仅在原来为「任意」时填入，已有明确类型不被覆盖；未授权定位时不填 SSID，也不调用授权请求。
+规则安全性仍由 Rust valid/validation 判定。
+
+连接页与服务器、名单设置同用 grouped Form + Section，规则行复用主次文字、capsule 标签、pencil 编辑及红色减号删除。
+顺序操作放一个上下箭头菜单，节约条件摘要空间；卡片页脚一行，风险详情放既有 HoverHelp，编辑器只保留一句提醒。
+完整可伪造风险和 Cisco 物理探针限制见 §46.4，README 完整说明保留。
+验证级别：编译、合并输入断言和离屏示例渲染；定位与实际控件交互仍需 I35 实测。

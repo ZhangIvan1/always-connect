@@ -14,64 +14,51 @@ struct OnDemandSettings: View {
     @State private var testFacts: NetworkFacts?
 
     var body: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                Toggle("按需连接", isOn: $enabled).onChange(of: enabled) { _ in save() }
-                Text("从上到下第一条命中生效；条件之间为且，同类多个值为或。未命中时连接 VPN。")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text("断开规则会让流量走本地网络。Wi-Fi、网络类型和 DNS 条件可被伪造；建议增加受系统信任的 HTTPS 探针。")
-                    .font(.caption).foregroundStyle(.orange)
-                ForEach(Array(rules.enumerated()), id: \.element.id) { index, rule in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text(rule.name)
-                            Text(actionName(rule.action)).font(.caption).foregroundStyle(.secondary)
-                            let validation = OnDemandCore.validate(rule)
-                            if !validation.valid {
-                                Label("需要修改：" + (validation.error ?? "规则无效，已跳过"), systemImage: "exclamationmark.triangle.fill")
-                                    .font(.caption).foregroundStyle(.orange)
-                            } else if validation.weak {
-                                Label("可被伪造：命中后流量会走本地网络", systemImage: "exclamationmark.triangle.fill")
-                                    .font(.caption).foregroundStyle(.orange)
-                            }
-                        }
-                        Spacer()
-                        Button("上移") {
-                            rules.swapAt(index, index - 1)
-                            save()
-                        }.disabled(index == 0)
-                        Button("下移") {
-                            rules.swapAt(index, index + 1)
-                            save()
-                        }.disabled(index + 1 == rules.count)
-                        Button("编辑") { editing = rule }
-                        Button("删除", role: .destructive) {
-                            rules.remove(at: index)
-                            save()
-                        }
-                    }
-                }
-                if let draft = editing {
-                    OnDemandRuleEditor(rule: draft, cancel: { editing = nil }) { rule in
-                        if let index = rules.firstIndex(where: { $0.id == rule.id }) {
-                            rules[index] = rule
-                        } else {
-                            rules.append(rule)
-                        }
-                        editing = nil
+        Section {
+            Toggle("按规则自动连接", isOn: $enabled).onChange(of: enabled) { _ in save() }
+            ForEach(Array(rules.enumerated()), id: \.element.id) { index, rule in
+                OnDemandRuleRow(rule: rule, first: index == 0, last: index + 1 == rules.count,
+                    move: { offset in
+                        rules.swapAt(index, index + offset)
                         save()
+                    }, edit: { editing = rule }, remove: {
+                        rules.remove(at: index)
+                        save()
+                    })
+            }
+            if let draft = editing {
+                OnDemandRuleEditor(rule: draft, cancel: { editing = nil }) { rule in
+                    if let index = rules.firstIndex(where: { $0.id == rule.id }) {
+                        rules[index] = rule
+                    } else {
+                        rules.append(rule)
                     }
-                    .id(draft.id)
-                } else {
-                    Button("添加规则") { editing = OnDemandRule() }
+                    editing = nil
+                    save()
                 }
-                HStack {
-                    Button(testing ? "正在测试…" : "测试当前网络", action: test).disabled(testing || !enabled)
-                    Text("仅在开启时读取网络；Wi-Fi 名称需要定位授权。")
-                        .font(.caption).foregroundStyle(.secondary)
+                .id(draft.id)
+            } else {
+                Button { editing = OnDemandRule() } label: {
+                    Label("添加规则", systemImage: "plus.circle.fill")
                 }
-                if let testResult { Text(testResult).font(.caption).textSelection(.enabled) }
-            }.padding(6)
+                .buttonStyle(.borderless)
+            }
+            HStack {
+                Button(testing ? "正在测试…" : "测试当前网络", action: test).disabled(testing || !enabled)
+                Spacer()
+                HoverHelp(action: {}) {
+                    Text("从上到下匹配第一条规则；条件之间为且，同类多个值为或。断开后使用本地网络。\n"
+                         + "Wi-Fi、网络类型和 DNS 条件可被伪造，建议增加受系统信任的 HTTPS 探针。\n"
+                         + "仅在开启时读取网络；匹配 Wi-Fi 名称需要定位授权。")
+                        .font(.caption).frame(width: 300, alignment: .leading)
+                }
+            }
+            if let testResult { Text(testResult).font(.caption).textSelection(.enabled) }
+        } header: {
+            Text("按需连接")
+        } footer: {
+            Text("按顺序匹配规则；未命中时连接 VPN。")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .onDisappear {
             testing = false
@@ -156,6 +143,64 @@ private func actionName(_ action: String) -> String {
     action == "disconnect" ? "断开 VPN，使用本地网络" : action == "ignore" ? "忽略，保持当前状态" : "连接 VPN"
 }
 
+/// Uses the same grouped Form row metrics and controls as the server and direct lists.
+struct OnDemandRuleRow: View {
+    var rule: OnDemandRule
+    var first: Bool
+    var last: Bool
+    var move: (Int) -> Void
+    var edit: () -> Void
+    var remove: () -> Void
+    private var tint: Color {
+        rule.action == "disconnect" ? .orange : rule.action == "connect" ? .accentColor : .secondary
+    }
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "network").foregroundStyle(.secondary).frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(rule.name).lineLimit(1)
+                    Text(rule.action == "disconnect" ? "断开" : rule.action == "ignore" ? "忽略" : "连接")
+                        .font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Capsule().fill(tint.opacity(0.15))).foregroundStyle(tint)
+                    let validation = OnDemandCore.validate(rule)
+                    if !validation.valid || validation.weak {
+                        HStack(spacing: 4) {
+                            Text(validation.valid ? "可被伪造" : "需要修改").font(.caption).foregroundStyle(.orange)
+                            HoverHelp(action: edit) {
+                                Text(validation.error ?? "这些条件可被伪造，命中后流量走本地网络；可加受系统信任的 HTTPS 探针。")
+                                    .font(.caption).frame(width: 260, alignment: .leading)
+                            }
+                        }
+                    }
+                }
+                Text(summary).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            }
+            Spacer()
+            Menu {
+                Button("上移") { move(-1) }.disabled(first)
+                Button("下移") { move(1) }.disabled(last)
+            } label: {
+                Image(systemName: "arrow.up.arrow.down")
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("调整规则顺序")
+            Button(action: edit) { Image(systemName: "pencil") }
+                .buttonStyle(.borderless).help("编辑规则")
+            Button(action: remove) { Image(systemName: "minus.circle.fill").foregroundStyle(.red) }
+                .buttonStyle(.borderless).help("删除规则")
+        }
+    }
+    private var summary: String {
+        var parts: [String] = []
+        if rule.network != "any" { parts.append(rule.network == "wifi" ? "Wi-Fi" : "有线") }
+        parts += rule.ssids
+        parts += rule.domains
+        parts += rule.servers
+        if let probe = rule.probe { parts.append(probe.target) }
+        return parts.isEmpty ? "任意网络" : parts.joined(separator: " · ")
+    }
+}
+
 private struct OnDemandRuleEditor: View {
     @State var rule: OnDemandRule
     var cancel: () -> Void
@@ -166,9 +211,18 @@ private struct OnDemandRuleEditor: View {
     @State private var probeKind = "none"
     @State private var probeTarget = ""
     @State private var error: String?
+    @State private var filling = false
+    @State private var fillGeneration = 0
+    @State private var fillMonitor: NWPathMonitor?
+    @State private var fillReader: NetworkFacts?
+    @State private var fillNote: String?
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            TextField("规则名称", text: $rule.name)
+            HStack {
+                TextField("规则名称", text: $rule.name)
+                Button(filling ? "正在读取…" : "填入当前网络", action: fillCurrentNetwork).disabled(filling)
+            }
+            if let fillNote { Text(fillNote).font(.caption).foregroundStyle(.secondary) }
             Picker("网络类型", selection: $rule.network) {
                 Text("任意").tag("any")
                 Text("Wi-Fi").tag("wifi")
@@ -196,7 +250,7 @@ private struct OnDemandRuleEditor: View {
                 Text("忽略").tag("ignore")
             }
             if OnDemandCore.validate(draft).weak {
-                Text("这些条件可被伪造。建议加一个组织内网、证书受系统信任的 HTTPS 地址作探针，例如 https://intranet.example.com/；也可以保留当前规则。")
+                Text("条件可被伪造，建议加受系统信任的内网 HTTPS 探针。")
                     .font(.caption).foregroundStyle(.orange)
             }
             if let error { Text(error).font(.caption).foregroundStyle(.orange) }
@@ -215,6 +269,45 @@ private struct OnDemandRuleEditor: View {
             probeKind = rule.probe?.kind ?? "none"
             probeTarget = rule.probe?.target ?? ""
         }
+        .onDisappear(perform: stopFill)
+    }
+    private func fillCurrentNetwork() {
+        fillGeneration += 1
+        let token = fillGeneration
+        filling = true
+        let monitor = NWPathMonitor()
+        let reader = NetworkFacts()
+        fillMonitor = monitor
+        fillReader = reader
+        monitor.pathUpdateHandler = { path in
+            DispatchQueue.main.async {
+                guard token == fillGeneration, filling else { return }
+                stopFill()
+                // One shot, no probes and no new location request.
+                let facts = reader.collect(path: path, needsSSID: true, requestLocationAuthorization: false)
+                if rule.network == "any", let network = facts.network { rule.network = network }
+                ssids = OnDemandRuleInput.merge(ssids.components(separatedBy: .newlines), facts.ssid.map { [$0] } ?? [])
+                    .joined(separator: "\n")
+                domains = OnDemandRuleInput.merge(values(domains), facts.domains, caseInsensitive: true)
+                    .joined(separator: ", ")
+                servers = OnDemandRuleInput.merge(values(servers), facts.servers).joined(separator: ", ")
+                fillNote = facts.network == nil ? "未读取到物理网络，已有条件已保留。" : "已合并当前网络，已有条件已保留。"
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "com.alwaysconnect.on-demand.fill"))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            guard token == fillGeneration, filling else { return }
+            stopFill()
+            fillNote = "读取超时，已有条件已保留。"
+        }
+    }
+    private func stopFill() {
+        filling = false
+        fillGeneration += 1
+        fillMonitor?.pathUpdateHandler = nil
+        fillMonitor?.cancel()
+        fillMonitor = nil
+        fillReader = nil
     }
     private func values(_ text: String) -> [String] {
         text.components(separatedBy: CharacterSet(charactersIn: ",\n"))

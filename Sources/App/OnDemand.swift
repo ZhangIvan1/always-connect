@@ -14,6 +14,16 @@ struct OnDemandRule: Codable, Equatable, Identifiable {
     var probe: OnDemandProbe?
     var action = "disconnect"
 }
+/// Editing only: retain original spelling/order and append previously absent facts.
+enum OnDemandRuleInput {
+    static func merge(_ existing: [String], _ added: [String], caseInsensitive: Bool = false) -> [String] {
+        var seen = Set<String>()
+        return (existing + added).filter { value in
+            guard !value.isEmpty else { return false }
+            return seen.insert(caseInsensitive ? value.lowercased() : value).inserted
+        }
+    }
+}
 struct OnDemandFacts: Codable, Equatable {
     var network: String?
     var ssid: String?
