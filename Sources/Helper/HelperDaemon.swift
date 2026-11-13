@@ -657,9 +657,13 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             reply(false, "unknown kill switch mode")
             return
         }
-        if parsed != .off { queue.async { self.userReleased = false } }
-        KillSwitch.shared.set(mode: parsed, tunnelIf: tunnelIf,
-                              gatewayIps: gatewayIps, reply: reply)
+        // Serialize the system effect too, not just userReleased: an older
+        // queued disconnect must never unload a new session's protection.
+        queue.async {
+            if parsed != .off { self.userReleased = false }
+            KillSwitch.shared.set(mode: parsed, tunnelIf: tunnelIf,
+                                  gatewayIps: gatewayIps, reply: reply)
+        }
     }
 
     func evaluateRule(

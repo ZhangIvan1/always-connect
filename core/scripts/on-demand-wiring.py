@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 root, output = map(Path, sys.argv[1:])
 source = (root / 'Sources/App/HelperClient.swift').read_text()
+service = (root / 'Sources/Helper/HelperDaemon.swift').read_text()
 def block(text, marker):
     start = text.index(marker)
     opening = text.index('{', start)
@@ -46,6 +47,8 @@ fill_methods = fill_methods.replace('DispatchQueue.main.async {', 'DispatchQueue
 fill_methods = fill_methods.replace('deadline: .now() + 3) {', 'deadline: .now() + 3) { [self] in')
 disappear = block(view, '.onDisappear')[len('.onDisappear'):].replace('{', '{ [self] in', 1)
 
+service_protection = block(service, 'func setKillSwitch(')
+
 fixture = r'''
 import Foundation
 struct DispatchQueue {
@@ -65,7 +68,28 @@ enum ProfileStore {
     static var settings = Settings(onDemandEnabled: true, onDemandRules: [])
     static func loadAppSettings() -> Settings { settings }
 }
+enum HelperInstaller { static var installedHelperMatchesBundle = true }
 struct Tracker { func noteUserStop() {} }
+final class ServiceQueue {
+    var blocked = false
+    var pending: [() -> Void] = []
+    func async(execute: @escaping () -> Void) { pending.append(execute); drain() }
+    func drain() { while !blocked && !pending.isEmpty { pending.removeFirst()() } }
+}
+final class KillSwitch {
+    enum Mode: Int { case off = 0, connected = 1, blocking = 2 }
+    static let shared = KillSwitch()
+    var held = false
+    func set(mode: Mode, tunnelIf: String, gatewayIps: [String], reply: (Bool, String) -> Void) {
+        held = mode != .off
+        reply(true, "")
+    }
+}
+final class Service {
+    let queue = ServiceQueue()
+    var userReleased = true
+    SERVER_PROTECTION_BODY
+}
 final class Resource {
     var pathUpdateHandler: (() -> Void)?
     var cancelled = false
@@ -90,6 +114,7 @@ final class Proxy {
     var code = 1
     var held = false
     var blocked = false
+    var dropsStatus = false
     var queue: [() -> Void] = []
     var replies: [() -> Void] = []
     var calls: [String] = []
@@ -99,17 +124,14 @@ final class Proxy {
         enqueue { self.calls.append("disconnect"); self.code = 0; self.held = false; self.replies.append(reply) }
     }
     func getStatus(_ reply: @escaping (Int, String) -> Void) {
-        enqueue { self.calls.append("status"); reply(self.code, "") }
+        enqueue { self.calls.append("status"); if !self.dropsStatus { reply(self.code, "") } }
     }
     func getNetworkHeld(_ reply: @escaping (Bool) -> Void) {
         enqueue { self.calls.append("held"); reply(self.held) }
     }
     func setKillSwitch(_ mode: Int, tunnelIf: String, gatewayIps: [String], reply: @escaping (Bool, String) -> Void) {
-        // The old service applies this on its separate kill-switch queue.
-        // Only the production client's status barrier orders it after disconnect.
-        calls.append("arm")
-        held = mode != 0
-        reply(true, "")
+        let apply = { self.calls.append("arm"); self.held = mode != 0; reply(true, "") }
+        if HelperInstaller.installedHelperMatchesBundle { enqueue(apply) } else { apply() }
     }
 }
 final class Client {
@@ -236,6 +258,7 @@ final class ViewLifecycle {
         delayed.cisco?.completion?()
         timers.filter { $0.0 == 10 }.forEach { $0.1() }
         check(delayed.starts == 1, "bounded release reaches the production connection entry without status replies")
+        HelperInstaller.installedHelperMatchesBundle = false
         delayed.setKillSwitch(1, tunnelIf: "utun9", gatewayIps: ["192.0.2.1"])
         check(!delayed.proxy.calls.contains("arm"), "new Cisco protection waits behind the old server disconnect")
         delayed.proxy.blocked = false
@@ -245,6 +268,32 @@ final class ViewLifecycle {
               "old queued unload precedes rearm even on the old service")
         delayed.proxy.replies.forEach { $0() }
         check(delayed.starts == 1 && delayed.proxy.held, "late disconnect replies cannot unload new protection")
+
+        HelperInstaller.installedHelperMatchesBundle = true
+        let lost = Client()
+        lost.cisco = Cisco()
+        lost.proxy.blocked = true
+        lost.proxy.dropsStatus = true
+        var lostTimers: [(Double, () -> Void)] = []
+        lost.onDemandDisconnect.schedule = { lostTimers.append(($0, $1)) }
+        lost.onDemandSettingsChanged()
+        _ = lost.connectWithStoredCredentials(manual: true)
+        lost.cisco?.completion?()
+        lostTimers.filter { $0.0 == 10 }.forEach { $0.1() }
+        lost.setKillSwitch(1, tunnelIf: "utun9", gatewayIps: ["192.0.2.1"])
+        lost.proxy.blocked = false
+        lost.proxy.drain()
+        check(lost.starts == 1 && lost.proxy.held, "new service arms protection even if every status reply is lost")
+        lost.proxy.replies.forEach { $0() }
+        check(lost.proxy.held, "late replies cannot remove the reply-independent arm")
+        let service = Service()
+        service.queue.blocked = true
+        service.queue.async { KillSwitch.shared.held = false }
+        service.setKillSwitch(1, tunnelIf: "utun9", gatewayIps: ["192.0.2.1"]) { _, _ in }
+        check(!KillSwitch.shared.held, "production service queues protection behind pending disconnect")
+        service.queue.blocked = false
+        service.queue.drain()
+        check(KillSwitch.shared.held && !service.userReleased, "production service installs protection after old unload")
 
         let slow = Client()
         slow.cisco = Cisco()
@@ -280,6 +329,6 @@ final class ViewLifecycle {
     }
 }
 '''
-for key, value in [('CALLBACKS', callbacks), ('METHODS', body), ('DISAPPEAR', disappear), ('EDITOR_FILL_BODY', fill_methods)]:
+for key, value in [('CALLBACKS', callbacks), ('METHODS', body), ('DISAPPEAR', disappear), ('EDITOR_FILL_BODY', fill_methods), ('SERVER_PROTECTION_BODY', service_protection)]:
     fixture = fixture.replace(key, value)
 output.write_text(fixture)

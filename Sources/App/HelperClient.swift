@@ -379,22 +379,25 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     self.pfWarning = "后台服务未响应：断线封网未生效"
                 }
             }
-            // Queue barrier: even an old service must finish any queued disconnect
-            // before arming this session. Never let a late unload follow the new arm.
-            proxy.getStatus { _, _ in
-                DispatchQueue.main.async {
-                    let mode = ProfileStore.loadAppSettings().isDropProtectionOn
-                        && self.onDemand.permitsConnection() && self.usesCisco ? mode : 0
-                    proxy.setKillSwitch(mode, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
-                        DispatchQueue.main.async {
-                            // A late successful arm still updates the warning: a deadline
-                            // is not cancellation of the service's queued operation.
-                            finished = true
-                            self.markHelperReachable()
-                            self.pfWarning = ok || !self.usesCisco ? nil : message
-                        }
+            let apply = {
+                let mode = ProfileStore.loadAppSettings().isDropProtectionOn
+                    && self.onDemand.permitsConnection() && self.usesCisco ? mode : 0
+                proxy.setKillSwitch(mode, tunnelIf: tunnelIf, gatewayIps: gatewayIps) { ok, message in
+                    DispatchQueue.main.async {
+                        // A deadline does not cancel a queued successful arm.
+                        finished = true
+                        self.markHelperReachable()
+                        self.pfWarning = ok || !self.usesCisco ? nil : message
                     }
                 }
+            }
+            if HelperInstaller.installedHelperMatchesBundle {
+                // This service serializes disconnect and protection on one queue.
+                // No status reply is needed to submit protection after a lost reply.
+                apply()
+            } else {
+                // Older/unknown service: its protection uses a different queue.
+                proxy.getStatus { _, _ in DispatchQueue.main.async(execute: apply) }
             }
         }
     }

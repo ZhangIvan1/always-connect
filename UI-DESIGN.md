@@ -347,7 +347,7 @@ Wi-Fi 名称每行一个并保留原字符；其他类多个值用逗号或换�
 按需规则的可信度（PR #4，2026-11-12）：断开卡片说明流量会走本地网络。无 HTTPS 探针的断开规则标橙色「可被伪造」，编辑器建议受系统信任的内网 HTTPS 地址；仍允许保存。断开 + HTTP 规则标「需要修改」并显示 Rust 校验原因，运行时跳过。Swift 不重复判断弱条件。
 
 ### 按需连接：使用反馈后的设置页（DESIGN §46.11）
-连接页沿用其余设置页的 grouped Form：Section 标题「按需连接」，第一行左侧「按规则自动连接」、右侧现有 AlwaysToggleStyle 开关；
+连接页沿用其余设置页的 grouped Form：Section 标题「按需连接」，第一行左侧「按规则自动连接」、右侧现有 AlwaysSwitchStyle 开关；
 页脚一行「按顺序匹配规则；未命中时连接 VPN。」；连接详情仍在下一张卡片。
 规则行复用服务器列表的 HStack 10 / VStack 1 间距、主标题和 caption 次标题、动作 capsule，
 名单列表的 18 点图标和红色 minus.circle.fill 删除按钮；编辑用 pencil、borderless。
