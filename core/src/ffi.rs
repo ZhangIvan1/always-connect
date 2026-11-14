@@ -1161,6 +1161,7 @@ pub struct AcCiscoHooks {
     pub credentials: extern "C" fn(*mut c_void, *mut *mut c_char, *mut *mut c_char, *mut *mut c_char) -> bool,
     /// Comma-separated hosts (malloc'd) or null.
     pub profile_hosts: extern "C" fn(*mut c_void) -> *mut c_char,
+    pub network_available: extern "C" fn(*mut c_void) -> bool,
     pub before_login: extern "C" fn(*mut c_void),
     pub owned: extern "C" fn(*mut c_void, bool),
     pub log: extern "C" fn(*mut c_void, *const c_char),
@@ -1230,6 +1231,7 @@ pub extern "C" fn ac_cisco_new(cli: *const c_char, approval_minimum_ms: u32, mon
                     .unwrap_or_default()
             })
         },
+        network_available: { let x = c(); let available = h.network_available; Box::new(move || available(x.0)) },
         before_login: { let x = c(); Box::new(move || before_login(x.0)) },
         owned: { let x = c(); Box::new(move |o| owned(x.0, o)) },
         log: { let x = c(); Box::new(move |l| log(x.0, cstring(l).as_ptr())) },
@@ -1257,6 +1259,12 @@ pub extern "C" fn ac_cisco_connect(e: *const cisco::Engine) {
 pub extern "C" fn ac_cisco_disconnect(e: *const cisco::Engine) {
     if let Some(e) = unsafe { e.as_ref() } { e.disconnect() }
 }
+/// Delivers an OS network-change event; availability and debounce stay in Rust.
+#[no_mangle]
+pub extern "C" fn ac_cisco_network_changed(e: *const cisco::Engine) {
+    if let Some(e) = unsafe { e.as_ref() } { e.network_changed(); }
+}
+
 #[no_mangle]
 pub extern "C" fn ac_cisco_rearm(e: *const cisco::Engine) {
     if let Some(e) = unsafe { e.as_ref() } { e.rearm() }
@@ -1508,6 +1516,7 @@ pub struct AcEngineHooks {
     pub ctx: *mut c_void,
     pub state: extern "C" fn(*mut c_void, c_int, *const c_char),
     pub terminal: extern "C" fn(*mut c_void, c_int),
+    pub network_available: extern "C" fn(*mut c_void) -> bool,
     /// "router|interface" (malloc'd) or null.
     pub physical_network: extern "C" fn(*mut c_void, *const c_char) -> *mut c_char,
     /// Comma-separated (malloc'd) or null.
@@ -1540,6 +1549,7 @@ pub extern "C" fn ac_oc_new(config: *const c_char, hooks: *const AcEngineHooks) 
     let hooks = oc_engine::Hooks {
         state: { let x = c(); Box::new(move |s, d| state(x.0, s, cstring(d).as_ptr())) },
         terminal: { let x = c(); Box::new(move |t| terminal(x.0, t)) },
+        network_available: { let x = c(); let available = h.network_available; Box::new(move || available(x.0)) },
         physical_network: {
             let x = c();
             Box::new(move |prefer| {

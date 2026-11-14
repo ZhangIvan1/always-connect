@@ -2760,3 +2760,21 @@ runner 在私有临时目录中解码、导入临时钥匙串，允许 codesign 
 断言同时检查：有效流程必须在下载核对后才公开，同一提交草稿可重试，较旧版本不能设为 Latest。
 workflow 的表达式、权限与 shell 经 actionlint 检查；签名导入、真实 runner 打包及 GitHub 上传由首次 v0.2.7 Release workflow 做端到端验收。
 CI 发布不代表真实 VPN 行为已经实测，原有 mac-proof 清单继续适用。
+
+
+## 四十八、无物理网络时暂停连接（外部贡献，用户反馈，2026-11-14；待维护者审阅）
+
+### 48.1 判定与去抖
+Swift 只从 getifaddrs 与 configd 读取事实：存在 UP/RUNNING 的 en* 接口，且对应 IPv4 或 IPv6 服务有 Router，即有物理网络；utun 不参与。两种系统读取失败视为未知，继续既有连接，不把故障误判成无网。没有路由器连续两秒才暂停；截止时重新读事实，恢复立即生效。Wi-Fi 短暂切换小于两秒不暂停。这里只判断物理联网，不判断互联网、网关或 DNS 是否可达：仍有路由器的外网故障继续遵循既有重试策略。
+
+### 48.2 Rust 状态与执行
+共用 `offline::Gate` 保存 wanted、paused、pending 代次；输入为 start、stop、availability 与 deadline(token, fresh fact)，输出为一次性 deadline、cancel、resume。手动断开清除 wanted，恢复网络不会再次连接；旧 deadline 无效。不是新的第七种面板状态，暂停是 Reconnecting 的「等待网络恢复」变体。
+
+Cisco 的现有路由通知及 App 现有 NWPath 回调触发事实读取。去抖截止在独立的一次性任务执行，不被 180 秒 CLI connect 阻塞：暂停先终止活动 CLI，再在引擎队列提交 `vpn disconnect`，取消 Cisco 守护进程的连接尝试；保留 managing/wanted，清空 retry/monitor 截止。已有保护切到 blocking，绝不发 off，也不走手动断开的撤保护路径。恢复时清除退避并立即尝试；Cisco 的 disconnect CLI 若迟迟不退出，仍受既有 30 秒调用上限约束，真实 CLI 的取消表现需 I37 实测。停止后迟到的登录输出与 stats 不再发布已连接或重装保护。
+
+自建引擎复用已有路由通知读取同一套物理事实，不增加 XPC 方法。暂停时结束活动 openconnect，取消批准计时，并阻止所有排队 respawn；不写手动断开标记，不释放 NetworkGuard 的 holder 或规则。子进程退出前恢复则排队一次恢复，退出后立即派生；手动断开仍按原路径撤保护。按需断开/退出同样清除连接意图，两者不被网络恢复覆盖。断线保护原本关闭时也不因无网偷偷打开。
+
+### 48.3 验证级别、限制与开销
+Rust 事件序列覆盖断网、去抖、取消、恢复、手动断开及旧代次；自建引擎夹具使用假的 pfctl，验证无网不派生且原有封网记录不变。Cisco 接线脚本只驱动假 CLI，确认取消命令确实改变假守护进程状态，恢复重连，离线手动断开后不连。真实 Cisco 超时中的取消、IPv6-only、合盖/唤醒、pf 与网关行为均列 I37，脚本通过不代表已实测。
+
+复用已有路由 socket / NWPath 通知，无新增常驻轮询；每次丢网只增加一枚两秒的一次性截止任务。Cisco 暂停期撤销原 15 秒状态检查和重试，自建停止 respawn；预期开销降低，尚无测量数据。按 §三十二在维护者机器对比 main/本分支的在线空闲与离线等待（设置窗关闭）：footprint 起止、CPU 均值/最大值、top idlew 均值/最大值均待实测；本地验证禁止启动 App，不能以估算替代数字。

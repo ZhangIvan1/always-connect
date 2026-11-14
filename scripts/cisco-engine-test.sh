@@ -12,7 +12,7 @@ export FAKE_CISCO_DIR=$WORK
 # The engine is Rust (DESIGN.md §32.11); CiscoEngine.swift is its shell.
 (cd "$ROOT/core" && cargo build --release --quiet) || exit 1
 swiftc -O -parse-as-library -module-name CiscoHarness \
-    "$ROOT/Sources/App/CiscoEngine.swift" "$ROOT/core/scripts/CiscoEngineHarness.swift" \
+    "$ROOT/Sources/Shared/PhysicalConnectivity.swift" "$ROOT/Sources/App/CiscoEngine.swift" "$ROOT/core/scripts/CiscoEngineHarness.swift" \
     "$ROOT/core/target/release/libalwaysconnect_core.a" -o "$WORK/harness" 2>&1 | grep -v "built for newer"
 [ -x "$WORK/harness" ] || exit 1
 OUT=$("$WORK/harness" "$ROOT/core/scripts/fake-cisco-vpn.sh")
@@ -53,11 +53,23 @@ echo "$S" | grep -qE "；(2[4-9]|3[0-6]) 秒后重试" || { echo "MISSING in pus
 S=$(section adopt-on-refresh no-adopt-foreign)
 need adopt "$S" "EVENT2 state=connected"
 need adopt "$S" "EVENT2 killswitch=1"
-S=$(section no-adopt-foreign DONE)
+S=$(section no-adopt-foreign offline-cancel)
 need foreign "$S" "EVENT3 managing=false"
 if echo "$S" | grep -qE "EVENT3 (state=connected|killswitch=)"; then
     echo "UNEXPECTED in foreign: adopted a session the App did not start"; FAILS=$((FAILS+1))
 fi
+S=$(section offline-cancel offline-resume)
+need offline "$S" "等待网络恢复"
+need offline "$S" "offline owned=true"
+need offline "$S" "offline cancel-issued=true"
+need offline "$S" "offline daemon-state=Disconnected"
+# The daemon cancel must run even though terminating -s already ended the CLI.
+[ -s "$WORK/cancellations" ] || { echo "MISSING Cisco cancel"; FAILS=$((FAILS+1)); }
+S=$(section offline-resume offline-manual-stop)
+need resume "$S" "state=connected"
+S=$(section restored-after-manual DONE)
+none manual-offline "$S" "state=authenticating"
+none manual-offline "$S" "state=connected"
 LOGINS=$(grep -c . "$WORK/commands" 2>/dev/null || true)
 echo "logins attempted: $LOGINS"
 rm -rf "$WORK"

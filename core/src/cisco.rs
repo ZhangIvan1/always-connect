@@ -235,6 +235,7 @@ pub struct Hooks {
     pub profile_hosts: Box<dyn Fn() -> Vec<String> + Send + Sync>,
     /// Before a CLI login: ask Cisco's window app to quit (it holds the
     /// connect capability).
+    pub network_available: Box<dyn Fn() -> bool + Send + Sync>,
     pub before_login: Box<dyn Fn() + Send + Sync>,
     /// The App started (true) or let go of (false) the Cisco session.
     pub owned: Box<dyn Fn(bool) + Send + Sync>,
@@ -259,6 +260,7 @@ enum Command_ {
     Refresh,
     /// The routing table changed.
     Changed,
+    Network(bool),
 }
 
 struct Shared {
@@ -269,6 +271,8 @@ struct Shared {
     managing: AtomicBool,
     episode_retries: AtomicU32,
     reported: AtomicI32,
+    offline: AtomicBool,
+    network: Mutex<crate::offline::Gate>,
 }
 
 pub struct Engine {
@@ -304,6 +308,8 @@ impl Engine {
             managing: AtomicBool::new(false),
             episode_retries: AtomicU32::new(0),
             reported: AtomicI32::new(DISCONNECTED),
+            offline: AtomicBool::new(false),
+            network: Mutex::new(crate::offline::Gate::default()),
         });
         let (tx, rx) = mpsc::channel::<Command_>();
         let s = Arc::clone(&shared);
@@ -350,10 +356,12 @@ impl Engine {
         // Routing changes wake the watch at once instead of waiting for
         // the next 15 s check.
         let route_tx = tx.clone();
+        let route_shared = Arc::clone(&shared);
         let _ = std::thread::Builder::new().name("ac-cisco-routes".into()).stack_size(64 * 1024).spawn(move || {
             let Some(watch) = crate::route_watch::RouteWatch::new() else { return };
             loop {
                 if let crate::route_watch::Wake::Changed = watch.wait(Duration::from_secs(3600), Duration::from_millis(300), None) {
+                    route_shared.observe_network(&route_tx, None);
                     if route_tx.send(Command_::Changed).is_err() {
                         return;
                     }
@@ -366,11 +374,14 @@ impl Engine {
     pub fn connect(&self) {
         self.shared.stop_requested.store(false, Ordering::SeqCst);
         self.shared.set_owned(true);
+        self.shared.network.lock().unwrap().start();
+        self.shared.observe_network(&self.tx, None);
         let _ = self.tx.send(Command_::Connect);
     }
 
     pub fn disconnect(&self) {
         self.shared.set_owned(false);
+        self.shared.network.lock().unwrap().stop();
         self.shared.stop_requested.store(true, Ordering::SeqCst);
         if let Some(pid) = *self.shared.active_pid.lock().unwrap() {
             unsafe { libc::kill(pid as i32, libc::SIGTERM) };
@@ -391,7 +402,15 @@ impl Engine {
     /// tunnel Cisco already has up.
     pub fn refresh(&self) {
         self.shared.managing.store(true, Ordering::SeqCst);
+        self.shared.network.lock().unwrap().start();
+        self.shared.observe_network(&self.tx, None);
         let _ = self.tx.send(Command_::Refresh);
+    }
+
+    /// A system path event (also used by the fake-CLI wiring harness).
+    pub fn network_changed(&self) {
+        self.shared.observe_network(&self.tx, None);
+        let _ = self.tx.send(Command_::Changed);
     }
 
     pub fn is_managing(&self) -> bool {
@@ -404,17 +423,63 @@ impl Engine {
 }
 
 impl Shared {
+    /// Reuses routing events and one debounce deadline, independently of the
+    /// worker which may be blocked inside Cisco's connect CLI.
+    fn observe_network(self: &Arc<Self>, tx: &Sender<Command_>, deadline: Option<u64>) {
+        let available = (self.hooks.network_available)();
+        let mut gate = self.network.lock().unwrap();
+        let actions = match deadline {
+            Some(token) => gate.deadline(token, available),
+            None => gate.observe(available),
+        };
+        self.offline.store(gate.paused, Ordering::SeqCst);
+        for action in actions {
+            match action {
+                crate::offline::Action::Deadline(token) => {
+                    let weak = Arc::downgrade(self);
+                    let tx = tx.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("ac-offline-debounce".into())
+                        .stack_size(32 * 1024)
+                        .spawn(move || {
+                            std::thread::sleep(Duration::from_secs(2));
+                            if let Some(shared) = weak.upgrade() {
+                                shared.observe_network(&tx, Some(token));
+                            }
+                        });
+                }
+                crate::offline::Action::Cancel => {
+                    if let Some(pid) = *self.active_pid.lock().unwrap() {
+                        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                    }
+                    let _ = tx.send(Command_::Network(false));
+                }
+                crate::offline::Action::Resume => {
+                    let _ = tx.send(Command_::Network(true));
+                }
+            }
+        }
+    }
+
     fn set_owned(&self, owned: bool) {
         self.managing.store(owned, Ordering::SeqCst);
         (self.hooks.owned)(owned);
     }
 
     fn stopped(&self) -> bool {
-        self.stop_requested.load(Ordering::SeqCst)
+        self.stop_requested.load(Ordering::SeqCst) || self.offline.load(Ordering::SeqCst)
     }
 
     fn cli(&self, args: &[&str], input: Option<&str>, timeout: Duration, on_line: &mut dyn FnMut(&str)) -> RunResult {
-        let mut on_start = |pid: u32| *self.active_pid.lock().unwrap() = Some(pid);
+        let mut on_start = |pid: u32| {
+            // Publish under the same lock used by disconnect. If cancellation
+            // won before spawn published its PID, terminate this late child too.
+            let mut active = self.active_pid.lock().unwrap();
+            *active = Some(pid);
+            if args == ["-s"] && self.stopped() {
+                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            }
+        };
         let result = run(&self.config.cli, args, input, timeout, &mut on_start, on_line);
         *self.active_pid.lock().unwrap() = None;
         result
@@ -425,6 +490,8 @@ impl Shared {
     }
 
     fn post(&self, state: i32, detail: &str) {
+        if state != DISCONNECTED && self.stop_requested.load(Ordering::SeqCst) { return; }
+        if state != DISCONNECTED && self.offline.load(Ordering::SeqCst) && detail != "等待网络恢复" { return; }
         (self.hooks.state)(state, detail);
     }
 
@@ -451,6 +518,10 @@ impl Shared {
         match cmd {
             Command_::Connect => {
                 st.wanted = true;
+                if self.offline.load(Ordering::SeqCst) {
+                    self.report(RECONNECTING, "等待网络恢复");
+                    return;
+                }
                 st.backoff_index = 0;
                 st.push_backoff_index = 0;
                 st.unanswered_since = None;
@@ -461,6 +532,24 @@ impl Shared {
                 }
                 if st.monitor_at.is_none() {
                     st.monitor_at = Some(Instant::now() + self.config.monitor);
+                }
+            }
+            Command_::Network(available) => {
+                if !st.wanted || self.stop_requested.load(Ordering::SeqCst) { return; }
+                st.retry_at = None;
+                st.monitor_at = None;
+                if !available {
+                    // Keep ownership and the held set. Never use manual-stop's
+                    // release path for an unavailable physical network.
+                    if st.last_kill_switch.is_some() {
+                        self.send_kill_switch(st, 2, "", Vec::new());
+                    }
+                    self.cli(&["disconnect"], None, Duration::from_secs(30), &mut |_| {});
+                    self.report(RECONNECTING, "等待网络恢复");
+                } else if !self.stopped() {
+                    st.backoff_index = 0;
+                    st.monitor_at = Some(Instant::now() + self.config.monitor);
+                    self.attempt(st);
                 }
             }
             Command_::Disconnect => {
@@ -513,6 +602,9 @@ impl Shared {
             return;
         };
         (self.hooks.before_login)();
+        // Credentials / quitting the Cisco window can block. A stop during
+        // either operation must not start a new CLI login afterwards.
+        if self.stopped() { return; }
         if st.ever_connected && st.last_kill_switch.as_ref().is_some_and(|k| k.0 == 2) {
             // Resolved now, through the DNS the blocking set lets out.
             let gateways = self.gateway_addresses(st, None);
@@ -523,6 +615,9 @@ impl Shared {
         let mut input = format!("connect {}\n{}\n{}\n", credentials.entry, credentials.username, credentials.password);
         let mut pushed: Option<Instant> = None;
         let result = self.cli(&["-s"], Some(&input), Duration::from_secs(180), &mut |line: &str| {
+            if self.stopped() {
+                return;
+            }
             if line.contains(">> ") && !line.contains("Username") {
                 (self.hooks.log)(&format!("cisco: {}", line.trim()));
             }
@@ -631,6 +726,7 @@ impl Shared {
 
     fn adopt_connected(&self, st: &mut State) {
         let stats = self.cli(&["stats"], None, Duration::from_secs(30), &mut |_| {}).output;
+        if self.stopped() { return; }
         st.tunnel_if = default_route_tunnel().unwrap_or_else(|| st.tunnel_if.clone());
         let gateways = self.gateway_addresses(st, parse_server_address(&stats));
         st.ever_connected = true;
@@ -693,6 +789,72 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnect_during_login_preparation_never_starts_cli_or_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "ac-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let cli = dir.join("vpn");
+        std::fs::write(&cli, "#!/bin/sh\ncase \"$1\" in\nstate) echo '>> state: Disconnected';;\n-s) touch \"$(dirname \"$0\")/login\";;\ndisconnect) touch \"$(dirname \"$0\")/cancel\";;\nesac\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (entered, wait_entered) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel();
+        let wait_release = Mutex::new(wait_release);
+        let (done, wait_done) = mpsc::channel();
+        let engine = Engine::new(
+            Config {
+                cli: cli.to_str().unwrap().into(),
+                approval_timeout_minimum: Duration::from_secs(20),
+                monitor: MONITOR,
+            },
+            Hooks {
+                state: Box::new(|_, _| {}),
+                terminal: Box::new(|_| {}),
+                kill_switch: Box::new(|_, _, _| {}),
+                credentials: Box::new(|| {
+                    Some(Credentials {
+                        entry: "VPN-A".into(),
+                        username: "u".into(),
+                        password: "p".into(),
+                    })
+                }),
+                profile_hosts: Box::new(Vec::new),
+                network_available: Box::new(|| true),
+                before_login: Box::new(move || {
+                    entered.send(()).unwrap();
+                    wait_release.lock().unwrap().recv().unwrap();
+                }),
+                owned: Box::new(|_| {}),
+                log: Box::new(|_| {}),
+                disconnected: Box::new(move || {
+                    let _ = done.send(());
+                }),
+            },
+        );
+        engine.connect();
+        wait_entered.recv_timeout(Duration::from_secs(15)).unwrap();
+        engine.disconnect();
+        release.send(()).unwrap();
+        wait_done.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(
+            !dir.join("login").exists(),
+            "cancelled preparation must never submit a login"
+        );
+        assert!(
+            dir.join("cancel").exists(),
+            "Cisco daemon must receive disconnect, not just CLI termination"
+        );
+        assert!(!engine.is_managing());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn parsing() {

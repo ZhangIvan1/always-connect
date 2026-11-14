@@ -14,19 +14,20 @@ banner() { printf '\n  >> state: Unknown\nVPN>   >> state: %s\nVPN>   >> registe
 case "${1:-}" in
 state) banner ;;
 stats) banner; printf '[ Address Information ]\n    Server Address:              198.51.100.9\n' ;;
-disconnect) banner; echo Disconnected > "$DIR/state"; printf '  >> state: Disconnecting\n  >> state: Disconnected\n' ;;
+disconnect) echo cancel >> "$DIR/cancellations"; banner; echo Disconnected > "$DIR/state"; printf '  >> state: Disconnecting\n  >> state: Disconnected\n' ;;
 -s)
     banner
     read -r cmd; read -r user; read -r pass
     echo "$cmd" >> "$DIR/commands"
     printf 'VPN> %s\n  >> contacting host for login information...\n' "$cmd"
     case "$pass" in
-    good|bad|pushfail|noapprove|quickfail) ;;
+    good|bad|pushfail|noapprove|quickfail|slow) ;;
     *) printf '  >> error: The VPN connection failed due to unsuccessful domain name resolution.\n'; exit 0 ;;
     esac
     printf '\n  >> Please enter your username and password.\nGroup: Staff\n\nUsername: [default] '
     sleep 0.3
     case "$pass" in
+    slow) echo Connecting > "$DIR/state"; exec sleep 30 ;;
     good) sleep 1; echo Connected > "$DIR/state"
           printf '  >> state: Connecting\n  >> notice: Establishing VPN session...\n  >> state: Connected\nVPN> goodbye...\n' ;;
     bad)  printf '\n  >> Login error.\n' ;;

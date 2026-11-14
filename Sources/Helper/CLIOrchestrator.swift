@@ -124,6 +124,7 @@ final class CLIOrchestrator {
                 box.lock.lock(); let handler = box.onTerminal; box.lock.unlock()
                 handler?(value)
             },
+            networkAvailable: { _ in TestSeam.isActive || PhysicalConnectivity.available() },
             physicalNetwork: { _, prefer in
                 guard let prefer, let now = PhysicalNetwork.current(preferring: String(cString: prefer)) else { return nil }
                 return strdup("\(now.gateway)|\(now.interface)")
@@ -275,6 +276,7 @@ struct AcEngineHooks {
     var ctx: UnsafeMutableRawPointer?
     var state: @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?) -> Void
     var terminal: @convention(c) (UnsafeMutableRawPointer?, Int32) -> Void
+    var networkAvailable: @convention(c) (UnsafeMutableRawPointer?) -> Bool
     var physicalNetwork: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
     var localDNS: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
     var systemRoots: @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
