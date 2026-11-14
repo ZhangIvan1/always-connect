@@ -470,7 +470,11 @@ impl Engine {
             self.shared.stop_requested.store(false, Ordering::SeqCst);
             self.shared.set_owned(true);
             gate.start();
-            let intent = self.shared.current_intent();
+            let intent = self
+                .shared
+                .cancel_generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1);
             let _ = self.tx.send(Command_::Connect(intent));
         }
         self.shared.observe_network(&self.tx, None);

@@ -28,6 +28,7 @@ struct Fixture {
     dir: Scratch,
     available: Arc<AtomicBool>,
     calls: Arc<AtomicU32>,
+    terminals: Arc<AtomicU32>,
     entered: mpsc::Receiver<()>,
     second: mpsc::Receiver<()>,
     release: Sender<()>,
@@ -53,6 +54,8 @@ esac
         let net = available.clone();
         let calls = Arc::new(AtomicU32::new(0));
         let credentials_calls = calls.clone();
+        let terminals = Arc::new(AtomicU32::new(0));
+        let terminal_events = terminals.clone();
         let (entered_tx, entered) = mpsc::channel();
         let (second_tx, second) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -66,7 +69,9 @@ esac
             },
             Hooks {
                 state: Box::new(|_, _| {}),
-                terminal: Box::new(|_| {}),
+                terminal: Box::new(move |_| {
+                    terminal_events.fetch_add(1, Ordering::SeqCst);
+                }),
                 kill_switch: Box::new(|_, _, _| {}),
                 credentials: Box::new(move || {
                     if credentials_calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -98,6 +103,7 @@ esac
             dir,
             available,
             calls,
+            terminals,
             entered,
             second,
             release,
@@ -125,12 +131,13 @@ fn offline_recovery_must_not_submit_cancelled_preparation() {
     f.start();
     f.available.store(false, Ordering::SeqCst);
     f.engine.network_changed();
+    let preparation_intent = f.engine.shared.current_intent();
     // Use the production two-second deadline while the worker is blocked.
     let until = Instant::now() + Duration::from_secs(5);
-    while f.engine.shared.current_intent() == 0 && Instant::now() < until {
+    while f.engine.shared.current_intent() == preparation_intent && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_ne!(f.engine.shared.current_intent(), 0);
+    assert_ne!(f.engine.shared.current_intent(), preparation_intent);
     f.available.store(true, Ordering::SeqCst);
     f.engine.network_changed();
     f.release.send(()).unwrap();
@@ -154,7 +161,12 @@ fn rapid_stop_start_must_not_submit_cancelled_preparation() {
     f.second.recv_timeout(Duration::from_secs(10)).unwrap();
     f.done.recv_timeout(Duration::from_secs(10)).unwrap();
     f.barrier();
+    let stale_terminals = f.terminals.load(Ordering::SeqCst);
     f.finish();
+    assert_eq!(
+        stale_terminals, 0,
+        "old stop must not publish a terminal for the new start"
+    );
     assert!(
         !f.dir.0.join("login").exists(),
         "cancelled preparation must never submit a login"
