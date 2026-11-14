@@ -163,13 +163,13 @@ fn rapid_stop_start_must_not_submit_cancelled_preparation() {
     f.barrier();
     let stale_terminals = f.terminals.load(Ordering::SeqCst);
     f.finish();
-    assert_eq!(
-        stale_terminals, 0,
-        "old stop must not publish a terminal for the new start"
-    );
     assert!(
         !f.dir.0.join("login").exists(),
         "cancelled preparation must never submit a login"
+    );
+    assert_eq!(
+        stale_terminals, 0,
+        "old stop must not publish a terminal for the new start"
     );
 }
 
