@@ -720,6 +720,12 @@ impl Shared {
                 crate::offline::Action::Cancel => {
                     // Preserve the guard and its owner. A normal (non-manual)
                     // openconnect exit leaves drop protection in place.
+                    c.in_drop_episode |= c.hook_fired;
+                    if c.config.drop_protection {
+                        if let Some((tunnel, gateways)) = c.last_pf.clone() {
+                            self.load_pf(c, Some(tunnel), gateways, false);
+                        }
+                    }
                     c.driver.on_drop(false);
                     Self::cancel(c, Timer::ApprovalTimeout);
                     Self::cancel(c, Timer::ApprovalProbe);
@@ -1670,6 +1676,9 @@ mod tests {
         let engine = Engine::new(
             Config {
                 no_routes: true,
+                physical_if: "en0".into(),
+                drop_protection: true,
+                allow_direct_egress_when_connected: true,
                 test_active: true,
                 support_dir: dir.to_string_lossy().into(),
                 ..Config::default()
@@ -1691,9 +1700,11 @@ mod tests {
             physical_if: "en0".into(),
             ..Inputs::default()
         };
-        assert!(guard.apply(&engine.holder(), false, &inputs).is_none());
+        assert!(guard.apply(&engine.holder(), true, &inputs).is_none());
         {
             let mut core = engine.shared.core.lock().unwrap();
+            core.last_pf = Some((inputs.tunnel_if.clone(), inputs.gateway_ips.clone()));
+            core.last_allow_direct_egress = true;
             core.network.start();
             core.network.observe(false);
             engine.shared.network_event(&mut core, Some(1), false);
@@ -1702,6 +1713,13 @@ mod tests {
             assert!(!core.stop_requested, "offline is not a manual release");
             assert_eq!(guard.held().unwrap().1, inputs);
             assert!(!dir.join("last-release.json").exists());
+            let record: network_guard::Record =
+                serde_json::from_slice(&std::fs::read(dir.join("guard.json")).unwrap()).unwrap();
+            assert!(
+                !record.connected,
+                "offline must replace connected-mode physical egress with blocking"
+            );
+            assert!(!core.last_allow_direct_egress);
             core.network.stop();
             assert!(
                 core.network.observe(true).is_empty(),
