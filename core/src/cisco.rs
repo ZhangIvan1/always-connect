@@ -304,9 +304,10 @@ pub struct Hooks {
     pub credentials: Box<dyn Fn() -> Option<Credentials> + Send + Sync>,
     /// Every gateway host the Cisco profiles name, plus the selected entry's.
     pub profile_hosts: Box<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// A fresh, read-only physical-route fact for change/deadline events.
+    pub network_available: Box<dyn Fn() -> bool + Send + Sync>,
     /// Before a CLI login: ask Cisco's window app to quit (it holds the
     /// connect capability).
-    pub network_available: Box<dyn Fn() -> bool + Send + Sync>,
     pub before_login: Box<dyn Fn() + Send + Sync>,
     /// The App started (true) or let go of (false) the Cisco session.
     pub owned: Box<dyn Fn(bool) + Send + Sync>,
@@ -325,13 +326,15 @@ pub struct Config {
 }
 
 enum Command_ {
-    Connect,
-    Disconnect,
+    Connect(u32),
+    Disconnect(u32),
     Rearm,
-    Refresh,
+    Refresh(u32),
     /// The routing table changed.
     Changed,
-    Network(bool),
+    Network { available: bool, intent: u32 },
+    #[cfg(test)]
+    Barrier(Sender<()>),
 }
 
 struct Shared {
@@ -352,6 +355,7 @@ pub struct Engine {
 }
 
 struct State {
+    intent: u32,
     wanted: bool,
     ever_connected: bool,
     tunnel_if: String,
@@ -389,6 +393,7 @@ impl Engine {
             .stack_size(256 * 1024)
             .spawn(move || {
                 let mut st = State {
+                    intent: 0,
                     wanted: false,
                     ever_connected: false,
                     tunnel_if: String::new(),
@@ -443,23 +448,37 @@ impl Engine {
     }
 
     pub fn connect(&self) {
-        self.shared.stop_requested.store(false, Ordering::SeqCst);
-        self.shared.set_owned(true);
-        self.shared.network.lock().unwrap().start();
+        // Serialize intent publication with stop/network actions. A cancelled
+        // queued start cannot adopt the epoch of a later recovery.
+        {
+            let mut gate = self.shared.network.lock().unwrap();
+            self.shared.stop_requested.store(false, Ordering::SeqCst);
+            self.shared.set_owned(true);
+            gate.start();
+            let intent = self.shared.current_intent();
+            let _ = self.tx.send(Command_::Connect(intent));
+        }
         self.shared.observe_network(&self.tx, None);
-        let _ = self.tx.send(Command_::Connect);
     }
 
     pub fn disconnect(&self) {
-        self.shared.set_owned(false);
-        self.shared.network.lock().unwrap().stop();
-        self.shared.stop_requested.store(true, Ordering::SeqCst);
-        self.shared.cancel_generation.fetch_add(1, Ordering::SeqCst);
+        let intent;
+        {
+            let mut gate = self.shared.network.lock().unwrap();
+            gate.stop();
+            self.shared.stop_requested.store(true, Ordering::SeqCst);
+            intent = self
+                .shared
+                .cancel_generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1);
+            self.shared.set_owned(false);
+            let _ = self.tx.send(Command_::Disconnect(intent));
+        }
         (self.shared.hooks.log)("disconnect requested");
-        // Answer the click at once; Cisco may take a while to wind down
-        // a login that was still trying.
-        self.shared.post(DISCONNECTED, "正在断开…");
-        let _ = self.tx.send(Command_::Disconnect);
+        if self.shared.is_current(intent) {
+            self.shared.post(DISCONNECTED, "正在断开…");
+        }
     }
 
     /// The background service restarted: send it the current kill switch again.
@@ -470,10 +489,15 @@ impl Engine {
     /// Launch / panel open with the App's stored "owned" flag set: adopt a
     /// tunnel Cisco already has up.
     pub fn refresh(&self) {
-        self.shared.managing.store(true, Ordering::SeqCst);
-        self.shared.network.lock().unwrap().start();
+        {
+            let mut gate = self.shared.network.lock().unwrap();
+            self.shared.managing.store(true, Ordering::SeqCst);
+            gate.start();
+            let _ = self
+                .tx
+                .send(Command_::Refresh(self.shared.current_intent()));
+        }
         self.shared.observe_network(&self.tx, None);
-        let _ = self.tx.send(Command_::Refresh);
     }
 
     /// A system path event (also used by the fake-CLI wiring harness).
@@ -518,11 +542,20 @@ impl Shared {
                         });
                 }
                 crate::offline::Action::Cancel => {
-                    self.cancel_generation.fetch_add(1, Ordering::SeqCst);
-                    let _ = tx.send(Command_::Network(false));
+                    let intent = self
+                        .cancel_generation
+                        .fetch_add(1, Ordering::SeqCst)
+                        .wrapping_add(1);
+                    let _ = tx.send(Command_::Network {
+                        available: false,
+                        intent,
+                    });
                 }
                 crate::offline::Action::Resume => {
-                    let _ = tx.send(Command_::Network(true));
+                    let _ = tx.send(Command_::Network {
+                        available: true,
+                        intent: self.current_intent(),
+                    });
                 }
             }
         }
@@ -537,18 +570,33 @@ impl Shared {
         self.stop_requested.load(Ordering::SeqCst) || self.offline.load(Ordering::SeqCst)
     }
 
+    fn current_intent(&self) -> u32 {
+        self.cancel_generation.load(Ordering::SeqCst)
+    }
+
+    fn is_current(&self, intent: u32) -> bool {
+        self.current_intent() == intent
+    }
+
+    fn permits_attempt(&self, intent: u32) -> bool {
+        self.is_current(intent) && !self.stopped()
+    }
+
     fn cli(
         &self,
+        intent: u32,
         args: &[&str],
         input: Option<&str>,
         timeout: Duration,
         on_line: &mut dyn FnMut(&str),
     ) -> RunResult {
-        let generation = self.cancel_generation.load(Ordering::SeqCst);
-        let cancelled = || {
-            args != ["disconnect"]
-                && (self.stopped() || self.cancel_generation.load(Ordering::SeqCst) != generation)
-        };
+        let cancelled = || args != ["disconnect"] && !self.permits_attempt(intent);
+        if cancelled() {
+            return RunResult {
+                status: -1,
+                output: String::new(),
+            };
+        }
         let mut on_start = |pid: u32| {
             // The child is unreaped here. Never keep a PID across a wait/reap:
             // the cancellation predicate instead follows the login intent.
@@ -577,8 +625,18 @@ impl Shared {
         result
     }
 
-    fn state_now(&self) -> Option<String> {
-        parse_state(&self.cli(&["state"], None, Duration::from_secs(30), &mut |_| {}).output)
+    fn state_now(&self, intent: u32) -> Option<String> {
+        parse_state(
+            &self
+                .cli(
+                    intent,
+                    &["state"],
+                    None,
+                    Duration::from_secs(30),
+                    &mut |_| {},
+                )
+                .output,
+        )
     }
 
     fn post(&self, state: i32, detail: &str) {
@@ -598,17 +656,35 @@ impl Shared {
     }
 
     fn send_kill_switch(&self, st: &mut State, mode: i32, tun: &str, gateways: Vec<String>) {
-        (self.hooks.log)(&format!("killswitch mode={mode} gateways={}", gateways.len()));
+        if !self.is_current(st.intent) || self.stop_requested.load(Ordering::SeqCst) {
+            return;
+        }
+        (self.hooks.log)(&format!(
+            "killswitch mode={mode} gateways={}",
+            gateways.len()
+        ));
         let last = st.last_kill_switch.take();
-        let keep_tun = if tun.is_empty() { last.as_ref().map(|l| l.1.clone()).unwrap_or_default() } else { tun.to_string() };
-        let keep_gw = if gateways.is_empty() { last.map(|l| l.2).unwrap_or_default() } else { gateways.clone() };
+        let keep_tun = if tun.is_empty() {
+            last.as_ref().map(|l| l.1.clone()).unwrap_or_default()
+        } else {
+            tun.to_string()
+        };
+        let keep_gw = if gateways.is_empty() {
+            last.map(|l| l.2).unwrap_or_default()
+        } else {
+            gateways.clone()
+        };
         st.last_kill_switch = Some((mode, keep_tun, keep_gw));
         (self.hooks.kill_switch)(mode, tun, &gateways);
     }
 
     fn command(&self, st: &mut State, cmd: Command_) {
         match cmd {
-            Command_::Connect => {
+            Command_::Connect(intent) => {
+                if !self.is_current(intent) || self.stop_requested.load(Ordering::SeqCst) {
+                    return;
+                }
+                st.intent = intent;
                 st.wanted = true;
                 if self.offline.load(Ordering::SeqCst) {
                     self.report(RECONNECTING, "等待网络恢复");
@@ -617,17 +693,25 @@ impl Shared {
                 st.backoff_index = 0;
                 st.push_backoff_index = 0;
                 st.unanswered_since = None;
-                if self.state_now().as_deref() == Some("Connected") {
+                if self.state_now(st.intent).as_deref() == Some("Connected") {
                     self.adopt_connected(st);
                 } else {
                     self.attempt(st);
                 }
-                if st.monitor_at.is_none() {
+                if self.permits_attempt(intent) && st.monitor_at.is_none() {
                     st.monitor_at = Some(Instant::now() + self.config.monitor);
                 }
             }
-            Command_::Network(available) => {
-                if !st.wanted || self.stop_requested.load(Ordering::SeqCst) { return; }
+            Command_::Network { available, intent } => {
+                if !self.is_current(intent)
+                    || !self.managing.load(Ordering::SeqCst)
+                    || self.stop_requested.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                // The desired start may itself have been superseded while queued.
+                st.intent = intent;
+                st.wanted = true;
                 st.retry_at = None;
                 st.monitor_at = None;
                 if !available {
@@ -636,29 +720,51 @@ impl Shared {
                     if st.last_kill_switch.is_some() {
                         self.send_kill_switch(st, 2, "", Vec::new());
                     }
-                    self.cli(&["disconnect"], None, Duration::from_secs(30), &mut |_| {});
-                    self.report(RECONNECTING, "等待网络恢复");
+                    self.cli(
+                        st.intent,
+                        &["disconnect"],
+                        None,
+                        Duration::from_secs(30),
+                        &mut |_| {},
+                    );
+                    if self.is_current(intent) {
+                        self.report(RECONNECTING, "等待网络恢复");
+                    }
                 } else if !self.stopped() {
                     st.backoff_index = 0;
                     st.monitor_at = Some(Instant::now() + self.config.monitor);
                     self.attempt(st);
                 }
             }
-            Command_::Disconnect => {
+            Command_::Disconnect(intent) => {
+                st.intent = intent;
                 st.wanted = false;
                 st.retry_at = None;
                 st.last_kill_switch = None;
                 st.monitor_at = None;
-                self.cli(&["disconnect"], None, Duration::from_secs(30), &mut |_| {});
+                self.cli(
+                    st.intent,
+                    &["disconnect"],
+                    None,
+                    Duration::from_secs(30),
+                    &mut |_| {},
+                );
                 st.ever_connected = false;
                 self.episode_retries.store(0, Ordering::SeqCst);
-                self.report(DISCONNECTED, "manual disconnect");
-                (self.hooks.terminal)(1);
+                if self.is_current(intent) {
+                    self.report(DISCONNECTED, "manual disconnect");
+                    (self.hooks.terminal)(1);
+                }
+                // Every stop still acknowledges its FIFO cleanup barrier.
                 (self.hooks.disconnected)();
+            }
+            #[cfg(test)]
+            Command_::Barrier(done) => {
+                let _ = done.send(());
             }
             Command_::Rearm => {
                 if let Some((mode, tun, gateways)) = st.last_kill_switch.clone() {
-                    (self.hooks.kill_switch)(mode, &tun, &gateways);
+                    self.send_kill_switch(st, mode, &tun, gateways);
                 }
             }
             Command_::Changed => {
@@ -668,8 +774,12 @@ impl Shared {
                     self.tick(st);
                 }
             }
-            Command_::Refresh => {
-                let state = self.state_now();
+            Command_::Refresh(intent) => {
+                if !self.permits_attempt(intent) {
+                    return;
+                }
+                st.intent = intent;
+                let state = self.state_now(intent);
                 if state.as_deref() == Some("Connected") && self.reported() != CONNECTED {
                     st.wanted = true;
                     self.adopt_connected(st);
@@ -685,56 +795,83 @@ impl Shared {
     }
 
     fn attempt(&self, st: &mut State) {
+        let intent = st.intent;
         st.retry_at = None;
-        if !st.wanted || self.stopped() {
+        if !st.wanted || !self.permits_attempt(intent) {
             return;
         }
-        let Some(credentials) = (self.hooks.credentials)() else {
+        let credentials = (self.hooks.credentials)();
+        if !self.permits_attempt(intent) {
+            return;
+        }
+        let Some(credentials) = credentials else {
             self.report(DISCONNECTED, "未设置凭据");
             return;
         };
         (self.hooks.before_login)();
         // Credentials / quitting the Cisco window can block. A stop during
         // either operation must not start a new CLI login afterwards.
-        if self.stopped() { return; }
+        if !self.permits_attempt(intent) {
+            return;
+        }
         if st.ever_connected && st.last_kill_switch.as_ref().is_some_and(|k| k.0 == 2) {
             // Resolved now, through the DNS the blocking set lets out.
             let gateways = self.gateway_addresses(st, None);
             self.send_kill_switch(st, 2, "", gateways);
         }
-        self.report(if st.ever_connected { RECONNECTING } else { AUTHENTICATING },
-                    &format!("正在登录 {}", credentials.entry));
-        let mut input = format!("connect {}\n{}\n{}\n", credentials.entry, credentials.username, credentials.password);
+        if !self.permits_attempt(intent) {
+            return;
+        }
+        self.report(
+            if st.ever_connected {
+                RECONNECTING
+            } else {
+                AUTHENTICATING
+            },
+            &format!("正在登录 {}", credentials.entry),
+        );
+        let mut input = format!(
+            "connect {}\n{}\n{}\n",
+            credentials.entry, credentials.username, credentials.password
+        );
         let mut pushed: Option<Instant> = None;
-        let result = self.cli(&["-s"], Some(&input), Duration::from_secs(180), &mut |line: &str| {
-            if self.stopped() {
-                return;
-            }
-            if line.contains(">> ") && !line.contains("Username") {
-                (self.hooks.log)(&format!("cisco: {}", line.trim()));
-            }
-            if line.contains("Username:") {
-                // The password goes in right after; the gateway then
-                // pushes an approval and waits for it silently.
-                if pushed.is_none() {
-                    pushed = Some(Instant::now());
+        let result = self.cli(
+            intent,
+            &["-s"],
+            Some(&input),
+            Duration::from_secs(180),
+            &mut |line: &str| {
+                if !self.permits_attempt(intent) {
+                    return;
                 }
-                self.post(AWAITING_APPROVAL, "已提交密码，等你在手机上确认登录");
-            } else if line.contains(">> notice: Establishing VPN") {
-                self.post(CONNECTING, &line.replace("  >> notice: ", ""));
-            }
-        });
+                if line.contains(">> ") && !line.contains("Username") {
+                    (self.hooks.log)(&format!("cisco: {}", line.trim()));
+                }
+                if line.contains("Username:") {
+                    // The password goes in right after; the gateway then
+                    // pushes an approval and waits for it silently.
+                    if pushed.is_none() {
+                        pushed = Some(Instant::now());
+                    }
+                    self.post(AWAITING_APPROVAL, "已提交密码，等你在手机上确认登录");
+                } else if line.contains(">> notice: Establishing VPN") {
+                    self.post(CONNECTING, &line.replace("  >> notice: ", ""));
+                }
+            },
+        );
         unsafe {
             for b in input.as_bytes_mut() {
                 std::ptr::write_volatile(b, 0);
             }
         }
         drop(credentials);
-        if self.stopped() {
+        if !self.permits_attempt(intent) {
             return;
         }
         let output = result.output;
-        if parse_state(&output).as_deref() == Some("Connected") || output.contains(">> state: Connected") {
+        if parse_state(&output).as_deref() == Some("Connected")
+            || output.contains(">> state: Connected")
+        {
             self.adopt_connected(st);
             return;
         }
@@ -765,14 +902,17 @@ impl Shared {
     }
 
     fn schedule_retry(&self, st: &mut State, error: &str, pushed: bool, approval_expired: bool) {
-        if !st.wanted || self.stopped() || st.retry_at.is_some() {
+        if !st.wanted || !self.permits_attempt(st.intent) || st.retry_at.is_some() {
             return;
         }
         let mut base;
         if pushed {
             base = PUSH_BACKOFF[st.push_backoff_index.min(PUSH_BACKOFF.len() - 1)];
             st.push_backoff_index += 1;
-            if st.unanswered_since.is_some_and(|t| t.elapsed() >= QUIET_AFTER) {
+            if st
+                .unanswered_since
+                .is_some_and(|t| t.elapsed() >= QUIET_AFTER)
+            {
                 base = QUIET_INTERVAL;
             }
         } else {
@@ -784,9 +924,24 @@ impl Shared {
             self.episode_retries.fetch_add(1, Ordering::SeqCst);
         }
         let wait = delay.round() as u64;
-        let when = if wait >= 120 { format!("{} 分钟", wait / 60) } else { format!("{wait} 秒") };
-        let detail = if approval_expired { format!("{error}，{when}后重新发起批准") } else { format!("{error}；{when}后重试") };
-        self.report(if st.ever_connected { RECONNECTING } else { AUTHENTICATING }, &detail);
+        let when = if wait >= 120 {
+            format!("{} 分钟", wait / 60)
+        } else {
+            format!("{wait} 秒")
+        };
+        let detail = if approval_expired {
+            format!("{error}，{when}后重新发起批准")
+        } else {
+            format!("{error}；{when}后重试")
+        };
+        self.report(
+            if st.ever_connected {
+                RECONNECTING
+            } else {
+                AUTHENTICATING
+            },
+            &detail,
+        );
         st.retry_at = Some(Instant::now() + Duration::from_secs_f64(delay));
     }
 
@@ -817,10 +972,23 @@ impl Shared {
     }
 
     fn adopt_connected(&self, st: &mut State) {
-        let stats = self.cli(&["stats"], None, Duration::from_secs(30), &mut |_| {}).output;
-        if self.stopped() { return; }
+        let stats = self
+            .cli(
+                st.intent,
+                &["stats"],
+                None,
+                Duration::from_secs(30),
+                &mut |_| {},
+            )
+            .output;
+        if !self.permits_attempt(st.intent) {
+            return;
+        }
         st.tunnel_if = default_route_tunnel().unwrap_or_else(|| st.tunnel_if.clone());
         let gateways = self.gateway_addresses(st, parse_server_address(&stats));
+        if !self.permits_attempt(st.intent) {
+            return;
+        }
         st.ever_connected = true;
         self.episode_retries.store(0, Ordering::SeqCst);
         st.backoff_index = 0;
@@ -837,12 +1005,12 @@ impl Shared {
         // check: a "Disconnected" now is that, not a drop to block and
         // retry (2026-11-06: switching to the own connection disconnects
         // Cisco, the routing change woke this check first).
-        if !st.wanted || self.stopped() {
+        if !st.wanted || !self.permits_attempt(st.intent) {
             return;
         }
         st.last_tick = Some(Instant::now());
-        let state = self.state_now();
-        if self.stopped() {
+        let state = self.state_now(st.intent);
+        if !self.permits_attempt(st.intent) {
             return;
         }
         match state.as_deref() {
@@ -866,7 +1034,8 @@ impl Shared {
                 }
                 let reported = self.reported();
                 if reported == CONNECTED
-                    || (reported == RECONNECTING && st.last_kill_switch.as_ref().map(|k| k.0) != Some(2))
+                    || (reported == RECONNECTING
+                        && st.last_kill_switch.as_ref().map(|k| k.0) != Some(2))
                 {
                     self.send_kill_switch(st, 2, "", Vec::new());
                     self.report(RECONNECTING, "已断开，网络已拦截，正在重连");
@@ -876,6 +1045,8 @@ impl Shared {
             _ => {}
         }
     }
+
+
 }
 
 #[cfg(test)]
@@ -1003,3 +1174,6 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(3) && r.status != 0, "timed out and ended");
     }
 }
+
+#[cfg(test)]
+mod intent_tests;
