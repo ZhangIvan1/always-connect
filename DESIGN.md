@@ -2770,7 +2770,7 @@ Swift 只从 getifaddrs 与 configd 读取事实：存在 UP/RUNNING 的 en* 接
 ### 48.2 Rust 状态与执行
 共用 `offline::Gate` 保存 wanted、paused、pending 代次；输入为 start、stop、availability 与 deadline(token, fresh fact)，输出为一次性 deadline、cancel、resume。手动断开清除 wanted，恢复网络不会再次连接；旧 deadline 无效。不是新的第七种面板状态，暂停是 Reconnecting 的「等待网络恢复」变体。
 
-Cisco 的现有路由通知及 App 现有 NWPath 回调触发事实读取。去抖截止在独立的一次性任务执行，不被 180 秒 CLI connect 阻塞：暂停先终止活动 CLI，再在引擎队列提交 `vpn disconnect`，取消 Cisco 守护进程的连接尝试；保留 managing/wanted，清空 retry/monitor 截止。已有保护切到 blocking，绝不发 off，也不走手动断开的撤保护路径。恢复时清除退避并立即尝试；Cisco 的 disconnect CLI 若迟迟不退出，仍受既有 30 秒调用上限约束，真实 CLI 的取消表现需 I37 实测。停止后迟到的登录输出与 stats 不再发布已连接或重装保护。
+Cisco 的现有路由通知及 App 现有 NWPath 回调触发事实读取。去抖截止在独立的一次性任务执行，不被 180 秒 CLI connect 阻塞：暂停先终止活动 CLI，再在引擎队列提交 `vpn disconnect`，取消 Cisco 守护进程的连接尝试；保留 managing/wanted，清空 retry/monitor 截止。已有保护切到 blocking，绝不发 off，也不走手动断开的撤保护路径。恢复时清除退避并立即尝试；Cisco 的 disconnect CLI 若迟迟不退出，仍受30 秒调用上限与两秒 TERM 宽限约束，真实 CLI 的取消表现需 I37 实测。停止后迟到的登录输出与 stats 不再发布已连接或重装保护。
 
 自建引擎复用已有路由通知读取同一套物理事实，不增加 XPC 方法。暂停时结束活动 openconnect，取消批准计时，并阻止所有排队 respawn；不写手动断开标记，不释放 NetworkGuard 的 holder 或规则。子进程退出前恢复则排队一次恢复，退出后立即派生；手动断开仍按原路径撤保护。按需断开/退出同样清除连接意图，两者不被网络恢复覆盖。断线保护原本关闭时也不因无网偷偷打开。
 

@@ -834,6 +834,7 @@ impl Shared {
     }
 
     fn finish_terminal(&self, c: &mut Core, reason: Terminal, detail: &str) {
+        c.network.stop();
         c.last_terminal = Some(reason);
         c.in_drop_episode = false;
         self.report(c, detail);

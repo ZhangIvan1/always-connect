@@ -21,7 +21,8 @@
 //! One engine thread does everything, as the Swift queue did; it waits
 //! on a channel with a deadline (next monitor tick or retry), so an idle
 //! engine wakes for nothing. A login blocks it (up to 180 s) exactly as
-//! before; a disconnect kills the CLI from the caller's thread at once.
+//! before; a disconnect invalidates the login intent immediately. The CLI reader
+//! observes cancellation within its existing 200 ms read wait.
 
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
@@ -61,19 +62,46 @@ pub struct RunResult {
 /// Runs the Cisco CLI to completion (stdout and stderr together),
 /// streaming lines to `on_line` — prompts, which end without a newline
 /// (": " or "] "), too. `on_start` gets the child's pid.
-pub fn run(cli: &str, args: &[&str], input: Option<&str>, timeout: Duration,
-           on_start: &mut dyn FnMut(u32), on_line: &mut dyn FnMut(&str)) -> RunResult {
+pub fn run(
+    cli: &str,
+    args: &[&str],
+    input: Option<&str>,
+    timeout: Duration,
+    on_start: &mut dyn FnMut(u32),
+    on_line: &mut dyn FnMut(&str),
+) -> RunResult {
+    run_interruptible(cli, args, input, timeout, on_start, on_line, &|| false)
+}
+
+fn run_interruptible(
+    cli: &str,
+    args: &[&str],
+    input: Option<&str>,
+    timeout: Duration,
+    on_start: &mut dyn FnMut(u32),
+    on_line: &mut dyn FnMut(&str),
+    cancelled: &dyn Fn() -> bool,
+) -> RunResult {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return RunResult { status: -1, output: String::new() };
+        return RunResult {
+            status: -1,
+            output: String::new(),
+        };
     }
     for fd in fds {
         // Only the child's stdout/stderr may hold the write end: a stray
         // copy kept the pipe open past the CLI's exit.
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
-    let (read_end, write_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    let Ok(err_end) = write_end.try_clone() else { return RunResult { status: -1, output: String::new() } };
+    let (read_end, write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let Ok(err_end) = write_end.try_clone() else {
+        return RunResult {
+            status: -1,
+            output: String::new(),
+        };
+    };
     let mut cmd = Command::new(cli);
     crate::reset_child_signals(&mut cmd);
     let child = cmd
@@ -85,7 +113,12 @@ pub fn run(cli: &str, args: &[&str], input: Option<&str>, timeout: Duration,
     // The command holds our copies of the pipe's write end: gone now, or
     // the CLI's exit would never read as end-of-output.
     drop(cmd);
-    let Ok(mut child) = child else { return RunResult { status: -1, output: String::new() } };
+    let Ok(mut child) = child else {
+        return RunResult {
+            status: -1,
+            output: String::new(),
+        };
+    };
     on_start(child.id());
     if let Some(mut stdin) = child.stdin.take() {
         if let Some(input) = input {
@@ -99,12 +132,24 @@ pub fn run(cli: &str, args: &[&str], input: Option<&str>, timeout: Duration,
     let mut pending: Vec<u8> = Vec::new();
     let mut buffer = [0u8; 4096];
     let mut killed = false;
+    let mut kill_started = None;
+    let mut forced = false;
     let mut exited = false;
+    let mut output_closed = false;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() && !killed {
+        if (left.is_zero() || cancelled()) && !killed {
             let _ = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
             killed = true;
+            kill_started = Some(Instant::now());
+        }
+        // A CLI ignoring TERM must not hold up the queued daemon disconnect.
+        if !exited
+            && !forced
+            && kill_started.is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+        {
+            unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+            forced = true;
         }
         // The CLI's exit ends the run, as before, even if something it
         // started still holds the pipe: check it at least every 200 ms.
@@ -112,14 +157,28 @@ pub fn run(cli: &str, args: &[&str], input: Option<&str>, timeout: Duration,
             exited = true;
             unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
         }
-        let wait_ms = if exited { 0 } else { left.as_millis().clamp(1, 200) as i32 };
-        let mut p = libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        if exited && output_closed {
+            break;
+        }
+        let wait_ms = if exited {
+            0
+        } else if killed {
+            200
+        } else {
+            left.as_millis().clamp(1, 200) as i32
+        };
+        let mut p = libc::pollfd {
+            fd: if output_closed { -1 } else { file.as_raw_fd() },
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let ready = unsafe { libc::poll(&mut p, 1, wait_ms) };
         if ready < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            break;
+            output_closed = true;
+            continue;
         }
         if ready == 0 {
             if exited {
@@ -128,7 +187,16 @@ pub fn run(cli: &str, args: &[&str], input: Option<&str>, timeout: Duration,
             continue;
         }
         let n = match file.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                output_closed = true;
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) if exited => break,
+            Err(_) => {
+                output_closed = true;
+                continue;
+            }
             Ok(n) => n,
         };
         output.extend_from_slice(&buffer[..n]);
@@ -143,7 +211,10 @@ pub fn run(cli: &str, args: &[&str], input: Option<&str>, timeout: Duration,
         }
     }
     let status = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
-    RunResult { status, output: String::from_utf8_lossy(&output).into_owned() }
+    RunResult {
+        status,
+        output: String::from_utf8_lossy(&output).into_owned(),
+    }
 }
 
 /// The last `>> state: X` the CLI printed.
@@ -267,7 +338,7 @@ struct Shared {
     config: Config,
     hooks: Hooks,
     stop_requested: AtomicBool,
-    active_pid: Mutex<Option<u32>>,
+    cancel_generation: AtomicU32,
     managing: AtomicBool,
     episode_retries: AtomicU32,
     reported: AtomicI32,
@@ -304,7 +375,7 @@ impl Engine {
             config,
             hooks,
             stop_requested: AtomicBool::new(false),
-            active_pid: Mutex::new(None),
+            cancel_generation: AtomicU32::new(0),
             managing: AtomicBool::new(false),
             episode_retries: AtomicU32::new(0),
             reported: AtomicI32::new(DISCONNECTED),
@@ -383,9 +454,7 @@ impl Engine {
         self.shared.set_owned(false);
         self.shared.network.lock().unwrap().stop();
         self.shared.stop_requested.store(true, Ordering::SeqCst);
-        if let Some(pid) = *self.shared.active_pid.lock().unwrap() {
-            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        }
+        self.shared.cancel_generation.fetch_add(1, Ordering::SeqCst);
         (self.shared.hooks.log)("disconnect requested");
         // Answer the click at once; Cisco may take a while to wind down
         // a login that was still trying.
@@ -449,9 +518,7 @@ impl Shared {
                         });
                 }
                 crate::offline::Action::Cancel => {
-                    if let Some(pid) = *self.active_pid.lock().unwrap() {
-                        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                    }
+                    self.cancel_generation.fetch_add(1, Ordering::SeqCst);
                     let _ = tx.send(Command_::Network(false));
                 }
                 crate::offline::Action::Resume => {
@@ -470,18 +537,43 @@ impl Shared {
         self.stop_requested.load(Ordering::SeqCst) || self.offline.load(Ordering::SeqCst)
     }
 
-    fn cli(&self, args: &[&str], input: Option<&str>, timeout: Duration, on_line: &mut dyn FnMut(&str)) -> RunResult {
+    fn cli(
+        &self,
+        args: &[&str],
+        input: Option<&str>,
+        timeout: Duration,
+        on_line: &mut dyn FnMut(&str),
+    ) -> RunResult {
+        let generation = self.cancel_generation.load(Ordering::SeqCst);
+        let cancelled = || {
+            args != ["disconnect"]
+                && (self.stopped() || self.cancel_generation.load(Ordering::SeqCst) != generation)
+        };
         let mut on_start = |pid: u32| {
-            // Publish under the same lock used by disconnect. If cancellation
-            // won before spawn published its PID, terminate this late child too.
-            let mut active = self.active_pid.lock().unwrap();
-            *active = Some(pid);
-            if args == ["-s"] && self.stopped() {
+            // The child is unreaped here. Never keep a PID across a wait/reap:
+            // the cancellation predicate instead follows the login intent.
+            if cancelled() {
                 unsafe { libc::kill(pid as i32, libc::SIGTERM) };
             }
         };
-        let result = run(&self.config.cli, args, input, timeout, &mut on_start, on_line);
-        *self.active_pid.lock().unwrap() = None;
+        let mut current_line = |line: &str| {
+            if !cancelled() {
+                on_line(line);
+            }
+        };
+        let mut result = run_interruptible(
+            &self.config.cli,
+            args,
+            input,
+            timeout,
+            &mut on_start,
+            &mut current_line,
+            &cancelled,
+        );
+        if cancelled() {
+            result.status = -1;
+            result.output.clear();
+        }
         result
     }
 
@@ -871,6 +963,29 @@ mod tests {
         assert_eq!(host_part("https://gw.example:8443/group"), "gw.example");
         assert_eq!(host_part("gw.example"), "gw.example");
         assert_eq!(resolve("127.0.0.1"), vec!["127.0.0.1"]);
+    }
+
+    #[test]
+    fn term_ignoring_cli_has_a_bounded_shutdown() {
+        for script in [
+            "trap '' TERM; exec sleep 30",
+            "exec 1>&- 2>&-; trap '' TERM; exec sleep 30",
+        ] {
+            let start = Instant::now();
+            let result = run(
+                "/bin/sh",
+                &["-c", script],
+                None,
+                Duration::from_millis(300),
+                &mut |_| {},
+                &mut |_| {},
+            );
+            assert_ne!(result.status, 0);
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "TERM refusal or closed output must not wedge the engine"
+            );
+        }
     }
 
     #[test]
