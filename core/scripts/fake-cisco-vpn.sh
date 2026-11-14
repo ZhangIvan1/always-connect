@@ -25,14 +25,21 @@ disconnect) echo cancel >> "$DIR/cancellations"; banner; echo Disconnected > "$D
     *) printf '  >> error: The VPN connection failed due to unsuccessful domain name resolution.\n'; exit 0 ;;
     esac
     printf '\n  >> Please enter your username and password.\nGroup: Staff\n\nUsername: [default] '
-    sleep 0.3
+    # Quick failure arrives immediately, well below the 0.5s test threshold.
+    # Expiry still waits 0.3 + 1s, clearly above that same threshold.
+    if [ "$pass" != quickfail ]; then sleep 0.3; fi
     case "$pass" in
     slow) echo Connecting > "$DIR/state"; exec sleep 30 ;;
     good) sleep 1; echo Connected > "$DIR/state"
           printf '  >> state: Connecting\n  >> notice: Establishing VPN session...\n  >> state: Connected\nVPN> goodbye...\n' ;;
     bad)  printf '\n  >> Login error.\n' ;;
     noapprove) sleep 1; printf '\n  >> Login failed.\n' ;;
-    quickfail) printf '\n  >> Login failed.\n' ;;
+    quickfail) printf '\n  >> Login failed.\n'
+               # Close output but retain the process for 1s: reaping time must
+               # not turn this immediate rejection into approval expiration.
+               exec 1>&- 2>&-
+               sleep 1 ;;
+
     *)    printf '\n  >> error: The VPN connection failed: no response from the gateway.\n' ;;
     esac
     ;;

@@ -275,6 +275,21 @@ pub fn default_route_tunnel() -> Option<String> {
     crate::connections::default_route_interface().filter(|n| n.starts_with("utun"))
 }
 
+/// Classify the gateway response when observed, independently of EOF/reaping.
+/// Missing timing stays a rejection rather than scheduling another phone push.
+fn approval_expired_at_response(
+    output: &str,
+    pushed: Option<Instant>,
+    failed_at: Option<Instant>,
+    minimum: Duration,
+) -> bool {
+    output.contains("Login failed")
+        && !output.contains("Login error")
+        && pushed
+            .zip(failed_at)
+            .is_some_and(|(start, response)| response.saturating_duration_since(start) >= minimum)
+}
+
 // MARK: - The engine
 
 pub struct Credentials {
@@ -835,6 +850,7 @@ impl Shared {
             credentials.entry, credentials.username, credentials.password
         );
         let mut pushed: Option<Instant> = None;
+        let mut failed_at: Option<Instant> = None;
         let result = self.cli(
             intent,
             &["-s"],
@@ -843,6 +859,9 @@ impl Shared {
             &mut |line: &str| {
                 if !self.permits_attempt(intent) {
                     return;
+                }
+                if line.contains("Login failed") || line.contains("Login error") {
+                    failed_at.get_or_insert_with(Instant::now);
                 }
                 if line.contains(">> ") && !line.contains("Username") {
                     (self.hooks.log)(&format!("cisco: {}", line.trim()));
@@ -875,9 +894,12 @@ impl Shared {
             self.adopt_connected(st);
             return;
         }
-        let approval_expired = output.contains("Login failed")
-            && !output.contains("Login error")
-            && pushed.is_some_and(|t| t.elapsed() >= self.config.approval_timeout_minimum);
+        let approval_expired = approval_expired_at_response(
+            &output,
+            pushed,
+            failed_at,
+            self.config.approval_timeout_minimum,
+        );
         if approval_expired {
             // Nobody tapped approve in time: ask again later, more and
             // more slowly.

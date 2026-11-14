@@ -201,3 +201,34 @@ fn queued_network_recovery_cannot_adopt_a_newer_intent() {
     );
 }
 
+#[test]
+fn production_threshold_uses_response_time_not_reaping_time() {
+    // Model a 19s response whose process is finally reaped after 25s.
+    let pushed = Instant::now() - Duration::from_secs(25);
+    let threshold = Duration::from_secs(20);
+    let failure = "  >> Login failed.";
+    assert!(!approval_expired_at_response(
+        failure,
+        Some(pushed),
+        Some(pushed + Duration::from_secs(19)),
+        threshold
+    ));
+    assert!(approval_expired_at_response(
+        failure,
+        Some(pushed),
+        Some(pushed + Duration::from_secs(21)),
+        threshold
+    ));
+    assert!(!approval_expired_at_response(
+        "Login error",
+        Some(pushed),
+        Some(pushed + Duration::from_secs(21)),
+        threshold
+    ));
+    assert!(!approval_expired_at_response(
+        failure,
+        Some(pushed),
+        None,
+        threshold
+    ));
+}
