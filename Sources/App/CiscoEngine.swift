@@ -74,6 +74,7 @@ final class CiscoEngine {
     /// Fallback interval of the state check between routing changes;
     /// 0 = the engine's own (15 s). Settable for the harness only.
     static var monitorInterval: TimeInterval = 0
+    static var physicalAvailability: () -> Bool = { PhysicalConnectivity.available() }
 
     /// The App started this Cisco session (DESIGN.md §25.4, F8):
     /// persisted, so a relaunch after a crash takes it back, while a
@@ -112,6 +113,8 @@ final class CiscoEngine {
     }
 
     /// The Helper restarted: send it the current kill switch again.
+    func networkChanged() { existing.map(ac_cisco_network_changed) }
+
     func rearm() { existing.map(ac_cisco_rearm) }
 
     /// Launch / panel open: adopt a tunnel Cisco already has up (the
@@ -157,6 +160,7 @@ final class CiscoEngine {
                 if let entry = engine.credentialsProvider?()?.entry { hosts.append(CiscoProfiles.resolve(entry)) }
                 return strdup(hosts.joined(separator: ","))
             },
+            networkAvailable: { _ in CiscoEngine.physicalAvailability() },
             beforeLogin: { _ in CiscoEngine.quitCiscoGUI() },
             owned: { _, owned in UserDefaults.standard.set(owned, forKey: CiscoEngine.ownedKey) },
             log: { _, line in
@@ -242,6 +246,7 @@ struct AcCiscoHooks {
                                      UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
                                      UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Bool
     var profileHosts: @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+    var networkAvailable: @convention(c) (UnsafeMutableRawPointer?) -> Bool
     var beforeLogin: @convention(c) (UnsafeMutableRawPointer?) -> Void
     var owned: @convention(c) (UnsafeMutableRawPointer?, Bool) -> Void
     var log: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Void
@@ -271,3 +276,6 @@ func ac_cisco_run(_ cli: UnsafePointer<CChar>, _ args: UnsafePointer<CChar>, _ i
 func ac_cisco_parse_state(_ output: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_default_route_tunnel")
 func ac_default_route_tunnel() -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("ac_cisco_network_changed")
+func ac_cisco_network_changed(_ e: OpaquePointer)

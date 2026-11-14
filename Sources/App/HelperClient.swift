@@ -103,6 +103,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         case .awaitingApproval: return "等你在手机上确认登录"
         case .connected: return "已连接 · \(ProfileStore.loadProfile().server)"
         case .reconnecting:
+            if detail == "等待网络恢复" { return detail }
             let retries = dropRetryCount > 0 ? "（第 \(dropRetryCount) 次）" : ""
             if !protectsDrops {
                 return "已断开，正在重连（断线保护已关，流量走本地网络）" + retries
@@ -1543,6 +1544,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         pathMonitor.pathUpdateHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.cisco?.networkChanged()
                 self.onDemandPathReady = true
                 self.scheduleOnDemandEvaluation()
                 if let (ssid, done) = self.pendingOnDemandFacts {

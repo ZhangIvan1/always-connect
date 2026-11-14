@@ -15,6 +15,7 @@ pub mod ffi;
 pub mod kill_switch;
 pub mod network_guard;
 pub mod oc_engine;
+pub mod offline;
 pub mod pf;
 pub mod relay;
 pub mod relay_log;
