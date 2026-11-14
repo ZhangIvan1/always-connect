@@ -149,6 +149,8 @@ enum Event {
     SplitHit(String, Vec<String>),
     /// A scheduled retry: spawn again unless a manual stop landed first.
     Respawn,
+    #[cfg(test)]
+    Barrier(Sender<()>),
     Availability(bool),
     OfflineDeadline(u64),
     Release,
@@ -697,6 +699,10 @@ impl Shared {
                         self.spawn_next(&mut c);
                     }
                 }
+                #[cfg(test)]
+                Event::Barrier(done) => {
+                    let _ = done.send(());
+                }
                 Event::Release => c.released = true,
             }
             self.publish(&c);
@@ -1082,6 +1088,8 @@ impl Shared {
                 return;
             }
         }
+        // No generation may inherit output suppression for a previous child.
+        c.resume_after_exit = false;
         c.attempts += 1;
         c.hook_fired = false;
         c.tunnel_retrying = false;
@@ -1402,9 +1410,14 @@ impl Shared {
     // MARK: Child exit
 
     fn child_exited(self: &Arc<Self>, c: &mut Core) {
+        // This intent belongs to the exiting child, even when another offline
+        // episode currently prevents its requested restart.
+        let resume_after_exit = std::mem::take(&mut c.resume_after_exit);
         // Partial trailing lines.
         for stdout in [true, false] {
-            if c.network.paused || c.resume_after_exit { break; }
+            if c.network.paused || resume_after_exit {
+                break;
+            }
             let rest = std::mem::take(if stdout { &mut c.out_buffer } else { &mut c.err_buffer });
             if !rest.is_empty() {
                 let line = String::from_utf8_lossy(&rest).trim_matches(|ch| ch == '\n' || ch == '\r').to_string();
@@ -1426,7 +1439,7 @@ impl Shared {
             self.report(c, "等待网络恢复");
             return;
         }
-        if std::mem::take(&mut c.resume_after_exit) {
+        if resume_after_exit {
             self.spawn_next(c);
             return;
         }
@@ -1758,3 +1771,6 @@ mod tests {
         assert_eq!(shell_quoted("/a b/it's"), "'/a b/it'\\''s'");
     }
 }
+
+#[cfg(test)]
+mod recovery_tests;
