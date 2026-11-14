@@ -118,6 +118,13 @@ struct Harness {
         log("STEP restored-after-manual")
         available = true
         engine.networkChanged(); wait(2)
+        log("STEP stop-active-login")
+        let beforeActiveStop = cancellationCount()
+        password = "slow"
+        engine.connect(); wait(1)
+        engine.disconnect {}; wait(3)
+        log("cancelled owned=\(engine.isManaging)")
+        log("active cancel-issued=\(cancellationCount() > beforeActiveStop)")
         log("DONE")
     }
 }

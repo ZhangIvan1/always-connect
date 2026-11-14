@@ -67,9 +67,14 @@ need offline "$S" "offline daemon-state=Disconnected"
 [ -s "$WORK/cancellations" ] || { echo "MISSING Cisco cancel"; FAILS=$((FAILS+1)); }
 S=$(section offline-resume offline-manual-stop)
 need resume "$S" "state=connected"
-S=$(section restored-after-manual DONE)
+S=$(section restored-after-manual stop-active-login)
 none manual-offline "$S" "state=authenticating"
 none manual-offline "$S" "state=connected"
+S=$(section stop-active-login DONE)
+need active-stop "$S" "manual disconnect"
+need active-stop "$S" "cancelled owned=false"
+need active-stop "$S" "active cancel-issued=true"
+none active-stop "$S" "秒后重试"
 LOGINS=$(grep -c . "$WORK/commands" 2>/dev/null || true)
 echo "logins attempted: $LOGINS"
 rm -rf "$WORK"
