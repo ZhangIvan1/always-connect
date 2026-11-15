@@ -312,3 +312,35 @@ while :; do sleep 0.05; done
     }
 }
 
+#[test]
+fn network_recovery_preserves_approval_rate_limit_but_resets_ordinary_backoff() {
+    let f = Fixture::new();
+    // No credentials: test the recovery decision without submitting a login.
+    f.calls.store(1, Ordering::SeqCst);
+    f.engine.shared.managing.store(true, Ordering::SeqCst);
+    let unanswered = Instant::now() - Duration::from_secs(100);
+    let mut st = State {
+        intent: 0,
+        wanted: true,
+        ever_connected: false,
+        tunnel_if: String::new(),
+        monitor_at: None,
+        retry_at: None,
+        backoff_index: 4,
+        push_backoff_index: 3,
+        unanswered_since: Some(unanswered),
+        last_kill_switch: None,
+        last_tick: None,
+    };
+    f.engine.shared.command(
+        &mut st,
+        Command_::Network {
+            available: true,
+            intent: 0,
+        },
+    );
+    f.finish();
+    assert_eq!(st.backoff_index, 0);
+    assert_eq!(st.push_backoff_index, 3);
+    assert_eq!(st.unanswered_since, Some(unanswered));
+}
