@@ -376,3 +376,58 @@ fn network_recovery_preserves_approval_rate_limit_but_resets_ordinary_backoff() 
     assert_eq!(st.push_backoff_index, 3);
     assert_eq!(st.unanswered_since, Some(unanswered));
 }
+
+#[test]
+fn each_actual_state_line_is_observed_once() {
+    let f = Fixture::with_cli(Some("/bin/sh"));
+    let mut observed = Vec::new();
+    let result = f.engine.shared.cli(
+        0,
+        &[
+            "-c",
+            "printf '>> state: Connecting\\n>> state: Connected\\n'",
+        ],
+        None,
+        Duration::from_secs(5),
+        &mut |line| observed.push(line.to_owned()),
+    );
+    let text = f.engine.timeline_text();
+    f.finish();
+    assert_eq!(result.status, 0);
+    let states: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("connect Observation") && line.contains("state="))
+        .collect();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(
+        states.len(),
+        2,
+        "completed output replay must not invent new arrivals: {states:?}"
+    );
+    assert!(states[0].contains("state=Connecting"));
+    assert!(states[1].contains("state=Connected"));
+}
+
+#[test]
+fn only_unstreamed_tail_is_added_without_changing_control_callbacks() {
+    let f = Fixture::with_cli(Some("/bin/sh"));
+    let mut observed = Vec::new();
+    let result = f.engine.shared.cli(
+        0,
+        &["-c", "printf '>> state: Connecting\\n>> state: Connected'"],
+        None,
+        Duration::from_secs(5),
+        &mut |line| observed.push(line.to_owned()),
+    );
+    let text = f.engine.timeline_text();
+    f.finish();
+    assert_eq!(result.status, 0);
+    assert_eq!(observed, [">> state: Connecting"]);
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("connect Observation") && line.contains("state="))
+            .count(),
+        2
+    );
+    assert!(text.contains("state=Connected"));
+}

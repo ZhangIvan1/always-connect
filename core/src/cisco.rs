@@ -94,6 +94,7 @@ fn run_interruptible(
         on_line,
         cancelled,
         &mut |_| {},
+        &mut |_| {},
     )
 }
 
@@ -106,6 +107,7 @@ fn run_observed(
     on_line: &mut dyn FnMut(&str),
     cancelled: &dyn Fn() -> bool,
     signal: &mut dyn FnMut(Outcome),
+    on_tail: &mut dyn FnMut(&str),
 ) -> RunResult {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -240,6 +242,11 @@ fn run_observed(
             on_line(&String::from_utf8_lossy(&pending));
             pending.clear();
         }
+    }
+    // Prompts and complete lines were consumed above. Only this undelivered
+    // tail may be added to diagnostics; keep the control callback unchanged.
+    if !pending.is_empty() {
+        on_tail(&String::from_utf8_lossy(&pending));
     }
     let status = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
     RunResult {
@@ -790,10 +797,8 @@ impl Shared {
             &mut current_line,
             &cancelled,
             &mut signal,
+            &mut |tail| trace.cli_line(tail),
         );
-        for line in result.output.lines() {
-            trace.cli_line(line);
-        }
         trace.result(if termination.get() != Outcome::Completed {
             termination.get()
         } else if cancelled() {
