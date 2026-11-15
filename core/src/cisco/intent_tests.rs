@@ -292,16 +292,42 @@ printf '>> error: vpn.private.example account-secret 198.51.100.88 suspended lon
 exec 1>&- 2>&-
 while :; do sleep 0.05; done
 "#;
-    let result = f.engine.shared.cli(
-        0,
-        &["-c", script],
-        None,
-        Duration::from_millis(500),
-        &mut |_| {},
-    );
-    let text = f.engine.timeline_text();
+    let (ready, observed) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let (result, live, text, observed_line) = std::thread::scope(|scope| {
+        let shared = &f.engine.shared;
+        let run = scope.spawn(move || {
+            shared.cli(
+                0,
+                &["-c", script],
+                None,
+                Duration::from_millis(500),
+                &mut |line| {
+                    if line.contains("re-authentication") {
+                        ready.send(()).unwrap();
+                        released.recv().unwrap();
+                    }
+                },
+            )
+        });
+        let observed_line = observed.recv_timeout(Duration::from_secs(5)).is_ok();
+        let live = f.engine.timeline_text();
+        let _ = release.send(());
+        let result = run.join().unwrap();
+        (result, live, f.engine.timeline_text(), observed_line)
+    });
     f.finish();
+    assert!(
+        observed_line,
+        "fixture did not emit the diagnostic observation"
+    );
     assert_ne!(result.status, 0);
+    assert!(live.contains("SuspendedSessionTimeout"));
+    assert!(live.contains("state=Connected"));
+    assert!(
+        !live.contains(" End "),
+        "CLI observations must export before completion"
+    );
     for outcome in ["Timeout", "Term", "Kill", "OutputClosed"] {
         assert!(text.contains(outcome), "{outcome}: {text}");
     }
@@ -314,6 +340,7 @@ while :; do sleep 0.05; done
         "allotted time limit",
     ] {
         assert!(!text.contains(secret));
+        assert!(!live.contains(secret));
     }
 }
 

@@ -2794,7 +2794,7 @@ Rust 事件序列覆盖断网、去抖、取消、恢复、手动断开及旧代
 
 在 Rust 内存保留至多 200 条且不超过两小时的操作事件，取较小窗口；不写日志文件、不增加轮询，重启即清空。时间为距导出的墙钟秒数（包含休眠），与 CLI 超时/批准退避继续使用的 Instant 分开；系统时间回拨时丢弃未来记录。每条只存固定枚举、操作 id、意图代次和时间，不保存 CLI 原文、服务器/Group、用户名、IP、接口名或名单。
 
-操作包括 request-connect/request-disconnect、state、stats、登录 connect、disconnect、取凭据、等 GUI、网关解析、暂停、恢复和 tick。request-*、暂停/恢复的 Queued→Start 显示 FIFO 排队时间；同步子步骤的 Queued/Start 在本次调用内连续记录。Start 没有 End 可以定位尚未返回的步骤，End 的 Completed 仅表示本地步骤返回，不证明 GUI 已退出或网关接受了凭据。意图取消立即记录，CLI 另记录实际 TERM、KILL、超时和输出关闭；最终状态与错误只经白名单枚举转换，未识别值为 Unknown/Other。过期操作即使清扫完成也标记为取消，不把它算作新会话成功。
+操作包括 request-connect/request-disconnect、state、stats、登录 connect、disconnect、取凭据、等 GUI、网关解析、暂停、恢复和 tick。request-*、暂停/恢复的 Queued→Start 显示 FIFO 排队时间；同步子步骤的 Queued/Start 在本次调用内连续记录。Start 没有 End 可以定位尚未返回的步骤，End 的 Completed 仅表示本地步骤返回，不证明 GUI 已退出或网关接受了凭据。意图取消立即记录，CLI 另记录实际 TERM、KILL、超时和输出关闭；CLI 一读到新的 state/error 分类就记录观察事件，不等待命令结束，卡住时也能导出最后观察。状态与错误只经白名单枚举转换，未识别值为 Unknown/Other。过期操作即使清扫完成也标记为取消，不把它算作新会话成功。
 
 tick 记录观测到的 Connected→Reconnecting→Disconnected 等变化及上一段停留时长；导出也显示最后一次观测状态的当前停留，最长展示两小时。观测间隔内的真实 Cisco 状态并不保证不变，这不是持续采样。解析失败记 Unknown，过期 tick 不覆盖当前观察。
 

@@ -55,6 +55,7 @@ pub(super) enum Phase {
     Cancel,
     OutputClosed,
     StateChanged,
+    Observation,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Outcome {
@@ -313,11 +314,15 @@ impl Trace<'_> {
         });
     }
     pub fn cli_line(&self, line: &str) {
+        let previous = (self.state.get(), self.error.get());
         if let Some((_, state)) = line.split_once(">> state: ") {
             self.state.set(Some(CiscoState::parse(state.trim())));
         }
         if let Some(error) = ErrorClass::parse(line) {
             self.error.set(Some(error));
+        }
+        if previous != (self.state.get(), self.error.get()) {
+            self.note(Phase::Observation, Outcome::Completed);
         }
     }
     pub fn result(&self, outcome: Outcome) {
