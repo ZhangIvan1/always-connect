@@ -55,6 +55,16 @@ const CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
 mod timeline;
 use timeline::{Operation, Outcome, Phase, Recorder};
 
+/// Closed error categories reused by the whole diagnostic export.
+pub(crate) fn diagnostic_detail(text: &str) -> &'static str {
+    timeline::diagnostic_detail(text)
+}
+
+/// Rebuild the timeline when it crosses the diagnostic export boundary.
+pub(crate) fn diagnostic_timeline(text: &str) -> String {
+    timeline::sanitize_export(text)
+}
+
 // MARK: - The CLI
 
 pub struct RunResult {

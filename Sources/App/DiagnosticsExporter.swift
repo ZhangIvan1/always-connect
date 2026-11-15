@@ -9,7 +9,8 @@ import UniformTypeIdentifiers
 /// issues), so nothing names the user's VPN either: server, Cisco
 /// entries and group are hidden everywhere and split-list entries are
 /// counted, not listed (DiagnosticsRedaction, DESIGN.md §36.3).
-/// The Cisco timeline is a bounded Rust whitelist, never raw CLI text (§48.4).
+/// Every exported textual category is reconstructed in Rust; raw status and
+/// history summaries are never copied (§48.5). The live panel is unchanged.
 enum DiagnosticsExporter {
     static func export(manager: HelperClient, profile: Profile) {
         let panel = NSSavePanel()
@@ -33,20 +34,19 @@ enum DiagnosticsExporter {
     private static func diagnosticsText(
         manager: HelperClient, profile: Profile, ciscoTimeline: String
     ) -> String {
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
-        let os = ProcessInfo.processInfo.operatingSystemVersionString
-        let secrets = DiagnosticsRedaction.secrets(
-            server: profile.server, group: profile.group,
-            entries: profile.servers.map { ($0.name, $0.address, $0.ciscoName) })
-        let hide = { (text: String) in DiagnosticsRedaction.redact(text, secrets: secrets) }
+        let version = DiagnosticsRedaction.classify(
+            .version, Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let state = DiagnosticsRedaction.classify(.state, String(manager.state.rawValue))
+        let detail = DiagnosticsRedaction.classify(.detail, manager.detail)
         let rules = ProfileStore.loadRules()
         var lines = [
             "AlwaysConnect 诊断包（服务器、Group 与名单内容已隐去，可以公开）",
-            "导出时间：\(Date())",
+            "导出时间：\(ISO8601DateFormatter().string(from: Date()))",
             "App 版本：\(version)",
-            "系统：\(os)",
+            "系统：macOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)",
             "",
-            "Helper 状态：\(manager.state)（\(hide(manager.detail))）",
+            "Helper 状态：\(state)（\(detail)）",
             "Helper 可用：\(manager.helperAvailable ? "是" : "否")",
             "服务器：\(profile.server.isEmpty ? "未设置" : DiagnosticsRedaction.placeholder)（共 \(profile.servers.count) 个）",
             "Group：\(profile.group.isEmpty ? "未设置" : DiagnosticsRedaction.placeholder)",
@@ -56,19 +56,25 @@ enum DiagnosticsExporter {
             "规则（\(rules.count) 条，内容不导出）：",
         ]
         for rule in rules {
-            lines.append("- [\(rule.type)] \(DiagnosticsRedaction.placeholder) → \(rule.direction == .viaVPN ? "走 VPN" : "直连")\(rule.isEnabled ? "" : "（停用）")")
+            lines.append("- [\(DiagnosticsRedaction.classify(.rule, rule.type.rawValue))] \(DiagnosticsRedaction.placeholder) → \(rule.direction == .viaVPN ? "走 VPN" : "直连")\(rule.isEnabled ? "" : "（停用）")")
         }
         lines.append("")
         lines.append("掉线历史（\(manager.dropHistory.count) 次）：")
         let timeFormatter = DateFormatter()
+        timeFormatter.locale = Locale(identifier: "en_US_POSIX")
+        timeFormatter.calendar = Calendar(identifier: .gregorian)
         timeFormatter.dateFormat = "yyyy-MM-dd HH:mm"
         for drop in manager.dropHistory {
-            let engine = drop.engineLabel.map { "，\($0)" } ?? ""
-            lines.append(hide("- \(timeFormatter.string(from: drop.droppedAt)) → \(timeFormatter.string(from: drop.recoveredAt))：\(drop.outcomeLabel)，\(drop.summary)\(engine)"))
+            let outcome = DiagnosticsRedaction.classify(.outcome, drop.outcome?.rawValue ?? "legacy")
+            let engine = DiagnosticsRedaction.classify(.engine, drop.engine ?? "")
+            let reason = DiagnosticsRedaction.classify(.detail, drop.failureReason ?? "")
+            let retries = drop.retries.map { String($0) } ?? "未知"
+            let approvals = drop.approvals.map { String($0) } ?? "未知"
+            lines.append("- \(timeFormatter.string(from: drop.droppedAt)) → \(timeFormatter.string(from: drop.recoveredAt))：\(outcome)，\(engine)，重试 \(retries) 次，等待批准 \(approvals) 次；原因：\(reason)")
         }
         lines.append("")
         lines.append("Cisco 引擎时间线：")
-        lines.append(hide(ciscoTimeline))
+        lines.append(DiagnosticsRedaction.classify(.timeline, ciscoTimeline))
         return lines.joined(separator: "\n") + "\n"
     }
 }

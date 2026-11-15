@@ -1293,6 +1293,17 @@ pub extern "C" fn ac_cisco_timeline(e: *const cisco::Engine) -> *mut c_char {
     CString::new(text).unwrap().into_raw()
 }
 
+/// Export-only classification; unknown fields are omitted, never echoed.
+/// The caller frees the returned UTF-8 string with ac_string_free.
+#[no_mangle]
+pub extern "C" fn ac_diagnostics_classify(kind: *const c_char, value: *const c_char) -> *mut c_char {
+    let text = crate::diagnostics::classify(
+        &c_str(kind).unwrap_or_default(),
+        &c_str(value).unwrap_or_default(),
+    );
+    CString::new(text).unwrap().into_raw()
+}
+
 /// Runs the Cisco CLI once (`args` newline-separated); the output (free
 /// with ac_string_free), the exit status in `*status`.
 #[no_mangle]

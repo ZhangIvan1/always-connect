@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 const CAPACITY: usize = 200;
 const RETENTION: Duration = Duration::from_secs(2 * 3600);
+const HEADER: &str = "最近至多 200 条 / 2 小时；时间为距导出的墙钟秒数（含休眠）；仅白名单分类\n";
 
 /// Fixed labels only; neither arguments nor CLI output may be stored here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,9 +167,7 @@ impl Ring {
     }
     fn text(&mut self, now: SystemTime) -> String {
         self.trim(now);
-        let mut text = String::from(
-            "最近至多 200 条 / 2 小时；时间为距导出的墙钟秒数（含休眠）；仅白名单分类\n",
-        );
+        let mut text = String::from(HEADER);
         for e in &self.events {
             text.push_str(&format!(
                 "-{:.3}s #{} intent={} {} {:?} {:?}",
@@ -335,9 +334,192 @@ impl Drop for Trace<'_> {
     }
 }
 
+/// Export free-form status/history reasons through the same closed error map.
+pub(super) fn diagnostic_detail(text: &str) -> &'static str {
+    if text.is_empty() {
+        return "未记录";
+    }
+    if text.len() > 8192 {
+        return "其他详情已省略";
+    }
+    let error = ErrorClass::parse(text).or_else(|| ErrorClass::parse(&format!(">> error: {text}")));
+    match error {
+        Some(ErrorClass::SuspendedSessionTimeout) => "会话挂起超时，需重新认证",
+        Some(ErrorClass::ConnectCapabilityUnavailable) => "连接能力不可用",
+        Some(ErrorClass::NameResolution) => "域名解析失败",
+        Some(ErrorClass::NoResponse) => "未收到应答或连接超时",
+        Some(ErrorClass::LoginRejected) => "登录被拒绝",
+        Some(ErrorClass::LoginFailed) => "登录失败",
+        _ => "其他详情已省略",
+    }
+}
+
+const STATES: &[&str] = &[
+    "Connected",
+    "Reconnecting",
+    "Disconnected",
+    "Connecting",
+    "Authenticating",
+    "Unknown",
+];
+const OPERATIONS: &[&str] = &[
+    "intent",
+    "request-connect",
+    "request-disconnect",
+    "refresh",
+    "state",
+    "stats",
+    "connect",
+    "disconnect",
+    "credentials",
+    "gui-wait",
+    "gateway-resolution",
+    "pause",
+    "resume",
+    "tick",
+    "rearm",
+];
+const PHASES: &[&str] = &[
+    "Queued",
+    "Start",
+    "End",
+    "Cancel",
+    "OutputClosed",
+    "StateChanged",
+    "Observation",
+];
+const OUTCOMES: &[&str] = &[
+    "Completed",
+    "Success",
+    "Failed",
+    "Cancelled",
+    "Term",
+    "Kill",
+    "Timeout",
+    "OutputClosed",
+];
+const ERRORS: &[&str] = &[
+    "SuspendedSessionTimeout",
+    "ConnectCapabilityUnavailable",
+    "NameResolution",
+    "NoResponse",
+    "LoginRejected",
+    "LoginFailed",
+    "Other",
+];
+fn fixed(value: &str, allowed: &'static [&'static str]) -> Option<&'static str> {
+    allowed.iter().copied().find(|label| *label == value)
+}
+fn seconds(value: &str) -> Option<f64> {
+    let number: f64 = value.strip_suffix('s')?.parse().ok()?;
+    (number.is_finite() && (0.0..=RETENTION.as_secs_f64()).contains(&number)).then_some(number)
+}
+fn export_row(line: &str) -> Option<String> {
+    let fields: Vec<_> = line.split_ascii_whitespace().collect();
+    if fields.len() == 2 {
+        let state = fixed(fields[0].strip_prefix("last-tick-state=")?, STATES)?;
+        let dwell = seconds(fields[1].strip_prefix("dwell-within-window=")?)?;
+        return Some(format!(
+            "last-tick-state={state} dwell-within-window={dwell:.3}s\n"
+        ));
+    }
+    if !(6..=10).contains(&fields.len()) {
+        return None;
+    }
+    let age = seconds(fields[0].strip_prefix('-')?)?;
+    let id: u64 = fields[1].strip_prefix('#')?.parse().ok()?;
+    let intent: u32 = fields[2].strip_prefix("intent=")?.parse().ok()?;
+    let operation = fixed(fields[3], OPERATIONS)?;
+    let phase = fixed(fields[4], PHASES)?;
+    let outcome = fixed(fields[5], OUTCOMES)?;
+    let mut out = format!("-{age:.3}s #{id} intent={intent} {operation} {phase} {outcome}");
+    let mut seen = 0;
+    for field in &fields[6..] {
+        let (key, value) = field.split_once('=')?;
+        let (bit, canonical) = match key {
+            "state" => (1, format!("state={}", fixed(value, STATES)?)),
+            "error" => (2, format!("error={}", fixed(value, ERRORS)?)),
+            "previous" => {
+                let previous = if value == "None" {
+                    "None".to_owned()
+                } else {
+                    format!(
+                        "Some({})",
+                        fixed(value.strip_prefix("Some(")?.strip_suffix(')')?, STATES)?
+                    )
+                };
+                (4, format!("previous={previous}"))
+            }
+            "dwell" => (8, format!("dwell={:.3}s", seconds(value)?)),
+            _ => return None,
+        };
+        if seen & bit != 0 {
+            return None;
+        }
+        seen |= bit;
+        out.push(' ');
+        out.push_str(&canonical);
+    }
+    out.push('\n');
+    Some(out)
+}
+
+/// Rebuild even the timeline field at the export boundary. Unknown formats
+/// (including future producer fields) fail closed instead of passing text on.
+pub(super) fn sanitize_export(text: &str) -> String {
+    let omitted = || "时间线不可用或格式未知（已省略）\n".to_string();
+    if text.len() > 64 * 1024 {
+        return omitted();
+    }
+    let mut lines = text.lines();
+    if lines.next() != Some(HEADER.trim_end()) {
+        return omitted();
+    }
+    let mut out = HEADER.to_owned();
+    let mut count = 0;
+    let mut summary = false;
+    for line in lines {
+        if summary {
+            return omitted();
+        }
+        if line.starts_with("last-tick-state=") {
+            summary = true;
+        } else {
+            count += 1;
+        }
+        if count > CAPACITY {
+            return omitted();
+        }
+        let Some(row) = export_row(line) else {
+            return omitted();
+        };
+        out.push_str(&row);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn export_rebuilds_real_rows_and_rejects_unknown_text() {
+        let recorder = Recorder::new();
+        let trace = recorder.begin(Operation::Connect, 3);
+        trace.cli_line(">> state: Connected");
+        trace.cli_line(">> error: Login failed USER_CANARY_7");
+        drop(trace);
+        recorder.observe_state(3, Some("Connected"));
+        let text = recorder.text();
+        assert_eq!(sanitize_export(&text), text);
+        assert!(!sanitize_export(&(text.clone() + "RAW_CANARY_7\n")).contains("RAW_CANARY_7"));
+        let injected = text.replace("state=Connected", "state=USER_CANARY_7");
+        assert!(!sanitize_export(&injected).contains("USER_CANARY_7"));
+        assert_eq!(
+            sanitize_export("untrusted"),
+            "时间线不可用或格式未知（已省略）\n"
+        );
+    }
+
     #[test]
     fn capacity_and_retention_are_both_bounded() {
         let recorder = Recorder::new();
