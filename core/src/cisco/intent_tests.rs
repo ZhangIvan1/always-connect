@@ -1,20 +1,25 @@
 //! Real worker/CLI regressions for cancellation spanning preparation.
 use super::*;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ac-intent-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&path).unwrap();
+        // Atomic allocation: concurrent fixtures can share a clock tick.
+        let mut template = std::env::temp_dir()
+            .join("ac-intent-XXXXXX")
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        template.push(0);
+        let allocated = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        assert!(!allocated.is_null(), "{}", std::io::Error::last_os_error());
+        let bytes = unsafe { std::ffi::CStr::from_ptr(allocated) }
+            .to_bytes()
+            .to_vec();
+        let path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
         Self(path)
     }
 }
