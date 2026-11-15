@@ -11,6 +11,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
 parser.add_argument("--sample", type=Path)
 parser.add_argument("--unsafe-detail-control", action="store_true")
+parser.add_argument("--omit-history-metadata-control", action="store_true")
 args = parser.parse_args()
 root = args.root.resolve()
 
@@ -79,6 +80,38 @@ enum CiscoProfiles {
             "RULE_TYPE_CANARY_8", "RULE_TARGET_CANARY_8.example", "STATE_DESCRIPTION_CANARY_8",
             "ENGINE_CANARY_8", "HISTORY_CANARY_8", "TIMELINE_CANARY_8"]
         let leaks = tokens.filter { exported.contains($0) || malformed.contains($0) }
+        // Verify's two-hour sleep fixture: equal spans do not imply equal downtime.
+        let start = Date(timeIntervalSince1970: 0)
+        let end = Date(timeIntervalSince1970: 7200)
+        client.dropHistory = [DropRecord(droppedAt: start, recoveredAt: end, outcome: .recovered,
+            retries: 0, approvals: 0, engine: "cisco", sleepSince: start,
+            sleepDrops: 3, lastDroppedAt: end, downSeconds: 7)]
+        func historyLine() -> String {
+            DiagnosticsExporter.fixtureText(client, profile, timeline).split(separator: "\n")
+                .filter { $0.hasPrefix("- ") && $0.contains("已恢复") }.joined(separator: "\n")
+        }
+        let a = historyLine()
+        client.dropHistory[0].sleepDrops = 30
+        client.dropHistory[0].downSeconds = 900
+        let b = historyLine()
+        let distinguishable = a != b && a.contains("实际掉线 7 秒") && a.contains("睡眠记录 true")
+            && a.contains("睡眠期间断开 3 次") && b.contains("实际掉线 900 秒")
+            && b.contains("睡眠记录 true") && b.contains("睡眠期间断开 30 次")
+        client.dropHistory = [DropRecord(droppedAt: start, recoveredAt: start.addingTimeInterval(0.375),
+            outcome: .recovered)]
+        let ordinary = historyLine()
+        let subsecond = ordinary.contains("实际掉线 0.375 秒") && ordinary.contains("睡眠记录 false")
+        client.dropHistory[0].downSeconds = .infinity
+        client.dropHistory[0].sleepDrops = Int.max
+        let invalid = historyLine()
+        let bounded = !invalid.contains("实际掉线") && !invalid.contains("睡眠期间断开")
+            && invalid.contains("睡眠记录 false")
+        let historySafe = [a, b, ordinary, invalid].allSatisfy { row in
+            tokens.allSatisfy { !row.contains($0) }
+        }
+        print("3 sleep drops / 7s actual downtime: \(a)")
+        print("30 sleep drops / 900s actual downtime: \(b)")
+        print("distinguishable=\(distinguishable); subsecond=\(subsecond); bounded=\(bounded)")
         var done = false
         engine.disconnect { done = true }
         let stopped = Date().addingTimeInterval(10)
@@ -90,7 +123,7 @@ enum CiscoProfiles {
         print("fake error delivered=\(got); local stop completed=\(done); full bundle leaks=\(leaks)")
         let useful = exported.contains("Cisco 引擎时间线：") && exported.contains("request-connect")
             && exported.contains("重试 2 次") && exported.contains("认证中")
-        exit(got && done && useful && leaks.isEmpty ? 0 : 1)
+        exit(got && done && useful && leaks.isEmpty && distinguishable && subsecond && bounded && historySafe ? 0 : 1)
     }
 }
 '''
@@ -99,6 +132,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="diagnostics-export-") as temporary:
         work = Path(temporary)
         source = (root / "Sources/App/DiagnosticsExporter.swift").read_text()
+        if args.omit_history_metadata_control:
+            needle = 'if !metadata.isEmpty { lines[lines.count - 1] += "；\\(metadata)" }'
+            assert source.count(needle) == 1
+            source = source.replace(needle, "// Control: omit the three history metadata fields.")
         if args.unsafe_detail_control:
             needle = "let detail = DiagnosticsRedaction.classify(.detail, manager.detail)"
             assert source.count(needle) == 1

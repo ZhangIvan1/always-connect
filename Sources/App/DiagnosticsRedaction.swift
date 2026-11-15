@@ -4,7 +4,10 @@ import Foundation
 /// unregistered server, account or address must not bypass the public bundle.
 enum DiagnosticsRedaction {
     static let placeholder = "<已隐去>"
-    enum Kind: String { case state, detail, outcome, engine, rule, version, timeline }
+    enum Kind: String {
+        case state, detail, outcome, engine, rule, version, timeline
+        case durationSeconds, isSleepRecord, sleepDropCount
+    }
 
     static func classify(_ kind: Kind, _ value: String) -> String {
         guard let raw = ac_diagnostics_classify(kind.rawValue, value) else { return "已省略" }

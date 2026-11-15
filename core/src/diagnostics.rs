@@ -40,8 +40,40 @@ pub fn classify(kind: &str, value: &str) -> String {
         .into(),
         "version" => version(value).unwrap_or_else(|| "未提供".into()),
         "timeline" => crate::cisco::diagnostic_timeline(value),
+        "durationSeconds" => duration(value).unwrap_or_default(),
+        "isSleepRecord" => match value {
+            "true" => "睡眠记录 true",
+            "false" => "睡眠记录 false",
+            _ => "",
+        }
+        .into(),
+        "sleepDropCount" => sleep_drop_count(value).unwrap_or_default(),
         _ => "已省略".into(),
     }
+}
+
+// Export limits, not control policy: retain subsecond downtime and up to ten
+// Julian years / one million folded drops. Invalid metadata is omitted.
+fn duration(value: &str) -> Option<String> {
+    if value.len() > 64 {
+        return None;
+    }
+    let seconds = value.parse::<f64>().ok()?;
+    if !seconds.is_finite() || !(0.0..=315_576_000.0).contains(&seconds) {
+        return None;
+    }
+    let seconds = if seconds == 0.0 { 0.0 } else { seconds };
+    Some(format!("实际掉线 {seconds} 秒"))
+}
+
+fn sleep_drop_count(value: &str) -> Option<String> {
+    if value.len() > 16 {
+        return None;
+    }
+    let count = value.parse::<u32>().ok()?;
+    (1..=1_000_000)
+        .contains(&count)
+        .then(|| format!("睡眠期间断开 {count} 次"))
 }
 
 fn version(value: &str) -> Option<String> {
@@ -69,12 +101,75 @@ mod tests {
     fn unknown_fields_cannot_echo_arbitrary_payloads() {
         let raw = "RAW_CANARY_7 USER_CANARY_7 203.0.113.73 backup-canary.example GROUP_CANARY_7";
         for kind in [
-            "state", "detail", "outcome", "engine", "rule", "version", "timeline", "unknown",
+            "state",
+            "detail",
+            "outcome",
+            "engine",
+            "rule",
+            "version",
+            "timeline",
+            "unknown",
+            "durationSeconds",
+            "isSleepRecord",
+            "sleepDropCount",
         ] {
             let text = classify(kind, raw);
             for token in raw.split_whitespace() {
                 assert!(!text.contains(token), "{kind}");
             }
+        }
+    }
+    #[test]
+    fn history_metadata_is_bounded_and_rebuilt_without_rounding_to_minutes() {
+        for (raw, expected) in [
+            ("7.0", "7"),
+            ("9e2", "900"),
+            ("0.375", "0.375"),
+            ("-0", "0"),
+            ("315576000", "315576000"),
+        ] {
+            assert_eq!(
+                classify("durationSeconds", raw),
+                format!("实际掉线 {expected} 秒")
+            );
+        }
+        assert_eq!(classify("sleepDropCount", "0003"), "睡眠期间断开 3 次");
+        assert_eq!(
+            classify("sleepDropCount", "1000000"),
+            "睡眠期间断开 1000000 次"
+        );
+        assert_eq!(classify("isSleepRecord", "true"), "睡眠记录 true");
+        assert_eq!(classify("isSleepRecord", "false"), "睡眠记录 false");
+    }
+    #[test]
+    fn invalid_history_metadata_is_omitted() {
+        for raw in [
+            "NaN",
+            "inf",
+            "-inf",
+            "-1",
+            "315576001",
+            "1e999",
+            "7 RAW_CANARY_7",
+            "",
+            &"0".repeat(65),
+        ] {
+            assert_eq!(classify("durationSeconds", raw), "", "{raw}");
+        }
+        for raw in [
+            "0",
+            "-1",
+            "1000001",
+            "4294967296",
+            "1.5",
+            "3 RAW_CANARY_7",
+            "",
+            &"0".repeat(17),
+        ] {
+            assert_eq!(classify("sleepDropCount", raw), "", "{raw}");
+        }
+        for raw in ["True", "1", "true RAW_CANARY_7", ""] {
+            assert_eq!(classify("isSleepRecord", raw), "");
         }
     }
     #[test]
