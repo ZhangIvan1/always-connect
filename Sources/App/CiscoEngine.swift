@@ -103,6 +103,15 @@ final class CiscoEngine {
     var isManaging: Bool { existing.map(ac_cisco_is_managing) ?? false }
     var episodeRetries: Int { existing.map { Int(ac_cisco_episode_retries($0)) } ?? 0 }
 
+    /// Read the Rust ring directly; exporting never starts a dormant engine.
+    var timelineText: String {
+        guard let engine = existing, let raw = ac_cisco_timeline(engine) else {
+            return "Cisco 引擎尚未启动\n"
+        }
+        defer { ac_string_free(raw) }
+        return String(cString: raw)
+    }
+
     // MARK: - Public
 
     func connect() { ac_cisco_connect(handle) }
@@ -269,6 +278,8 @@ func ac_cisco_refresh(_ e: OpaquePointer)
 func ac_cisco_is_managing(_ e: OpaquePointer) -> Bool
 @_silgen_name("ac_cisco_episode_retries")
 func ac_cisco_episode_retries(_ e: OpaquePointer) -> UInt32
+@_silgen_name("ac_cisco_timeline")
+func ac_cisco_timeline(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_cisco_run")
 func ac_cisco_run(_ cli: UnsafePointer<CChar>, _ args: UnsafePointer<CChar>, _ input: UnsafePointer<CChar>?,
                   _ timeoutMs: UInt32, _ status: UnsafeMutablePointer<Int32>) -> UnsafeMutablePointer<CChar>?

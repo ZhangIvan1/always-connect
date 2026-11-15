@@ -9,6 +9,7 @@ import UniformTypeIdentifiers
 /// issues), so nothing names the user's VPN either: server, Cisco
 /// entries and group are hidden everywhere and split-list entries are
 /// counted, not listed (DiagnosticsRedaction, DESIGN.md §36.3).
+/// The Cisco timeline is a bounded Rust whitelist, never raw CLI text (§48.4).
 enum DiagnosticsExporter {
     static func export(manager: HelperClient, profile: Profile) {
         let panel = NSSavePanel()
@@ -16,8 +17,10 @@ enum DiagnosticsExporter {
         panel.allowedContentTypes = [.plainText]
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            try? diagnosticsText(manager: manager, profile: profile)
-                .write(to: url, atomically: true, encoding: .utf8)
+            manager.ciscoTimelineForDiagnostics { timeline in
+                try? diagnosticsText(manager: manager, profile: profile, ciscoTimeline: timeline)
+                    .write(to: url, atomically: true, encoding: .utf8)
+            }
         }
     }
 
@@ -27,7 +30,9 @@ enum DiagnosticsExporter {
         return "AlwaysConnect-Diagnostics-\(formatter.string(from: Date())).txt"
     }
 
-    private static func diagnosticsText(manager: HelperClient, profile: Profile) -> String {
+    private static func diagnosticsText(
+        manager: HelperClient, profile: Profile, ciscoTimeline: String
+    ) -> String {
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
         let os = ProcessInfo.processInfo.operatingSystemVersionString
         let secrets = DiagnosticsRedaction.secrets(
@@ -61,6 +66,9 @@ enum DiagnosticsExporter {
             let engine = drop.engineLabel.map { "，\($0)" } ?? ""
             lines.append(hide("- \(timeFormatter.string(from: drop.droppedAt)) → \(timeFormatter.string(from: drop.recoveredAt))：\(drop.outcomeLabel)，\(drop.summary)\(engine)"))
         }
+        lines.append("")
+        lines.append("Cisco 引擎时间线：")
+        lines.append(hide(ciscoTimeline))
         return lines.joined(separator: "\n") + "\n"
     }
 }

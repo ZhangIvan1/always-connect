@@ -52,6 +52,9 @@ const QUIET_INTERVAL: f64 = 900.0;
 pub const MONITOR: Duration = Duration::from_secs(15);
 const CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
 
+mod timeline;
+use timeline::{Operation, Outcome, Phase, Recorder};
+
 // MARK: - The CLI
 
 pub struct RunResult {
@@ -81,6 +84,28 @@ fn run_interruptible(
     on_start: &mut dyn FnMut(u32),
     on_line: &mut dyn FnMut(&str),
     cancelled: &dyn Fn() -> bool,
+) -> RunResult {
+    run_observed(
+        cli,
+        args,
+        input,
+        timeout,
+        on_start,
+        on_line,
+        cancelled,
+        &mut |_| {},
+    )
+}
+
+fn run_observed(
+    cli: &str,
+    args: &[&str],
+    input: Option<&str>,
+    timeout: Duration,
+    on_start: &mut dyn FnMut(u32),
+    on_line: &mut dyn FnMut(&str),
+    cancelled: &dyn Fn() -> bool,
+    signal: &mut dyn FnMut(Outcome),
 ) -> RunResult {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -139,7 +164,11 @@ fn run_interruptible(
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if (left.is_zero() || cancelled()) && !killed {
+            if left.is_zero() {
+                signal(Outcome::Timeout);
+            }
             let _ = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+            signal(Outcome::Term);
             killed = true;
             kill_started = Some(Instant::now());
         }
@@ -150,6 +179,7 @@ fn run_interruptible(
         {
             unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
             forced = true;
+            signal(Outcome::Kill);
         }
         // The CLI's exit ends the run, as before, even if something it
         // started still holds the pipe: check it at least every 200 ms.
@@ -189,6 +219,7 @@ fn run_interruptible(
         let n = match file.read(&mut buffer) {
             Ok(0) => {
                 output_closed = true;
+                signal(Outcome::OutputClosed);
                 continue;
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -341,13 +372,22 @@ pub struct Config {
 }
 
 enum Command_ {
+    Traced {
+        id: u64,
+        intent: u32,
+        operation: Operation,
+        command: Box<Command_>,
+    },
     Connect(u32),
     Disconnect(u32),
     Rearm,
     Refresh(u32),
     /// The routing table changed.
     Changed,
-    Network { available: bool, intent: u32 },
+    Network {
+        available: bool,
+        intent: u32,
+    },
     #[cfg(test)]
     Barrier(Sender<()>),
 }
@@ -362,6 +402,7 @@ struct Shared {
     reported: AtomicI32,
     offline: AtomicBool,
     network: Mutex<crate::offline::Gate>,
+    timeline: Recorder,
 }
 
 pub struct Engine {
@@ -400,6 +441,7 @@ impl Engine {
             reported: AtomicI32::new(DISCONNECTED),
             offline: AtomicBool::new(false),
             network: Mutex::new(crate::offline::Gate::default()),
+            timeline: Recorder::new(),
         });
         let (tx, rx) = mpsc::channel::<Command_>();
         let s = Arc::clone(&shared);
@@ -448,17 +490,32 @@ impl Engine {
         // the next 15 s check.
         let route_tx = tx.clone();
         let route_shared = Arc::clone(&shared);
-        let _ = std::thread::Builder::new().name("ac-cisco-routes".into()).stack_size(64 * 1024).spawn(move || {
-            let Some(watch) = crate::route_watch::RouteWatch::new() else { return };
-            loop {
-                if let crate::route_watch::Wake::Changed = watch.wait(Duration::from_secs(3600), Duration::from_millis(300), None) {
-                    route_shared.observe_network(&route_tx, None);
-                    if route_tx.send(Command_::Changed).is_err() {
-                        return;
+        let _ = std::thread::Builder::new()
+            .name("ac-cisco-routes".into())
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let Some(watch) = crate::route_watch::RouteWatch::new() else {
+                    return;
+                };
+                loop {
+                    if let crate::route_watch::Wake::Changed =
+                        watch.wait(Duration::from_secs(3600), Duration::from_millis(300), None)
+                    {
+                        route_shared.observe_network(&route_tx, None);
+                        if route_shared
+                            .enqueue(
+                                &route_tx,
+                                Command_::Changed,
+                                Operation::Tick,
+                                route_shared.current_intent(),
+                            )
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            });
         Engine { shared, tx }
     }
 
@@ -470,12 +527,13 @@ impl Engine {
             self.shared.stop_requested.store(false, Ordering::SeqCst);
             self.shared.set_owned(true);
             gate.start();
-            let intent = self
-                .shared
-                .cancel_generation
-                .fetch_add(1, Ordering::SeqCst)
-                .wrapping_add(1);
-            let _ = self.tx.send(Command_::Connect(intent));
+            let intent = self.shared.advance_intent();
+            let _ = self.shared.enqueue(
+                &self.tx,
+                Command_::Connect(intent),
+                Operation::ConnectRequest,
+                intent,
+            );
         }
         self.shared.observe_network(&self.tx, None);
     }
@@ -486,13 +544,14 @@ impl Engine {
             let mut gate = self.shared.network.lock().unwrap();
             gate.stop();
             self.shared.stop_requested.store(true, Ordering::SeqCst);
-            intent = self
-                .shared
-                .cancel_generation
-                .fetch_add(1, Ordering::SeqCst)
-                .wrapping_add(1);
+            intent = self.shared.advance_intent();
             self.shared.set_owned(false);
-            let _ = self.tx.send(Command_::Disconnect(intent));
+            let _ = self.shared.enqueue(
+                &self.tx,
+                Command_::Disconnect(intent),
+                Operation::DisconnectRequest,
+                intent,
+            );
         }
         (self.shared.hooks.log)("disconnect requested");
         if self.shared.is_current(intent) {
@@ -502,7 +561,12 @@ impl Engine {
 
     /// The background service restarted: send it the current kill switch again.
     pub fn rearm(&self) {
-        let _ = self.tx.send(Command_::Rearm);
+        let _ = self.shared.enqueue(
+            &self.tx,
+            Command_::Rearm,
+            Operation::Rearm,
+            self.shared.current_intent(),
+        );
     }
 
     /// Launch / panel open with the App's stored "owned" flag set: adopt a
@@ -512,9 +576,13 @@ impl Engine {
             let mut gate = self.shared.network.lock().unwrap();
             self.shared.managing.store(true, Ordering::SeqCst);
             gate.start();
-            let _ = self
-                .tx
-                .send(Command_::Refresh(self.shared.current_intent()));
+            let intent = self.shared.current_intent();
+            let _ = self.shared.enqueue(
+                &self.tx,
+                Command_::Refresh(intent),
+                Operation::Refresh,
+                intent,
+            );
         }
         self.shared.observe_network(&self.tx, None);
     }
@@ -522,7 +590,17 @@ impl Engine {
     /// A system path event (also used by the fake-CLI wiring harness).
     pub fn network_changed(&self) {
         self.shared.observe_network(&self.tx, None);
-        let _ = self.tx.send(Command_::Changed);
+        let _ = self.shared.enqueue(
+            &self.tx,
+            Command_::Changed,
+            Operation::Tick,
+            self.shared.current_intent(),
+        );
+    }
+
+    /// Sanitized memory-only diagnostics; never waits for the worker or runs CLI.
+    pub fn timeline_text(&self) -> String {
+        self.shared.timeline.text()
     }
 
     pub fn is_managing(&self) -> bool {
@@ -535,6 +613,43 @@ impl Engine {
 }
 
 impl Shared {
+    fn enqueue(
+        &self,
+        tx: &Sender<Command_>,
+        command: Command_,
+        operation: Operation,
+        intent: u32,
+    ) -> Result<(), ()> {
+        let id = self.timeline.queued(operation, intent);
+        tx.send(Command_::Traced {
+            id,
+            operation,
+            intent,
+            command: Box::new(command),
+        })
+        .map_err(|_| ())
+    }
+
+    fn advance_intent(&self) -> u32 {
+        let old = self.cancel_generation.fetch_add(1, Ordering::SeqCst);
+        if old != 0 {
+            let trace = self.timeline.begin(Operation::Intent, old);
+            trace.note(Phase::Cancel, Outcome::Cancelled);
+            trace.result(Outcome::Cancelled);
+        }
+        old.wrapping_add(1)
+    }
+
+    fn stage<T>(&self, operation: Operation, intent: u32, body: impl FnOnce() -> T) -> T {
+        let trace = self.timeline.begin(operation, intent);
+        let result = body();
+        if !self.permits_attempt(intent) {
+            trace.note(Phase::Cancel, Outcome::Cancelled);
+            trace.result(Outcome::Cancelled);
+        }
+        result
+    }
+
     /// Reuses routing events and one debounce deadline, independently of the
     /// worker which may be blocked inside Cisco's connect CLI.
     fn observe_network(self: &Arc<Self>, tx: &Sender<Command_>, deadline: Option<u64>) {
@@ -561,20 +676,28 @@ impl Shared {
                         });
                 }
                 crate::offline::Action::Cancel => {
-                    let intent = self
-                        .cancel_generation
-                        .fetch_add(1, Ordering::SeqCst)
-                        .wrapping_add(1);
-                    let _ = tx.send(Command_::Network {
-                        available: false,
+                    let intent = self.advance_intent();
+                    let _ = self.enqueue(
+                        tx,
+                        Command_::Network {
+                            available: false,
+                            intent,
+                        },
+                        Operation::Pause,
                         intent,
-                    });
+                    );
                 }
                 crate::offline::Action::Resume => {
-                    let _ = tx.send(Command_::Network {
-                        available: true,
-                        intent: self.current_intent(),
-                    });
+                    let intent = self.current_intent();
+                    let _ = self.enqueue(
+                        tx,
+                        Command_::Network {
+                            available: true,
+                            intent,
+                        },
+                        Operation::Resume,
+                        intent,
+                    );
                 }
             }
         }
@@ -609,8 +732,17 @@ impl Shared {
         timeout: Duration,
         on_line: &mut dyn FnMut(&str),
     ) -> RunResult {
+        let operation = match args {
+            ["state"] => Operation::State,
+            ["stats"] => Operation::Stats,
+            ["disconnect"] => Operation::Disconnect,
+            _ => Operation::Connect,
+        };
+        let trace = self.timeline.begin(operation, intent);
         let cancelled = || args != ["disconnect"] && !self.permits_attempt(intent);
         if cancelled() {
+            trace.note(Phase::Cancel, Outcome::Cancelled);
+            trace.result(Outcome::Cancelled);
             return RunResult {
                 status: -1,
                 output: String::new(),
@@ -621,14 +753,35 @@ impl Shared {
             // the cancellation predicate instead follows the login intent.
             if cancelled() {
                 unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                trace.note(Phase::Cancel, Outcome::Term);
             }
         };
         let mut current_line = |line: &str| {
+            trace.cli_line(line);
             if !cancelled() {
                 on_line(line);
             }
         };
-        let mut result = run_interruptible(
+        let termination = std::cell::Cell::new(Outcome::Completed);
+        let mut signal = |outcome| {
+            trace.note(
+                if outcome == Outcome::OutputClosed {
+                    Phase::OutputClosed
+                } else {
+                    Phase::Cancel
+                },
+                outcome,
+            );
+            match outcome {
+                Outcome::Kill => termination.set(outcome),
+                Outcome::Timeout if termination.get() != Outcome::Kill => termination.set(outcome),
+                Outcome::Term if termination.get() == Outcome::Completed => {
+                    termination.set(outcome)
+                }
+                _ => {}
+            }
+        };
+        let mut result = run_observed(
             &self.config.cli,
             args,
             input,
@@ -636,7 +789,20 @@ impl Shared {
             &mut on_start,
             &mut current_line,
             &cancelled,
+            &mut signal,
         );
+        for line in result.output.lines() {
+            trace.cli_line(line);
+        }
+        trace.result(if termination.get() != Outcome::Completed {
+            termination.get()
+        } else if cancelled() {
+            Outcome::Cancelled
+        } else if result.status == 0 {
+            Outcome::Success
+        } else {
+            Outcome::Failed
+        });
         if cancelled() {
             result.status = -1;
             result.output.clear();
@@ -699,6 +865,21 @@ impl Shared {
 
     fn command(&self, st: &mut State, cmd: Command_) {
         match cmd {
+            Command_::Traced {
+                id,
+                intent,
+                operation,
+                command,
+            } => {
+                let trace = self.timeline.start(id, operation, intent);
+                if !self.is_current(intent) {
+                    trace.note(Phase::Cancel, Outcome::Cancelled);
+                }
+                self.command(st, *command);
+                if !self.is_current(intent) {
+                    trace.result(Outcome::Cancelled);
+                }
+            }
             Command_::Connect(intent) => {
                 if !self.is_current(intent) || self.stop_requested.load(Ordering::SeqCst) {
                     return;
@@ -819,7 +1000,18 @@ impl Shared {
         if !st.wanted || !self.permits_attempt(intent) {
             return;
         }
-        let credentials = (self.hooks.credentials)();
+        let credentials = {
+            let trace = self.timeline.begin(Operation::Credentials, intent);
+            let result = (self.hooks.credentials)();
+            trace.result(if !self.permits_attempt(intent) {
+                Outcome::Cancelled
+            } else if result.is_some() {
+                Outcome::Success
+            } else {
+                Outcome::Failed
+            });
+            result
+        };
         if !self.permits_attempt(intent) {
             return;
         }
@@ -827,7 +1019,7 @@ impl Shared {
             self.report(DISCONNECTED, "未设置凭据");
             return;
         };
-        (self.hooks.before_login)();
+        self.stage(Operation::GuiWait, intent, || (self.hooks.before_login)());
         // Credentials / quitting the Cisco window can block. A stop during
         // either operation must not start a new CLI login afterwards.
         if !self.permits_attempt(intent) {
@@ -976,6 +1168,12 @@ impl Shared {
     /// several, and Cisco may pick another or a backup, §21.10), and the
     /// ones already let through.
     fn gateway_addresses(&self, st: &State, server: Option<String>) -> Vec<String> {
+        self.stage(Operation::GatewayResolution, st.intent, || {
+            self.gateway_addresses_inner(st, server)
+        })
+    }
+
+    fn gateway_addresses_inner(&self, st: &State, server: Option<String>) -> Vec<String> {
         let mut gateways: Vec<String> = server.into_iter().collect();
         let mut hosts: Vec<String> = (self.hooks.profile_hosts)().iter().map(|h| host_part(h)).collect();
         hosts.sort();
@@ -1027,6 +1225,10 @@ impl Shared {
     }
 
     fn tick(&self, st: &mut State) {
+        self.stage(Operation::Tick, st.intent, || self.tick_inner(st));
+    }
+
+    fn tick_inner(&self, st: &mut State) {
         // A disconnect the user asked for may be waiting behind this
         // check: a "Disconnected" now is that, not a drop to block and
         // retry (2026-11-06: switching to the own connection disconnects
@@ -1039,6 +1241,7 @@ impl Shared {
         if !self.permits_attempt(st.intent) {
             return;
         }
+        self.timeline.observe_state(st.intent, state.as_deref());
         match state.as_deref() {
             Some("Connected") => {
                 let tun = default_route_tunnel().unwrap_or_else(|| st.tunnel_if.clone());
@@ -1071,8 +1274,6 @@ impl Shared {
             _ => {}
         }
     }
-
-
 }
 
 #[cfg(test)]

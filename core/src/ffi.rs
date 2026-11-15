@@ -1282,6 +1282,17 @@ pub extern "C" fn ac_cisco_episode_retries(e: *const cisco::Engine) -> u32 {
     unsafe { e.as_ref() }.map_or(0, |e| e.episode_retries())
 }
 
+/// Sanitized, bounded memory-only timeline; free with ac_string_free.
+/// Does not enqueue work or wait for a Cisco CLI operation to finish.
+#[no_mangle]
+pub extern "C" fn ac_cisco_timeline(e: *const cisco::Engine) -> *mut c_char {
+    let text = unsafe { e.as_ref() }.map_or_else(
+        || "Cisco 引擎尚未启动\n".to_string(),
+        cisco::Engine::timeline_text,
+    );
+    CString::new(text).unwrap().into_raw()
+}
+
 /// Runs the Cisco CLI once (`args` newline-separated); the output (free
 /// with ac_string_free), the exit status in `*status`.
 #[no_mangle]

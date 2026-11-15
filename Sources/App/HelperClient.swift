@@ -1700,6 +1700,17 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         return "\(record.recoveredAt.timeIntervalSince1970) \(record.sleepDropCount) \(record.outcomeLabel) \(record.retries ?? 0)"
     }
 
+    /// Fetch only when exporting; keep the timeline out of recurring snapshots.
+    func ciscoTimelineForDiagnostics(_ completion: @escaping (String) -> Void) {
+        if AppRole.isSettings {
+            SettingsLink.shared.send("ciscoTimeline") { result in
+                completion(result ?? "未收到菜单栏 App 的时间线回复\n")
+            }
+            return
+        }
+        completion(ciscoEngine?.timelineText ?? "Cisco 引擎不可用\n")
+    }
+
     /// What the settings process shows, as JSON.
     func remoteSnapshot() -> String {
         var json: [String: Any] = [

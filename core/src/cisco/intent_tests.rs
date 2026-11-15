@@ -36,6 +36,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_cli(None)
+    }
+    fn with_cli(cli_override: Option<&str>) -> Self {
         let dir = Scratch::new();
         let cli = dir.0.join("vpn");
         std::fs::write(
@@ -63,7 +66,9 @@ esac
         let (done_tx, done) = mpsc::channel();
         let engine = Engine::new(
             Config {
-                cli: cli.to_string_lossy().into(),
+                cli: cli_override
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| cli.to_string_lossy().into()),
                 approval_timeout_minimum: Duration::from_secs(20),
                 monitor: MONITOR,
             },
@@ -244,3 +249,66 @@ fn production_threshold_uses_response_time_not_reaping_time() {
         threshold
     ));
 }
+
+#[test]
+fn diagnostics_ffi_remains_readable_during_blocked_preparation() {
+    let f = Fixture::new();
+    f.start();
+    let started = Instant::now();
+    let raw = crate::ffi::ac_cisco_timeline(&f.engine);
+    assert!(!raw.is_null());
+    let during = unsafe { std::ffi::CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
+    crate::ffi::ac_string_free(raw);
+    let elapsed = started.elapsed();
+    f.engine.disconnect();
+    let cancelled = f.engine.timeline_text();
+    f.release.send(()).unwrap();
+    f.done.recv_timeout(Duration::from_secs(10)).unwrap();
+    f.barrier();
+    f.finish();
+    assert!(elapsed < Duration::from_secs(1));
+    assert!(during.contains("credentials End"));
+    assert!(during.contains("gui-wait Start"));
+    assert!(!during.contains("gui-wait End"));
+    assert!(cancelled.contains("Cancel Cancelled"));
+    assert!(!during.contains("VPN-A"));
+}
+
+#[test]
+fn observed_cli_reports_timeout_term_kill_and_closed_output_without_secrets() {
+    // Use the trusted shell directly: launching a newly-written executable
+    // can be delayed by platform checks before its TERM trap is installed.
+    let f = Fixture::with_cli(Some("/bin/sh"));
+    let script = r#"trap '' TERM
+printf '>> state: Connected\n'
+printf '>> error: vpn.private.example account-secret 198.51.100.88 suspended longer than the allotted time limit requires re-authentication\n'
+exec 1>&- 2>&-
+while :; do sleep 0.05; done
+"#;
+    let result = f.engine.shared.cli(
+        0,
+        &["-c", script],
+        None,
+        Duration::from_millis(500),
+        &mut |_| {},
+    );
+    let text = f.engine.timeline_text();
+    f.finish();
+    assert_ne!(result.status, 0);
+    for outcome in ["Timeout", "Term", "Kill", "OutputClosed"] {
+        assert!(text.contains(outcome), "{outcome}: {text}");
+    }
+    assert!(text.contains("SuspendedSessionTimeout"));
+    assert!(text.contains("state=Connected"));
+    for secret in [
+        "vpn.private.example",
+        "account-secret",
+        "198.51.100.88",
+        "allotted time limit",
+    ] {
+        assert!(!text.contains(secret));
+    }
+}
+
