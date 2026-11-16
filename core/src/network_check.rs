@@ -110,6 +110,44 @@ fn routes_match(output: &str, expected: &Expected) -> bool {
     })
 }
 
+/// Confirm the small, unconditional Apple wildcard/direct call chain. Unknown
+/// filter rules and populated sibling anchors are conservatively unconfirmed.
+fn anchor_call(text: &str) -> Option<String> {
+    let lines:Vec<_>=text.lines().map(str::trim).filter(|s|!s.is_empty()&&!s.starts_with('#')&&!s.starts_with("scrub-anchor ")).collect();
+    if lines.len()!=1 {return None;}
+    let words:Vec<_>=lines[0].split_whitespace().collect();
+    if words.len()!=3 || words[0]!="anchor" || words[2]!="all" {return None;}
+    let name=words[1].strip_prefix('"')?.strip_suffix('"')?;
+    Some(name.into())
+}
+fn anchor_chain(get: &mut impl FnMut(&str,&[&str])->Output) -> bool {
+    let main=get("/sbin/pfctl",&["-s","rules"]); if !main.ok {return false;}
+    match anchor_call(&main.text).as_deref() {
+        Some(crate::pf::ANCHOR)=>true,
+        Some("com.apple/*")=>apple_children(get),
+        Some("com.apple")=>{
+            let parent=get("/sbin/pfctl",&["-a","com.apple","-s","rules"]);if !parent.ok{return false;}
+            match anchor_call(&parent.text).as_deref() {
+                Some("300.AlwaysConnect")|Some(crate::pf::ANCHOR)=>true,
+                Some("*")=>apple_children(get),_=>false,
+            }
+        },_=>false,
+    }
+}
+fn apple_children(get: &mut impl FnMut(&str,&[&str])->Output) -> bool {
+    let names=get("/sbin/pfctl",&["-a","com.apple","-s","Anchors"]);if !names.ok{return false;}
+    let mut target=false;
+    for name in names.text.lines().map(str::trim).filter(|s|!s.is_empty()) {
+        let name=name.trim_matches('"').strip_prefix("com.apple/").unwrap_or(name.trim_matches('"'));
+        if name=="300.AlwaysConnect" {target=true;continue;}
+        if name.contains('/') || !name.bytes().all(|c|c.is_ascii_alphanumeric()||b"._-".contains(&c)) {return false;}
+        let anchor=format!("com.apple/{name}");
+        let other=get("/sbin/pfctl",&["-a",&anchor,"-s","rules"]);
+        if !other.ok || !other.text.trim().is_empty() {return false;}
+    }
+    target
+}
+
 /// `exec` is injected in tests. Missing output, permission errors and deadlines
 /// are failed observations, never inferred success from the engine's memory.
 pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Output) -> Vec<Item> {
@@ -137,12 +175,16 @@ pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Ou
     result.push(item("网关经当前物理口直连", gateway_ok, "核对实际网关路由"));
     let pf = get("/sbin/pfctl", &["-a", crate::pf::ANCHOR, "-s", "rules"]);
     let info = get("/sbin/pfctl", &["-s", "info"]);
+    let enabled=info.ok&&info.text.contains("Status: Enabled");
+    let reachable=if expected.protection {anchor_chain(&mut get)} else {false};
+    let configured=pf.ok&&expected.rules.as_ref().is_some_and(|r|rules_match(&pf.text,r));
+    let effective=enabled&&reachable&&configured;
     if expected.protection {
-        result.push(item("实际防火墙配置与当前策略一致", pf.ok && expected.rules.as_ref().is_some_and(|r| rules_match(&pf.text, r)) && expected.error.is_none(), "完整核对实际规则；多放行、旧网卡、旧 DNS 和系统操作失败都不能通过"));
-        result.push(item("pf 已开启", info.ok && info.text.contains("Status: Enabled"), "读取系统实际过滤状态"));
-        let ipv6_ok = pf.ok && pf.text.lines().last().is_some_and(|l| l.trim().starts_with("block drop out quick"))
-            && pf.text.contains("inet proto udp") && !pf.text.contains(&format!("on {} all", expected.physical))
-            && expected.rules.as_ref().is_some_and(|r| rules_match(&pf.text, r));
+        result.push(item("实际防火墙配置与当前策略一致", effective && expected.error.is_none(), "完整核对实际规则；多放行、旧网卡、旧 DNS 和系统操作失败都不能通过"));
+        result.push(item("pf 已开启", enabled, "读取系统实际过滤状态"));
+        result.push(item("断线保护规则调用链已确认", reachable, "核对主/父锚点实际调用；额外过滤规则或未知分支显示未确认"));
+        let ipv6_ok=effective && pf.text.lines().last().is_some_and(|l|l.trim().starts_with("block drop out quick"))
+            && pf.text.contains("inet proto udp")&&!pf.text.contains(&format!("on {} all",expected.physical));
         result.push(item("物理公网 IPv6 受保护", ipv6_ok, "默认封堵包含 IPv6；DHCP 限 IPv4，链路本地发现保留；显式地址例外另计"));
         // The pre-existing broad tunnel allowance is visible, never a green
         // assertion that only this VPN can carry protected traffic.
@@ -190,11 +232,14 @@ pub(crate) fn read_command(path: &str, args: &[String], limit: Duration) -> Outp
 mod tests {
     use super::*;
     fn expected() -> Expected {
-        let rules = crate::pf::generate(&crate::pf::PfInput { tunnel_if:"utun5".into(), physical_if:"en0".into(), gateway_ips:vec!["203.0.113.1".into()], allow_networks:vec!["192.168.0.0/16".into()], allow_direct_egress:false, allow_dns:false, dns_servers:vec!["192.168.1.1".into()],direct_table:true,strict_dns:false }).unwrap();
+        let rules = crate::pf::generate(&crate::pf::PfInput { tunnel_if:"utun5".into(), physical_if:"en0".into(), gateway_ips:vec!["203.0.113.1".into()], allow_networks:vec!["192.168.0.0/16".into()], allow_direct_egress:false, allow_dns:false, dns_servers:vec!["192.168.1.1".into()],direct_table:true,strict_dns:false,block_direct:false }).unwrap();
         Expected { tunnel:Some("utun5".into()),dns_interface:Some("utun5".into()),physical:"en0".into(),gateway:Some("192.168.1.1".into()),vpn_gateways:vec!["203.0.113.1".into()],dns:vec!["10.1.1.1".into()],split:true,protection:true,rules:Some(rules),direct:vec!["198.51.100.9".into()],routes:vec!["198.51.100.9".into()],error:None,epoch:1 }
     }
     fn fixture(e:&Expected, path:&str,args:&[String]) -> Output {
-        let text = if path.ends_with("route") { if args.last().map(String::as_str)==Some("203.0.113.1") { "interface: en0" } else { "interface: utun5" }.into() }
+        let text = if args==["-s","rules"] {"anchor \"com.apple/*\" all".into()}
+        else if args==["-a","com.apple","-s","Anchors"] {"300.AlwaysConnect".into()}
+        else if args==["-a","com.apple","-s","rules"] {String::new()}
+        else if path.ends_with("route") { if args.last().map(String::as_str)==Some("203.0.113.1") { "interface: en0" } else { "interface: utun5" }.into() }
         else if args.last().map(String::as_str)==Some("--dns") { "resolver #1\\n  nameserver[0] : 127.0.0.1\\nresolver #2\\n  nameserver[0] : 192.168.1.1".replace("\\n","\n") }
         else if args.last().map(String::as_str)==Some("rules") { e.rules.clone().unwrap() }
         else if args.last().map(String::as_str)==Some("info") { "Status: Enabled".into() }
@@ -202,6 +247,25 @@ mod tests {
         else { "Destination Gateway Flags Netif Expire\n198.51.100.9 192.168.1.1 UGHS en0".into() };
         Output{ok:true,text}
     }
+    #[test]
+    fn missing_parent_disabled_pf_or_earlier_pass_cannot_report_protection() {
+        let e=expected();
+        for main in ["","pass out quick all\nanchor \"com.apple/*\" all","anchor \"com.apple/*\" all\npass out quick all"] {
+            let rows=run_with(&e,|p,a|if a==["-s","rules"] {Output{ok:true,text:main.into()}}else{fixture(&e,p,a)});
+            for label in ["实际防火墙配置与当前策略一致","物理公网 IPv6 受保护"] {assert!(!rows.iter().find(|i|i.item==label).unwrap().passed);}
+        }
+        let rows=run_with(&e,|p,a|if a==["-s","info"] {Output{ok:true,text:"Status: Disabled".into()}}else{fixture(&e,p,a)});
+        assert!(!rows.iter().find(|i|i.item=="物理公网 IPv6 受保护").unwrap().passed);
+        let rows=run_with(&e,|p,a| {
+            if a==["-a","com.apple","-s","Anchors"] {Output{ok:true,text:"100.Other\n300.AlwaysConnect".into()}}
+            else if a==["-a","com.apple/100.Other","-s","rules"] {Output{ok:true,text:"pass out quick all".into()}}
+            else{fixture(&e,p,a)}
+        });
+        assert!(!rows.iter().find(|i|i.item=="物理公网 IPv6 受保护").unwrap().passed);
+        let direct=run_with(&e,|p,a|if a==["-s","rules"] {Output{ok:true,text:format!("anchor \"{}\" all",crate::pf::ANCHOR)}}else{fixture(&e,p,a)});
+        assert!(direct.iter().find(|i|i.item=="物理公网 IPv6 受保护").unwrap().passed);
+    }
+
     #[test]
     fn loaded_config_not_cached_intent_determines_the_verdict() {
         let e=expected(); let good=run_with(&e,|p,a|fixture(&e,p,a));

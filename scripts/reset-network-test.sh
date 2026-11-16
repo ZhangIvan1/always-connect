@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 s=Path(sys.argv[1]).read_text(); start=s.index('scope_interface_identity() {'); reader=s.index('restore_scoped_routes_from_journal() {'); end=s.index('\n}',reader)+2
 native=s.index('native_route_entry() {'); native_end=s.index('\n}',native)+2
-retire=s.index('retire_direct_routes() {'); retire_end=s.index('\n}',retire)+2
+retire=s.index('direct_route_table() {'); retire_fn=s.index('retire_direct_routes() {'); retire_end=s.index('\n}',retire_fn)+2
 Path(sys.argv[2]).write_text(s[native:native_end]+'\n'+s[retire:retire_end]+'\n'+s[start:end]+'\n')
 PY
 source "$WORK/reader.sh"
@@ -40,6 +40,9 @@ printf 'AC_BOOT=boot-1\nAC_SCOPED_TUN="utun5;evil"\nAC_SCOPED_INDEX=107\nAC_SCOP
 restore_scoped_routes_from_journal "$WORK/journal" boot-1
 [ ! -s "$WORK/calls" ]
 # Unknown facts and actual delete errors preserve only unfinished entries.
+direct_route_table() {
+ printf 'Destination Gateway Flags Netif Expire\n203.0.113.9 192.168.1.1 UGHS en0\n203.0.113.10 192.168.1.1 UGHS en0\n'
+}
 DRY=0
 say() { :; }
 run() {
@@ -62,5 +65,39 @@ retire_direct_routes "$WORK/direct" boot-1 1 ''
 printf 'boot previous-boot\n203.0.113.9 192.168.1.1\n' > "$WORK/direct"
 retire_direct_routes "$WORK/direct" boot-1 1 ''
 [ ! -e "$WORK/direct" ] && [ ! -s "$WORK/direct-calls" ]
+: > "$WORK/direct-calls"
+printf 'boot boot-1\nretire 203.0.113.9 192.168.1.1\n' > "$WORK/direct"
+if retire_direct_routes "$WORK/direct" boot-1 1 '';then echo 'unconfirmed intent was replayed';exit 1;fi
+[ ! -s "$WORK/direct-calls" ] && grep -q '^retire 203.0.113.9' "$WORK/direct"
+direct_route_table() { printf 'Destination Gateway Flags Netif Expire\nunreadable-row\n'; }
+if retire_direct_routes "$WORK/direct" boot-1 1 '';then echo 'unknown table was treated as absent';exit 1;fi
+[ ! -s "$WORK/direct-calls" ] && grep -q '^retire 203.0.113.9' "$WORK/direct"
+direct_route_table() { printf 'Destination Gateway Flags Netif Expire\n'; }
+retire_direct_routes "$WORK/direct" boot-1 1 ''
+[ ! -e "$WORK/direct" ]
+# Fail the final metadata write after one deletion completed and one failed.
+# The durable intent must prevent another deletion after a process restart.
+writer_definition=$(declare -f write_direct_journal)
+eval "${writer_definition/write_direct_journal/real_write_direct_journal}"
+JOURNAL_WRITES=0
+write_direct_journal() {
+  JOURNAL_WRITES=$((JOURNAL_WRITES+1))
+  [ "$JOURNAL_WRITES" -eq 1 ] || return 1
+  real_write_direct_journal "$@"
+}
+direct_route_table() {
+ printf 'Destination Gateway Flags Netif Expire\n203.0.113.9 192.168.1.1 UGHS en0\n203.0.113.10 192.168.1.1 UGHS en0\n'
+}
+: > "$WORK/direct-calls"
+printf 'boot boot-1\n203.0.113.9 192.168.1.1\n203.0.113.10 192.168.1.1\n' > "$WORK/direct"
+if FAILED_TARGET=203.0.113.10 retire_direct_routes "$WORK/direct" boot-1 1 '';then echo 'metadata failure reported success';exit 1;fi
+[ "$(wc -l < "$WORK/direct-calls" | tr -d ' ')" = 2 ]
+grep -q '^retire 203.0.113.9' "$WORK/direct"
+eval "$writer_definition"
+if retire_direct_routes "$WORK/direct" boot-1 1 '';then echo 'interrupted deletion was replayed';exit 1;fi
+[ "$(wc -l < "$WORK/direct-calls" | tr -d ' ')" = 2 ]
+direct_route_table() { printf 'Destination Gateway Flags Netif Expire\n'; }
+retire_direct_routes "$WORK/direct" boot-1 1 ''
+[ ! -e "$WORK/direct" ]
 bash -n "$ROOT/scripts/reset-network.sh"
 echo 'PASS emergency scoped-route recovery, boot/interface ownership and invalid journal rejection (stubbed)'

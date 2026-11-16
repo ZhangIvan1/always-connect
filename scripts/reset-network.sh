@@ -67,41 +67,67 @@ native_route_entry() {
     }'
 }
 
-# Retire confirmed entries, preserving unknown/failed entries atomically.
+direct_route_table() { /usr/sbin/netstat -rn -f inet; }
+# 0 = matching owned signature; 1 = absent/foreign; 2 = unknown.
+direct_route_owner() {
+    table=$(direct_route_table 2>/dev/null) || return 2
+    printf '%s\n' "$table" | /usr/bin/awk -v entry="$1" -v gateway="$2" '
+      function network(v, a,o,n,b,i,ip,size,lo) {
+        if(v=="default") return ""
+        n=split(v,a,"/");i=split(a[1],o,".");if(n>2 || i>4)return "";b=n==2?a[2]:i*8
+        while(i<4)o[++i]=0
+        for(i=1;i<=4;i++)if(o[i] !~ /^[0-9]+$/ || o[i]>255)return ""
+        if(b !~ /^[0-9]+$/ || b>32)return ""
+        ip=((o[1]*256+o[2])*256+o[3])*256+o[4];size=2^(32-b);lo=int(ip/size)*size
+        return sprintf("%.0f %.0f",lo,lo+size-1)
+      }
+      BEGIN{wanted=network(entry)}
+      /^Destination/ && /Netif/ {header=1;next}
+      header && NF {
+        if(NF<4){bad=1;next} if($1=="default")next
+        range=network($1);if(range==""){bad=1;next}
+        if(index($3,"I")==0 && range==wanted){count++;same=($2==gateway)}
+      }
+      END {if(!header || bad || wanted=="" || count>1)exit 2; if(count==1 && same)exit 0;exit 1}'
+}
+write_direct_journal() {
+    temporary=$(/usr/bin/mktemp "$1.pending.XXXXXXXX") || return 1
+    if ! { printf 'boot %s\n%s' "$2" "$3" > "$temporary" && /bin/mv -f "$temporary" "$1"; }; then
+        /bin/rm -f "$temporary";return 1
+    fi
+}
+# Consume delete authority before mutating a route. Interrupted intent records
+# are only read back, never used as another delete authorisation.
 retire_direct_routes() {
     journal=$1; current_boot=$2; known=$3; own=$4
     [ -f "$journal" ] || return 0
     [ -n "$current_boot" ] || return 1
     IFS=' ' read -r marker saved_boot extra < "$journal" || return 1
-    if [ "$marker" != boot ] || [ -z "$saved_boot" ] || [ "$saved_boot" != "$current_boot" ]; then
-        run /bin/rm -f "$journal"
-        return $?
-    fi
-    pending=""; retired=0
-    while read -r ip gw extra; do
-        [ "$ip" = boot ] && continue
-        [ -n "$ip" ] || continue
-        if [ "$known" != 1 ]; then
-            pending="$pending$ip $gw
-"
-            continue
-        fi
-        if native_route_entry "$ip" "$known" "$own"; then retired=$((retired+1)); continue; fi
-        if case "$ip" in
-            */*) run /sbin/route -n delete -net "$ip";;
-            *) run /sbin/route -n delete -host "$ip";;
-        esac; then retired=$((retired+1))
-        else pending="$pending$ip $gw
-"; fi
-    done < "$journal"
+    if [ "$marker" != boot ] || [ -z "$saved_boot" ] || [ "$saved_boot" != "$current_boot" ]; then run /bin/rm -f "$journal";return $?;fi
+    original=$(/bin/cat "$journal") || return 1
+    intents=$(printf '%s\n' "$original" | /usr/bin/awk '$1=="boot"{next} $1=="retire"||$1=="install"{print;next} NF>=2{print "retire " $0}')
+    [ "$DRY" = 1 ] || write_direct_journal "$journal" "$saved_boot" "$intents" || return 1
+    pending="";retired=0
+    while read -r first second third; do
+        [ "$first" = boot ] && continue
+        [ -n "$first" ] || continue
+        kind=active;ip=$first;gw=$second
+        case "$first" in retire|install)kind=$first;ip=$second;gw=$third;;esac
+        line="$ip $gw";[ "$kind" = active ] || line="$kind $line"
+        if [ "$known" != 1 ];then pending="$pending$line
+";continue;fi
+        if native_route_entry "$ip" "$known" "$own";then retired=$((retired+1));continue;fi
+        if direct_route_owner "$ip" "$gw";then owner=0;else owner=$?;fi
+        if [ "$owner" = 1 ];then retired=$((retired+1));continue;fi
+        if [ "$kind" != active ] || [ "$owner" = 2 ];then pending="$pending$line
+";continue;fi
+        if case "$ip" in */*)run /sbin/route -n delete -net "$ip";;*)run /sbin/route -n delete -host "$ip";;esac;then retired=$((retired+1))
+        else pending="$pending$line
+";fi
+    done <<< "$original"
     say "retired $retired direct journal entries"
-    if [ -z "$pending" ]; then run /bin/rm -f "$journal"; return $?; fi
-    if [ "$DRY" != 1 ]; then
-        temporary=$(/usr/bin/mktemp "$journal.pending.XXXXXXXX") || return 1
-        if ! { printf 'boot %s\n%s' "$saved_boot" "$pending" > "$temporary" && /bin/mv -f "$temporary" "$journal"; }; then
-            /bin/rm -f "$temporary"; return 1
-        fi
-    fi
+    if [ -z "$pending" ];then run /bin/rm -f "$journal";return $?;fi
+    [ "$DRY" = 1 ] || write_direct_journal "$journal" "$saved_boot" "$pending" || return 1
     say "direct route cleanup pending; keep its journal for retry"
     return 1
 }

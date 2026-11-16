@@ -38,7 +38,9 @@ OUT=$(printf 'pw\n' | "$HELPER" run-once --server https://gw.invalid --user u --
   && grep -q fakecookie42 /tmp/ac-drop/session.json && pass drop-episode || { fail drop-episode; echo "$OUT" | grep -E "^(STATE|TERMINAL)"; }
 # 2b an internal reconnect is reported as reconnecting, then connected (§28.1)
 rm -rf /tmp/ac-irc; OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$REPO/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1)
-echo "$OUT" | grep -E "^STATE" | grep -A1 "隧道断了，正在重连" | grep -q "^STATE connected tunnel up" \
+echo "$OUT" | awk '/^STATE reconnecting 隧道断了，正在重连/ { waiting=1; next }
+  waiting && /^STATE connected tunnel up/ { recovered=1; exit }
+  END { exit !recovered }' \
   && echo "$OUT" | grep -q "^STATE reconnecting 隧道断了，正在重连" && pass internal-reconnect \
   || { fail internal-reconnect; echo "$OUT" | grep -E "^(STATE|TERMINAL)"; }
 # 3 pf

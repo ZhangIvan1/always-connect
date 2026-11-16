@@ -58,6 +58,8 @@ pub struct Inputs {
     pub direct_table: bool,
     #[serde(rename = "strictDNS", default)]
     pub strict_dns: bool,
+    #[serde(default)]
+    pub block_direct: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -113,6 +115,7 @@ pub fn text(connected: bool, i: &Inputs) -> Option<String> {
         dns_servers: clean(&i.local_dns_servers),
         direct_table: i.direct_table,
         strict_dns: i.strict_dns,
+        block_direct: i.block_direct,
     })
     .ok()
 }
@@ -284,28 +287,28 @@ impl Guard {
         if Self::is_stale(&s, holder) {
             return None;
         }
-        let Some(anchor) = text(connected, inputs) else { return Some("pf 兜底未生效：规则生成被拒".into()) };
-        if s.pf.load(&anchor).is_err() {
-            return Some("pf 兜底未生效，断线时无法封网".into());
+        let Some(anchor)=text(connected,inputs) else {return Some("pf 兜底未生效：规则生成被拒".into())};
+        if inputs.direct_table && !inputs.block_direct {
+            let mut base=inputs.clone();base.block_direct=true;
+            let staged=s.record.as_ref().is_some_and(|r|r.holder==holder&&r.connected==connected&&r.inputs==base);
+            if !staged {
+                let Some(base_text)=text(connected,&base) else {return Some("基础保护规则被拒".into())};
+                if s.pf.load(&base_text).is_err(){return Some("基础断线保护未能装载".into());}
+                self.record_applied(&mut s,holder,connected,&base);
+            }
+            let all:Vec<_>=s.direct.iter().cloned().collect();
+            let op=if all.is_empty(){"flush"}else{"replace"};
+            if s.pf.table(op,&all).is_err(){return Some("基础保护保持，直连表尚未就绪".into());}
         }
-        let direct: Vec<String> = s.direct.iter().cloned().collect();
-        s.record = Some(Record {
-            boot_session: self.settings.boot.clone().unwrap_or_default(),
-            token: s.pf.token.clone(),
-            holder: holder.to_string(),
-            connected,
-            inputs: inputs.clone(),
-            direct: Some(direct),
-        });
-        // A rules load empties the declared table: put it back.
-        if inputs.direct_table {
-            Self::reload_direct(&s);
-        }
-        self.persist(&s);
-        if !s.owner_present {
-            self.start_grace(&mut s);
-        }
+        if s.pf.load(&anchor).is_err(){return Some("pf 兜底未生效，断线时无法封网".into());}
+        self.record_applied(&mut s,holder,connected,inputs);
         None
+    }
+
+    fn record_applied(self: &Arc<Self>, s: &mut State, holder: &str, connected: bool, inputs: &Inputs) {
+        s.record=Some(Record {boot_session:self.settings.boot.clone().unwrap_or_default(),token:s.pf.token.clone(),holder:holder.into(),connected,inputs:inputs.clone(),direct:Some(s.direct.iter().cloned().collect())});
+        self.persist(s);
+        if !s.owner_present {self.start_grace(s);}
     }
 
     /// Let go of `holder`'s set; None = whatever is held. A stale or
@@ -515,7 +518,10 @@ impl Guard {
         }
         s.direct = saved.direct.clone().unwrap_or_default().into_iter().collect();
         // No owner yet and the tunnel's fate unknown: fail closed.
-        if saved.connected {
+        if saved.connected || saved.inputs.direct_table {
+            // A restarted daemon has not reconciled the old session's route
+            // ownership or DNS policy. Keep base protection without bypasses.
+            if saved.inputs.direct_table { saved.inputs.block_direct=true; }
             if let Some(anchor) = text(false, &saved.inputs) {
                 let _ = s.pf.load(&anchor);
                 saved.connected = false;
@@ -642,7 +648,7 @@ mod tests {
         let guard = Arc::new(Guard::new(Settings { support_dir: dir.clone(), boot: Some("B1".into()),
             grace: Duration::from_secs(120), pfctl: Some(tool.to_string_lossy().into()) }));
         let inputs = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["198.51.100.1".into()],
-            physical_if: "en0".into(), allow_networks: vec![], allow_dns: false, local_dns_servers: vec![], direct_table: true, strict_dns: false };
+            physical_if: "en0".into(), allow_networks: vec![], allow_dns: false, local_dns_servers: vec![], direct_table: true, strict_dns: false, block_direct: false };
         let holder = guard.new_own_holder();
         assert!(guard.apply(&holder, false, &inputs).is_none());
         assert!(guard.add_direct(&["203.0.113.9".into()]));
@@ -657,6 +663,24 @@ mod tests {
         assert!(guard.remove_direct(&["203.0.113.9".into()]));
         assert!(guard.direct_addresses().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn service_restart_keeps_base_protection_without_replaying_dynamic_bypasses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir=std::env::temp_dir().join(format!("ac-guard-restart-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();let tool=dir.join("pfctl-stub");
+        std::fs::write(&tool,"#!/bin/sh\nif [ \"$1\" = -E ];then echo 'Token : 123' >&2;fi\ncat >/dev/null\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let settings=||Settings{support_dir:dir.clone(),boot:Some("B1".into()),grace:Duration::from_secs(120),pfctl:Some(tool.to_string_lossy().into())};
+        let guard=Arc::new(Guard::new(settings()));guard.owner_attached();let holder=guard.new_own_holder();
+        let inputs=Inputs{tunnel_if:"utun5".into(),gateway_ips:vec!["198.51.100.1".into()],physical_if:"en0".into(),allow_networks:vec![],allow_dns:false,local_dns_servers:vec![],direct_table:true,strict_dns:true,block_direct:false};
+        assert!(guard.apply(&holder,false,&inputs).is_none());assert!(guard.add_direct(&["203.0.113.9".into()]));
+        let recovered=Arc::new(Guard::new(settings()));recovered.adopt_at_start();recovered.owner_attached();
+        assert!(recovered.is_holding());assert!(recovered.held().unwrap().1.block_direct);
+        assert!(!recovered.expected_rules().unwrap().contains("pass out quick to <ac_direct>"));
+        assert_eq!(recovered.direct_addresses(),vec!["203.0.113.9"]);
+        recovered.release(None,reason::USER);std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

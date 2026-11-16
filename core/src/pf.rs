@@ -86,6 +86,8 @@ pub struct PfInput {
     pub direct_table: bool,
     /// Restrict physical DNS to the root forwarder/bootstrap resolver.
     pub strict_dns: bool,
+    /// Declare the table but keep its optional bypass inactive.
+    pub block_direct: bool,
 }
 
 /// The direct-address table's name (Sources/Helper/NetworkGuard.swift).
@@ -255,7 +257,7 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
             out.push_str(&format!("pass out quick proto {{ udp tcp }} to {ip} port 53 no state\n"));
         }
     }
-    if input.direct_table {
+    if input.direct_table && !input.block_direct {
         out.push_str(&format!("pass out quick to <{DIRECT_TABLE}> no state\n"));
     }
     if input.allow_dns {
@@ -337,6 +339,7 @@ mod tests {
             dns_servers: vec![],
             direct_table: false,
             strict_dns: false,
+            block_direct: false,
         }
     }
 
@@ -436,6 +439,7 @@ pass out quick on en0 all\n";
             dns_servers: vec!["192.168.1.1".to_string(), "192.168.1.1".to_string(), "fd00::1".to_string()],
             direct_table: true,
             strict_dns: false,
+            block_direct: false,
             ..secure_input()
         };
         let text = generate(&input).unwrap();

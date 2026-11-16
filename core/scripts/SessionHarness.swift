@@ -415,14 +415,16 @@ struct SessionHarness {
             check(tableOps().last == "-a com.apple/300.AlwaysConnect -t ac_direct -T delete 203.0.113.20",
                   "pf table delete issued")
             check(NetworkGuard.shared.directAddresses == ["2001:db8::5"], "table contents tracked")
-            // A rules reload (new DNS servers) empties the table in pf: re-added.
+            // Reload with bypasses inactive, replace the complete persistent
+            // table, then enable bypasses. Never grant a partial old table.
             var moved = inputs
             moved.localDNSServers = ["10.0.0.1"]
             check(NetworkGuard.shared.apply(holder: holder, connected: false, inputs: moved) == nil, "reloaded")
             let log = pfLog()
             let lastLoad = log.lastIndex { $0.contains(" -f ") } ?? -1
-            let readd = log.lastIndex { $0 == "-a com.apple/300.AlwaysConnect -t ac_direct -T add 2001:db8::5" } ?? -1
-            check(readd > lastLoad, "table re-added after the reload")
+            let replace = log.lastIndex { $0 == "-a com.apple/300.AlwaysConnect -t ac_direct -T replace 2001:db8::5" } ?? -1
+            check(replace > 0 && replace < lastLoad && log[replace - 1].contains(" -f "),
+                  "base loaded before complete table replacement, then bypasses enabled")
             let saved = (try? String(contentsOf: guardFile, encoding: .utf8)) ?? ""
             check(saved.contains("2001:db8::5") && saved.contains("10.0.0.1"), "table and DNS servers in guard.json")
             NetworkGuard.shared.release(holder: nil, reason: NetworkGuard.Reason.user)
@@ -439,12 +441,13 @@ struct SessionHarness {
                 allowNetworks: [], allowDNS: false)
             inputs.directTable = true
             _ = NetworkGuard.shared.apply(holder: holder, connected: false, inputs: inputs)
-            check(pfLog().contains("-a com.apple/300.AlwaysConnect -t ac_direct -T add 203.0.113.40"),
+            check(pfLog().contains("-a com.apple/300.AlwaysConnect -t ac_direct -T replace 203.0.113.40"),
                   "loaded with the first set that declares the table")
             check(disconnect(session), "disconnect replied")
             assertReleased("direct-before-hold")
         case "direct-adopt":
-            // A restart in this boot re-adds the table's contents.
+            // A restart remembers old contents for reconciliation, while
+            // keeping dynamic bypasses inactive until a new session owns them.
             var record = NetworkGuard.Record(
                 bootSession: BootSession.id ?? "", token: "10077", holder: "own:9", connected: false,
                 inputs: .init(tunnelIf: "utun99", gatewayIps: ["198.51.100.7"], physicalIf: "en0",
@@ -459,6 +462,7 @@ struct SessionHarness {
             check(pfLog().contains("-a com.apple/300.AlwaysConnect -t ac_direct -T add 203.0.113.30"),
                   "direct table re-added after the restart")
             check(NetworkGuard.shared.directAddresses == ["203.0.113.30"], "contents known again")
+            check(!lastRules().contains("pass out quick to <ac_direct>"), "restart retains base protection without stale bypasses")
             check(waitFor(5) { !NetworkGuard.shared.isHolding }, "released after the grace period")
             assertReleased("direct-adopt", adoptedReferences: 1)
         case "old-record":
@@ -485,6 +489,10 @@ struct SessionHarness {
             NetworkGuard.shared.adoptAtStart()
             check(NetworkGuard.shared.holder == "own:9", "adopted the old engine's set")
             check(lastRules().contains("198.51.100.7"), "adopted set passes the old gateway")
+            // The App supplies the currently detected LAN. An old journal
+            // alone must not authorise keeping obsolete network exceptions.
+            let currentLAN: Bool? = sync { reply in session.updateAllowNetworks(["192.168.1.0/24"], withReply: reply) }
+            check(currentLAN == true, "current LAN supplied before takeover")
             check(prepareRelay(session, gateway: "198.51.100.9"), "relay prepared with another gateway address")
             setenv("FAKE_CONNECT_DELAY", "3", 1)
             check(connect(session) == true, "reconnect accepted")
