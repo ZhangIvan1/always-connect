@@ -38,7 +38,7 @@ setup() {
         "$R/Library/LaunchDaemons/com.cisco.secureclient.vpnagentd.plist" \
         "$R/Library/PrivilegedHelperTools/com.alwaysconnect.app.helper" \
         "$R/Library/PrivilegedHelperTools/AlwaysConnect-openconnect/bin/openconnect" \
-        "$S/guard.json" "$S/route-state" "$S/session.json" "$S/relay/client.key" \
+        "$S/direct-routes.pending.crash" "$S/direct-routes.retire-crash" "$S/guard.json" "$S/route-state" "$S/session.json" "$S/relay/client.key" \
         "$R/Library/Logs/AlwaysConnect/helper.log" \
         "$H/Library/Logs/AlwaysConnect/relay.log" "$H/Library/Logs/AlwaysConnect/update.log" \
         "$H/Library/Application Support/AlwaysConnect/alwaysconnect-vpnc.sh" \

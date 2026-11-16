@@ -222,22 +222,22 @@ pub fn route_state_path(support: &Path) -> PathBuf {
 }
 
 /// `<script> <reason>` against this session's route-state journal.
-pub fn run_script(reason: &str, script: &str, support: &Path, no_routes: bool, test_active: bool) {
+pub fn run_script(reason: &str, script: &str, support: &Path, no_routes: bool, test_active: bool) -> bool {
     let mut cmd = Command::new(script);
     crate::reset_child_signals(&mut cmd);
     cmd.arg(reason).env("ALWAYSCONNECT_ROUTE_STATE_PATH", route_state_path(support)).stdout(Stdio::null());
     if no_routes || test_active {
         cmd.env("ALWAYSCONNECT_NO_ROUTES", "1");
     }
-    if cmd.status().is_err() {
-        network_guard::log("CLIOrchestrator: route restore failed to run");
-    }
+    let success=cmd.status().is_ok_and(|status|status.success());
+    if !success { network_guard::log("CLIOrchestrator: route operation did not complete"); }
+    success
 }
 
 /// "The local network is still held closed": the gate holds a set, or
 /// the script changed routes and no restore has undone them yet.
 pub fn local_network_held(support: &Path) -> bool {
-    network_guard::shared().is_some_and(|g| g.is_holding()) || route_state_path(support).exists()
+    network_guard::shared().is_some_and(|g| g.is_holding()) || route_state_path(support).exists() || support.join("direct-routes").exists()
 }
 
 /// Daemon start (§26.3): a route-state journal from this boot is
@@ -251,8 +251,7 @@ pub fn undo_journal_at_start(script: &str, support: &Path, boot: Option<&str>, t
         let _ = std::fs::remove_file(&path);
         return "dropped".into();
     }
-    run_script("restore", script, support, false, test_active);
-    "restored".into()
+    if run_script("restore", script, support, false, test_active) {"restored".into()} else {"pending".into()}
 }
 
 /// Release with no engine running (§20.4, §25.2, §30.1): the gate, the
@@ -352,6 +351,15 @@ struct Child {
     alive: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct TunnelLease { name: String, index: u32, generation: u64 }
+const TUNNEL_RECONFIRM_ERROR: &str = "VPN 接口已变化，请重新连接；断线保护保持";
+fn interface_index(name: &str) -> Option<u32> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    (index != 0).then_some(index)
+}
+
 struct Core {
     config: Config,
     driver: SessionDriver,
@@ -392,6 +400,7 @@ struct Core {
     last_allow_direct_egress: bool,
     tunnel_dns: Vec<String>,
     tunnel_if: Option<String>,
+    tunnel_lease: Option<TunnelLease>,
     split_policy: crate::split_policy::SplitPolicy,
     split_needs_sync: bool,
     tunnel_retrying: bool,
@@ -468,6 +477,7 @@ impl Engine {
                 last_allow_direct_egress: false,
                 tunnel_dns: Vec::new(),
                 tunnel_if: None,
+                tunnel_lease: None,
                 split_policy: crate::split_policy::SplitPolicy::default(),
                 split_needs_sync: false,
                 tunnel_retrying: false,
@@ -740,7 +750,7 @@ impl Shared {
 
     fn report(&self, c: &Core, detail: &str) {
         let mut state = c.driver.state;
-        if c.tunnel_retrying && state == SessionStatus::Connected {
+        if (c.tunnel_retrying || (c.hook_fired && c.forwarder.is_some() && c.tunnel_if.is_none())) && state == SessionStatus::Connected {
             state = SessionStatus::Reconnecting;
         }
         // Re-authenticating inside a drop episode is, to the user, still
@@ -862,7 +872,14 @@ impl Shared {
 
     fn sync_split_routes(&self, c: &mut Core) -> bool {
         c.split_needs_sync = true;
-        let desired = c.split_policy.direct();
+        let mut desired = c.split_policy.direct();
+        if !desired.is_empty() {
+            let Some(own)=direct_routes::assigned_ipv4() else {
+                let error="本机地址未确认，直连例外未更新；可使用恢复网络";
+                c.pf_error=Some(error.into()); self.report(c,error); return false;
+            };
+            desired.retain(|value|value.parse().is_ok_and(|ip|direct_routes::ordinary_unicast(ip)&&!own.contains(&ip)));
+        }
         let actual: HashSet<_> = self.guard.direct_addresses().into_iter().collect();
         let gone: Vec<_> = actual.difference(&desired).cloned().collect();
         // Close the firewall exception before removing its route; never grant
@@ -886,7 +903,10 @@ impl Shared {
         let new: Vec<_> = routable.difference(&routed).cloned().collect();
         if !new.is_empty() {
             let Some(gateway) = &c.physical_gateway else { return false };
-            if !self.routes.add(&new, gateway) { return false; }
+            if !self.routes.add(&new, gateway) {
+                let error="直连路由安装失败，网络保护状态未确认；可使用恢复网络";
+                c.pf_error=Some(error.into()); self.report(c,error); return false;
+            }
         }
         let fresh: Vec<_> = desired.difference(&actual).cloned().collect();
         if !self.guard.add_direct(&fresh) { return false; }
@@ -897,11 +917,12 @@ impl Shared {
 
     fn update_forwarder(&self, c: &Core) {
         if let Some(f) = &c.forwarder {
-            f.set_upstreams(Upstreams {
+            let index=c.tunnel_lease.as_ref().filter(|lease|c.tunnel_if.as_ref()==Some(&lease.name)&&lease.generation==c.generation).map(|lease|lease.index);
+            f.set_pinned_upstreams(Upstreams {
                 tunnel: c.tunnel_dns.clone(), local: c.local_dns.clone(),
                 physical_if: if c.config.no_routes { None } else { Some(c.config.physical_if.clone()) },
                 tunnel_if: c.tunnel_if.clone(),
-            });
+            },index);
         }
     }
 
@@ -1002,9 +1023,13 @@ impl Shared {
         if let Some(f) = c.forwarder.take() {
             f.stop();
         }
-        self.routes.remove_all();
+        if !self.routes.remove_all() {
+            let error="直连路由清理未确认；可重试恢复网络";
+            c.pf_error=Some(error.into());self.report(c,error);
+        }
         c.split_hits.clear();
         c.split_addresses.clear();
+        c.tunnel_lease = None;
         c.split_policy = crate::split_policy::SplitPolicy::default();
         c.split_needs_sync = false;
     }
@@ -1094,6 +1119,7 @@ impl Shared {
         c.tunnel_retrying = false;
         c.saw_login_failed = false;
         c.tunnel_dns.clear();
+        c.tunnel_lease = None;
         c.tunnel_if = None;
         self.update_forwarder(c);
         if c.in_drop_episode {
@@ -1331,6 +1357,7 @@ impl Shared {
                     c.local_dns = if c.config.no_routes { Vec::new() } else { (self.hooks.local_dns)(&c.config.physical_if) };
                 }
                 c.tunnel_if = tun.clone();
+                self.remember_tunnel(c);
                 self.update_forwarder(c);
                 Self::cancel(c, Timer::ApprovalTimeout);
                 c.unanswered_since = None;
@@ -1367,6 +1394,7 @@ impl Shared {
                 if let Some((_, dns)) = pairs.iter().find(|(k,_)| *k == "dns") {
                     c.tunnel_dns = dns.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();
                 }
+                self.remember_tunnel(c);
                 self.update_forwarder(c);
                 if let Some((_, gateways)) = c.last_pf.clone() {
                     let allow = c.last_allow_direct_egress;
@@ -1616,6 +1644,34 @@ impl Shared {
         }
     }
 
+    fn remember_tunnel(&self, c: &mut Core) {
+        c.tunnel_lease = c.tunnel_if.as_ref().and_then(|name| interface_index(name)
+            .map(|index| TunnelLease { name: name.clone(), index, generation: c.generation }));
+        if c.tunnel_lease.is_some() && c.last_error.as_deref()==Some(TUNNEL_RECONFIRM_ERROR) { c.last_error=None; }
+    }
+
+    /// A short physical outage need not make openconnect reconnect. Re-arm
+    /// only the exact interface previously confirmed by this live child.
+    fn reconfirm_tunnel(&self, c: &mut Core) -> bool {
+        if c.stop_requested || c.tunnel_retrying || !c.hook_fired { return false; }
+        let Some(lease) = &c.tunnel_lease else { return false };
+        if !c.child.as_ref().is_some_and(|child| child.alive.load(Ordering::SeqCst)
+            && child.generation == lease.generation && c.generation == lease.generation)
+            || interface_index(&lease.name) != Some(lease.index) {
+            c.tunnel_if=None;
+            self.update_forwarder(c);
+            if c.last_error.as_deref()!=Some(TUNNEL_RECONFIRM_ERROR) {
+                c.last_error=Some(TUNNEL_RECONFIRM_ERROR.into()); self.report(c,TUNNEL_RECONFIRM_ERROR);
+            }
+            return false;
+        }
+        if c.tunnel_if.as_ref() == Some(&lease.name) { return false; }
+        c.tunnel_if = Some(lease.name.clone());
+        if c.last_error.as_deref()==Some(TUNNEL_RECONFIRM_ERROR) { c.last_error=None; }
+        self.update_forwarder(c);
+        true
+    }
+
     /// Configd can change DNS without a routing event or a different router.
     /// All watchers feed this one reducer path; unchanged facts do no work.
     fn refresh_network(&self, c: &mut Core) {
@@ -1628,6 +1684,7 @@ impl Shared {
                 if let Some((tun, gws)) = c.last_pf.clone() {
                     self.load_pf(c, Some(tun), gws, false);
                 }
+                self.report(c, "正在重新确认网络；断线保护保持");
             }
             return;
         };
@@ -1635,6 +1692,7 @@ impl Shared {
             self.follow_network(c, &gateway, &interface, true);
             return;
         }
+        if self.reconfirm_tunnel(c) { self.report(c, "网络已恢复，继续使用当前 VPN"); }
         if c.forwarder.is_some() || c.config.relay.is_some() {
             let dns = (self.hooks.local_dns)(&interface);
             if dns != c.local_dns {
@@ -1663,6 +1721,7 @@ impl Shared {
         if c.forwarder.is_some() || c.config.relay.is_some() {
             c.local_dns = if c.config.no_routes { Vec::new() } else { (self.hooks.local_dns)(interface) };
         }
+        self.reconfirm_tunnel(c);
         self.update_forwarder(c);
         self.sync_split_routes(c);
         self.route_networks_direct(c);
@@ -1671,6 +1730,7 @@ impl Shared {
             let allow = c.last_allow_direct_egress;
             self.load_pf(c, Some(tun), gws, allow);
         }
+        self.report(c, if c.tunnel_if.is_some() { "网络已更新，继续使用当前 VPN" } else { "网络已更新，等待确认 VPN 接口；断线保护保持" });
     }
 }
 
@@ -1820,6 +1880,104 @@ mod tests {
         }
         engine.stop(false, false); assert!(!dns_event(&engine, epoch, "direct.example", true));
         drop(engine); std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn sinkhole_and_local_dns_answers_cannot_install_routes_or_poison_other_names() {
+        let (engine,support)=split_engine("special-addresses");
+        engine.shared.routes.test_commands(Box::new(|_|panic!("special answer must not mutate routes")),crate::network_check::Output::default());
+        let epoch=engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        for ip in ["0.0.0.0","127.0.0.1","127.0.0.2","169.254.1.2","224.0.0.1","255.255.255.255"] {
+            let (tx,rx)=mpsc::channel();let ip=ip.parse().unwrap();
+            engine.send(Event::DnsAnswer(dns_forwarder::Observation { epoch,name:"direct.example".into(),entry:Some("direct.example".into()),addresses:vec![ip],direct:vec![ip] },tx));
+            assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            assert!(engine.shared.routes.addresses().is_empty()); assert!(engine.shared.guard.direct_addresses().is_empty());
+            assert!(dns_event(&engine,epoch,"vpn.example",false));
+        }
+        engine.stop(false,false); assert!(!dns_event(&engine,0,"old.example",true));
+        drop(engine); std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn withdrawn_route_already_removed_by_system_does_not_poison_other_dns_answers() {
+        let (engine,support)=split_engine("absent-route");
+        engine.shared.routes.test_commands(Box::new(|args| if args.contains(&"delete") {1}else{0}),
+            crate::network_check::Output { ok:true,text:"Destination Gateway Flags Netif Expire\ndefault 192.168.1.1 UGSc en0\n".into() });
+        let epoch=engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        assert!(dns_event(&engine,epoch,"direct.example",true));
+        engine.update_direct_domains(vec![]); assert!(!dns_event(&engine,epoch,"direct.example",true));
+        let current=engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        assert!(engine.shared.routes.addresses().is_empty());
+        assert!(dns_event(&engine,current,"vpn.example",false));
+        assert!(dns_event(&engine,current,"another.example",false));
+        engine.stop(false,false); assert!(!dns_event(&engine,0,"old.example",true));
+        drop(engine); std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn live_tunnel_binding_recovers_after_short_outage_without_another_hook() {
+        let facts = Arc::new(Mutex::new(Some(("192.168.1.1".into(), "en0".into()))));
+        let observed = facts.clone();
+        let (engine, support) = split_engine_with_hooks("live-binding", Hooks {
+            state: Box::new(|_,_| {}), terminal: Box::new(|_| {}),
+            physical_network: Box::new(move |_| observed.lock().unwrap().clone()),
+            local_dns: Box::new(|_| vec![]), system_roots: Box::new(|| None), stopped: Box::new(|| {}),
+        });
+        let iface = if cfg!(target_os="macos") { "lo0" } else { "lo" };
+        let udp=std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let server=udp.local_addr().unwrap().to_string();
+        let done=Arc::new(AtomicBool::new(false)); let stop=done.clone();
+        let packets=Arc::new(std::sync::atomic::AtomicUsize::new(0));let count=packets.clone();
+        let responder=std::thread::spawn(move || {
+            let mut bytes=[0;512];
+            while !stop.load(Ordering::SeqCst) { if let Ok((n,peer))=udp.recv_from(&mut bytes) {
+                count.fetch_add(1,Ordering::SeqCst); let mut reply=bytes[..n].to_vec();
+                reply[2]=0x81;reply[3]=0x80;reply[7]=1;
+                reply.extend([0xc0,12,0,1,0,1,0,0,0,60,0,4,198,51,100,1]);let _=udp.send_to(&reply,peer);
+            }}
+        });
+        let query=crate::on_demand::dns_query("vpn.example").unwrap();
+        let mut c = engine.shared.core.lock().unwrap();
+        c.tunnel_dns=vec![server];
+        c.config.physical_if = "en0".into(); c.generation = 7; c.hook_fired = true;
+        c.child = Some(Child { pid: i32::MAX, generation: 7, alive: Arc::new(AtomicBool::new(true)) });
+        c.tunnel_if = Some(iface.into()); engine.shared.remember_tunnel(&mut c); engine.shared.update_forwarder(&c);
+        *facts.lock().unwrap() = None; engine.shared.refresh_network(&mut c); assert!(c.tunnel_if.is_none());
+        *facts.lock().unwrap() = Some(("192.168.1.1".into(), "en0".into()));
+        engine.shared.refresh_network(&mut c);
+        assert_eq!(c.forwarder.as_ref().unwrap().bound_tunnel_interface().as_deref(), Some(iface));
+        assert!(c.forwarder.as_ref().unwrap().inner().resolve(&query).is_some());
+        let before=packets.load(Ordering::SeqCst);
+        let epoch=c.forwarder.as_ref().unwrap().epoch();
+        let index=c.tunnel_lease.as_ref().unwrap().index;
+        c.tunnel_lease.as_mut().unwrap().index=index+10000;
+        engine.shared.refresh_network(&mut c);
+        assert!(c.tunnel_if.is_none());
+        assert!(!c.forwarder.as_ref().unwrap().is_current(epoch));
+        assert!(c.forwarder.as_ref().unwrap().bound_tunnel_interface().is_none());
+        assert!(c.forwarder.as_ref().unwrap().inner().resolve(&query).is_none());
+        assert_eq!(packets.load(Ordering::SeqCst),before);
+        c.tunnel_lease.as_mut().unwrap().index=index;
+        engine.shared.refresh_network(&mut c);
+        assert_eq!(c.forwarder.as_ref().unwrap().bound_tunnel_interface().as_deref(),Some(iface));
+        c.tunnel_if = None; c.tunnel_retrying = true; engine.shared.refresh_network(&mut c);
+        assert!(c.tunnel_if.is_none(), "an internal reconnect still needs its own confirmation");
+        c.tunnel_retrying = false; c.generation = 8; engine.shared.refresh_network(&mut c);
+        assert!(c.tunnel_if.is_none(), "old ownership cannot confirm a new child generation");
+        c.child = None; drop(c); engine.stop(false,false); assert!(!dns_event(&engine,0,"old.example",true));
+        done.store(true,Ordering::SeqCst);responder.join().unwrap();
+        drop(engine); std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_reports_pending_when_script_exits_unsuccessfully() {
+        let dir=std::env::temp_dir().join(format!("ac-pending-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(route_state_path(&dir),"AC_BOOT=B1\n").unwrap();
+        assert_eq!(undo_journal_at_start("/usr/bin/false",&dir,Some("B1"),true),"pending");
+        assert!(route_state_path(&dir).exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

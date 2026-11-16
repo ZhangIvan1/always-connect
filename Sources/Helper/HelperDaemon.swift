@@ -681,11 +681,15 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     }
 
     func resolveGatewayIPv4(_ host: String, withReply reply: @escaping ([String]) -> Void) {
+        guard let lease = GatewayLookupLease() else { reply([]); return }
         DispatchQueue.global(qos: .utility).async {
-            guard let network = PhysicalNetwork.current(preferring: "") else { reply([]); return }
-            let servers = LocalDNS.servers(for: network.interface)
-            let csv = NetworkGuard.take(ac_resolve_gateway(host, servers.joined(separator: ","), network.interface)) ?? ""
-            reply(csv.split(separator: ",").map(String.init))
+            withExtendedLifetime(lease) {
+                guard ac_gateway_active(lease.handle),
+                      let network = PhysicalNetwork.current(preferring: "") else { reply([]); return }
+                let servers = LocalDNS.servers(for: network.interface)
+                let csv = NetworkGuard.take(ac_resolve_gateway(lease.handle, host, servers.joined(separator: ","), network.interface)) ?? ""
+                reply(csv.split(separator: ",").map(String.init))
+            }
         }
     }
 
@@ -741,4 +745,14 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
 }
 
 @_silgen_name("ac_resolve_gateway")
-func ac_resolve_gateway(_ host: UnsafePointer<CChar>, _ servers: UnsafePointer<CChar>, _ interface: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+func ac_resolve_gateway(_ lease: OpaquePointer, _ host: UnsafePointer<CChar>, _ servers: UnsafePointer<CChar>, _ interface: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
+
+private final class GatewayLookupLease: @unchecked Sendable {
+    let handle: OpaquePointer
+    init?() { guard let handle = ac_gateway_claim() else { return nil }; self.handle = handle }
+    deinit { ac_gateway_free(handle) }
+}
+@_silgen_name("ac_gateway_claim") func ac_gateway_claim() -> OpaquePointer?
+@_silgen_name("ac_gateway_active") func ac_gateway_active(_ lease: OpaquePointer) -> Bool
+@_silgen_name("ac_gateway_free") func ac_gateway_free(_ lease: OpaquePointer)

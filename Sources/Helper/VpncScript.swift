@@ -94,15 +94,66 @@ enum VpncScript {
       printf 'open\nremove State:/Network/Service/%s/IPv4\nremove State:/Network/Service/%s/DNS\nclose\n' "$1" "$1" | scutil >/dev/null 2>&1 || true
     }
 
+    boot_now() {
+      if [ "$(/usr/bin/id -u)" != 0 ] && [ -n "${ALWAYSCONNECT_BOOT_SESSION:-}" ]; then
+        printf '%s\n' "$ALWAYSCONNECT_BOOT_SESSION"
+      else
+        /usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null
+      fi
+    }
+    interface_identity() {
+      output=$(ifconfig -v "$1" 2>/dev/null) || {
+        interfaces=$(ifconfig -l 2>/dev/null) || return 2
+        case " $interfaces " in *" $1 "*) return 2;; *) return 1;; esac
+      }
+      identity=$(printf '%s\n' "$output" | awk '
+        / index / { for(i=1;i<NF;i++) if($i=="index") index_value=$(i+1) }
+        /inet / { if(!address) address=$2 }
+        END { if(index_value && address) print index_value " " address }')
+      [ -n "$identity" ] || return 2
+      printf '%s\n' "$identity"
+    }
+    clear_scope_owner() { AC_SCOPED_TUN=""; AC_SCOPED_INDEX=""; AC_SCOPED_ADDR=""; }
     load_state() {
       AC_BOOT=""; AC_PHYS_GW=""; AC_PHYS_IF=""; AC_VPN_GW=""; AC_TUN=""; AC_TUNS=""
+      clear_scope_owner
       if [ -n "$STATE" ] && [ -f "$STATE" ]; then . "$STATE"; fi
+      now_boot=$(boot_now)
+      if [ -n "$STATE" ] && [ -f "$STATE" ] && { [ -z "$AC_BOOT" ] || { [ -n "$now_boot" ] && [ "$AC_BOOT" != "$now_boot" ]; }; }; then
+        # Routes never survive reboot; names/indices may belong to other VPNs.
+        AC_BOOT=""; AC_PHYS_GW=""; AC_PHYS_IF=""; AC_VPN_GW=""; AC_TUN=""; AC_TUNS=""
+        clear_scope_owner
+        [ -z "$STATE" ] || rm -f "$STATE"
+      fi
     }
 
-    # Journal entry first, change second.
+    # Journal entry first, change second. DNS history and live scoped-route
+    # ownership are separate: successful retirement removes only the latter.
     save_state() {
-      printf 'AC_BOOT=%s\nAC_PHYS_GW=%s\nAC_PHYS_IF=%s\nAC_VPN_GW=%s\nAC_TUN=%s\nAC_TUNS="%s"\n' \
-        "$AC_BOOT" "$AC_PHYS_GW" "$AC_PHYS_IF" "$AC_VPN_GW" "$AC_TUN" "$AC_TUNS" > "$STATE"
+      printf 'AC_BOOT=%s\nAC_PHYS_GW=%s\nAC_PHYS_IF=%s\nAC_VPN_GW=%s\nAC_TUN=%s\nAC_TUNS="%s"\nAC_SCOPED_TUN=%s\nAC_SCOPED_INDEX=%s\nAC_SCOPED_ADDR=%s\n' \
+        "$AC_BOOT" "$AC_PHYS_GW" "$AC_PHYS_IF" "$AC_VPN_GW" "$AC_TUN" "$AC_TUNS" \
+        "$AC_SCOPED_TUN" "$AC_SCOPED_INDEX" "$AC_SCOPED_ADDR" > "$STATE"
+    }
+    retire_scoped_route() {
+      [ -n "$AC_SCOPED_TUN" ] || return 0
+      current_boot=$(boot_now)
+      [ -n "$current_boot" ] || return 1
+      if identity=$(interface_identity "$AC_SCOPED_TUN"); then
+        scope_status=0
+      else scope_status=$?; fi
+      [ "$scope_status" != 2 ] || return 1
+      if [ "$identity" = "$AC_SCOPED_INDEX $AC_SCOPED_ADDR" ] && [ "$AC_BOOT" = "$current_boot" ]; then
+        route -n delete -ifscope "$AC_SCOPED_TUN" default >/dev/null 2>&1 || {
+          # A system-removed route is already retired; read failure is unknown.
+          table=$(netstat -rn -f inet 2>/dev/null) || return 1
+          printf '%s\n' "$table" | awk -v tun="$AC_SCOPED_TUN" '
+            /^Destination/ && /Netif/ { header=1; next }
+            $1=="default" && $4==tun { present=1 }
+            END { exit (!header || present) ? 1 : 0 }' || return 1
+        }
+      fi
+      clear_scope_owner
+      save_state
     }
 
     # Undo connect. Idempotent: without a state file only stale
@@ -111,9 +162,8 @@ enum VpncScript {
     # installed one for a new network while the drop was held).
     restore() {
       load_state
-      for t in $AC_TUNS $AC_TUN; do
-        route -n delete -ifscope "$t" default >/dev/null 2>&1 || true
-      done
+      scope_failed=0
+      retire_scoped_route || { scope_failed=1; log restore "scoped route retirement not confirmed"; }
       for t in $AC_TUNS; do remove_service_keys "$t"; done
       remove_service_keys "$AC_TUN"
       remove_service_keys "$TUNDEV"
@@ -126,7 +176,13 @@ enum VpncScript {
       if [ -n "$AC_VPN_GW" ]; then
         route -n delete -host "$AC_VPN_GW" >/dev/null 2>&1 || true
       fi
-      rm -f "$STATE"
+      if [ "$scope_failed" = 0 ]; then rm -f "$STATE"
+      else
+        # Completed actions are not replayed on retry; keep only pending scope.
+        AC_PHYS_GW=""; AC_PHYS_IF=""; AC_VPN_GW=""; AC_TUN=""; AC_TUNS=""
+        save_state
+        return 1
+      fi
     }
 
     REASON=${1:-${reason:-}}
@@ -155,14 +211,19 @@ enum VpncScript {
             AC_PHYS_IF=${cur#* }
           fi
           [ -n "$AC_PHYS_GW" ] || { log connect "no physical default gateway"; exit 1; }
+          # Pending route ownership survives separately from DNS history.
+          # Never overwrite it, including after a partially failed restore.
+          retire_scoped_route || { log connect "previous scoped route retirement failed"; exit 1; }
           if [ -n "$AC_TUN" ] && [ "$AC_TUN" != "$TUNDEV" ]; then
             remove_service_keys "$AC_TUN"
-            route -n delete -ifscope "$AC_TUN" default >/dev/null 2>&1 || true
           fi
           # Journal before any change: this boot, the physical default
           # to put back, the gateway host route, every tunnel whose DNS
           # entries we are about to write.
-          AC_BOOT="$ALWAYSCONNECT_BOOT_SESSION"
+          AC_BOOT=$(boot_now)
+          identity=$(interface_identity "$TUNDEV")
+          [ -n "$AC_BOOT" ] && [ -n "$identity" ] || { log connect "tunnel identity unavailable"; exit 1; }
+          AC_SCOPED_TUN="$TUNDEV"; AC_SCOPED_INDEX=${identity%% *}; AC_SCOPED_ADDR=${identity#* }
           AC_VPN_GW="$VPNGATEWAY"
           AC_TUN="$TUNDEV"
           case " $AC_TUNS " in *" $TUNDEV "*) ;; *) AC_TUNS="${AC_TUNS:+$AC_TUNS }$TUNDEV";; esac
@@ -241,7 +302,7 @@ enum VpncScript {
         # Run by the Helper itself after a manual stop, never by
         # openconnect.
         if [ -z "$ALWAYSCONNECT_NO_ROUTES" ]; then
-          restore
+          restore || { log restore "cleanup remains pending"; exit 1; }
         fi
         hook "restore"
         exit 0

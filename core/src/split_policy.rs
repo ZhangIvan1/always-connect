@@ -21,7 +21,7 @@ pub struct SplitPolicy {
 impl SplitPolicy {
     pub fn observe(&mut self, name: String, addresses: &[Ipv4Addr], direct: &[Ipv4Addr]) -> bool {
         if self.saturated { return false; }
-        let observation: Vec<_> = addresses.iter().map(|ip| (*ip, direct.contains(ip))).collect();
+        let observation: Vec<_> = addresses.iter().map(|ip| (*ip, direct.contains(ip) && crate::direct_routes::ordinary_unicast(*ip))).collect();
         if self.names.get(&name).is_some_and(|c| c.current == observation) { return false; }
         let claims = self.names.entry(name).or_default();
         claims.vpn.extend(addresses.iter().filter(|ip| !direct.contains(ip)).copied());
@@ -68,6 +68,14 @@ impl SplitPolicy {
 mod tests {
     use super::*;
     fn ip(n: u8) -> Ipv4Addr { Ipv4Addr::new(203, 0, 113, n) }
+    #[test]
+    fn mixed_special_and_unicast_answers_learn_only_ordinary_addresses() {
+        let mut policy=SplitPolicy::default();
+        let ips=[std::net::Ipv4Addr::LOCALHOST,std::net::Ipv4Addr::UNSPECIFIED,ip(9)];
+        policy.observe("direct.example".into(),&ips,&ips);
+        assert_eq!(policy.direct(),HashSet::from([ip(9).to_string()]));
+    }
+
     #[test]
     fn removing_and_editing_rules_revokes_old_grants() {
         let mut p = SplitPolicy::default();

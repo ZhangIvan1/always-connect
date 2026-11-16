@@ -48,14 +48,93 @@ run() {
 }
 # Standalone fallback if the generated vpnc-script is absent or damaged.
 # Read only our private journal; never source it or interpolate commands.
+# Return success for entries that must retain native/system routing.
+native_route_entry() {
+    /usr/bin/awk -v entry="$1" -v known="$2" -v own="$3" 'BEGIN {
+      if(known!=1) exit 0
+      parts=split(entry,p,"/"); count=split(p[1],o,".")
+      if(count!=4 || parts>2) exit 0
+      for(i=1;i<=4;i++) if(o[i] !~ /^[0-9]+$/ || o[i]>255 || (length(o[i])>1 && substr(o[i],1,1)=="0")) exit 0
+      bits=parts==1?32:p[2]
+      if(bits !~ /^[0-9]+$/ || bits<1 || bits>32) exit 0
+      ip=((o[1]*256+o[2])*256+o[3])*256+o[4]; size=2^(32-bits); lo=int(ip/size)*size; hi=lo+size-1
+      if((lo>=0 && hi<=16777215) || (lo>=2130706432 && hi<=2147483647) || (lo>=2851995648 && hi<=2852061183) || lo>=3758096384) exit 0
+      if(bits==32) {
+        normal=sprintf("%d.%d.%d.%d",o[1],o[2],o[3],o[4]); n=split(own,addresses,/[^0-9.]+/)
+        for(i=1;i<=n;i++) if(normal==addresses[i]) exit 0
+      }
+      exit 1
+    }'
+}
+
+# Retire confirmed entries, preserving unknown/failed entries atomically.
+retire_direct_routes() {
+    journal=$1; current_boot=$2; known=$3; own=$4
+    [ -f "$journal" ] || return 0
+    [ -n "$current_boot" ] || return 1
+    IFS=' ' read -r marker saved_boot extra < "$journal" || return 1
+    if [ "$marker" != boot ] || [ -z "$saved_boot" ] || [ "$saved_boot" != "$current_boot" ]; then
+        run /bin/rm -f "$journal"
+        return $?
+    fi
+    pending=""; retired=0
+    while read -r ip gw extra; do
+        [ "$ip" = boot ] && continue
+        [ -n "$ip" ] || continue
+        if [ "$known" != 1 ]; then
+            pending="$pending$ip $gw
+"
+            continue
+        fi
+        if native_route_entry "$ip" "$known" "$own"; then retired=$((retired+1)); continue; fi
+        if case "$ip" in
+            */*) run /sbin/route -n delete -net "$ip";;
+            *) run /sbin/route -n delete -host "$ip";;
+        esac; then retired=$((retired+1))
+        else pending="$pending$ip $gw
+"; fi
+    done < "$journal"
+    say "retired $retired direct journal entries"
+    if [ -z "$pending" ]; then run /bin/rm -f "$journal"; return $?; fi
+    if [ "$DRY" != 1 ]; then
+        temporary=$(/usr/bin/mktemp "$journal.pending.XXXXXXXX") || return 1
+        if ! { printf 'boot %s\n%s' "$saved_boot" "$pending" > "$temporary" && /bin/mv -f "$temporary" "$journal"; }; then
+            /bin/rm -f "$temporary"; return 1
+        fi
+    fi
+    say "direct route cleanup pending; keep its journal for retry"
+    return 1
+}
+
+scope_interface_identity() {
+    output=$(/sbin/ifconfig -v "$1" 2>/dev/null) || {
+        interfaces=$(/sbin/ifconfig -l 2>/dev/null) || return 2
+        case " $interfaces " in *" $1 "*) return 2;; *) return 1;; esac
+    }
+    identity=$(printf '%s\n' "$output" | /usr/bin/awk '
+        / index / { for(i=1;i<NF;i++) if($i=="index") index_value=$(i+1) }
+        /inet / { if(!address) address=$2 }
+        END { if(index_value && address) print index_value " " address }')
+    [ -n "$identity" ] || return 2
+    printf '%s\n' "$identity"
+}
 restore_scoped_routes_from_journal() {
     [ -f "$1" ] || return 0
-    for tun in $(/usr/bin/awk -F= '/^AC_TUN(S)?=/ {
-        gsub(/"/, "", $2); n=split($2, values, " ")
-        for (i=1; i<=n; i++) if (values[i] ~ /^utun[0-9]+$/) print values[i]
-    }' "$1" | /usr/bin/sort -u); do
-        run /sbin/route -n delete -ifscope "$tun" default
-    done
+    record=$(/usr/bin/awk -F= '
+      $1=="AC_BOOT" { boot=$2 }
+      $1=="AC_SCOPED_TUN" { tun=$2 }
+      $1=="AC_SCOPED_INDEX" { index_value=$2 }
+      $1=="AC_SCOPED_ADDR" { address=$2 }
+      END { if(boot ~ /^[A-Za-z0-9-]+$/ && tun ~ /^utun[0-9]+$/ && index_value ~ /^[1-9][0-9]*$/ && address ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/)
+              print boot " " tun " " index_value " " address }' "$1")
+    [ -n "$record" ] || return 0
+    [ -n "${2:-}" ] || return 1
+    read -r recorded_boot tun index_value address <<< "$record"
+    [ "$recorded_boot" = "$2" ] || return 0
+    if identity=$(scope_interface_identity "$tun"); then status=0; else status=$?; fi
+    [ "$status" != 2 ] || return 1
+    [ "$identity" = "$index_value $address" ] || return 0
+    run /sbin/route -n delete -ifscope "$tun" default
 }
 
 web() { curl -s -m 6 -o /dev/null -w '%{http_code}' https://www.apple.com 2>/dev/null || true; }
@@ -102,24 +181,21 @@ done
 # 2 held state (and our pf enable reference, released in step 5).
 # The route journal is undone by the script that wrote it first
 # (DESIGN.md §26.3): gateway host route, default route, tunnel DNS.
-restore_scoped_routes_from_journal "$SUPPORT/route-state"
+SCOPED_PENDING=0; DIRECT_PENDING=0
+restore_scoped_routes_from_journal "$SUPPORT/route-state" "$(/usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null)" || SCOPED_PENDING=1
 TOKEN=$(plutil -extract token raw -o - "$SUPPORT/guard.json" 2>/dev/null || true)
 if [ -f "$SUPPORT/route-state" ] && [ -x "$SUPPORT/alwaysconnect-vpnc.sh" ]; then
     say "undo the route journal"
-    run env ALWAYSCONNECT_ROUTE_STATE_PATH="$SUPPORT/route-state" "$SUPPORT/alwaysconnect-vpnc.sh" restore
+    run env ALWAYSCONNECT_ROUTE_STATE_PATH="$SUPPORT/route-state" "$SUPPORT/alwaysconnect-vpnc.sh" restore || SCOPED_PENDING=1
 fi
 # The domain split's host routes, from their own journal (§26.5).
 if [ -f "$SUPPORT/direct-routes" ]; then
-    n=0
-    while read -r ip gw; do
-        [ "$ip" = boot ] && continue
-        case "$ip" in
-            */*) run route -n delete -net "$ip";;
-            *) run route -n delete -host "$ip";;
-        esac
-        n=$((n + 1))
-    done < "$SUPPORT/direct-routes"
-    say "removed $n direct route(s)"
+    own_known=0; own_addresses=""
+    if interface_output=$(/sbin/ifconfig -a 2>/dev/null); then
+        own_known=1
+        own_addresses=$(printf '%s\n' "$interface_output" | /usr/bin/awk '/inet / { print $2 }')
+    fi
+    retire_direct_routes "$SUPPORT/direct-routes" "$(/usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null)" "$own_known" "$own_addresses" || DIRECT_PENDING=1
     # A network of ours that the Mac has since moved onto kept the
     # system from adding that LAN's own route: put it back (harmless
     # when it exists, DESIGN.md §30.2).
@@ -136,6 +212,14 @@ if [ -f "$SUPPORT/direct-routes" ]; then
     done
 fi
 for f in guard.json pf-state.json route-state manual-disconnect direct-routes; do
+    if [ "$f" = route-state ] && [ "$SCOPED_PENDING" = 1 ]; then
+        say "scoped route cleanup unconfirmed; keep its journal for retry"
+        continue
+    fi
+    if [ "$f" = direct-routes ] && [ "$DIRECT_PENDING" = 1 ]; then
+        say "direct route cleanup unconfirmed; keep its journal for retry"
+        continue
+    fi
     [ -e "$SUPPORT/$f" ] && { say "forget held state $f"; run rm -f "$SUPPORT/$f"; }
 done
 

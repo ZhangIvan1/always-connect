@@ -19,7 +19,7 @@ pub struct Item { pub item: String, pub passed: bool, pub informational: bool, p
 fn item(name: &str, passed: bool, detail: &str) -> Item {
     Item { item: name.into(), passed, informational: false, detail: detail.into() }
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Output { pub ok: bool, pub text: String }
 
 pub fn interface(output: &str) -> Option<&str> {
@@ -51,7 +51,7 @@ fn canonical_rules(text: &str) -> Vec<String> {
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("table ")) {
         for line in expand_sets(line) {
             let mut line = format!(" {} ", line.split_whitespace().collect::<Vec<_>>().join(" "));
-            line = line.replace(" flags any ", " ").replace(" keep state ", " ").replace(" port = ", " port ").replace(" user = ", " user ");
+            line = line.replace(" keep state ", " ").replace(" port = ", " port ").replace(" user = ", " user ");
             line = line.replace(" all ", " from any to any ");
             if line.contains(" to ") && !line.contains(" from ") { line = line.replacen(" to ", " from any to ", 1); }
             let mut words: Vec<_> = line.split_whitespace().map(str::to_owned).collect();
@@ -59,6 +59,17 @@ fn canonical_rules(text: &str) -> Vec<String> {
                 Some("inet6")
             } else if words.iter().any(|w| w == "inet") || words.iter().any(|w| w.split('/').next().is_some_and(|s| s.parse::<std::net::Ipv4Addr>().is_ok())) { Some("inet") } else { None };
             words.retain(|w| w != "inet" && w != "inet6");
+            let explicit_flags = if let Some(at) = words.iter().position(|w| w == "flags") {
+                if at + 1 < words.len() { let flag = words[at + 1].clone(); words.drain(at..at + 2); Some(flag) }
+                else { Some("invalid".into()) }
+            } else { None };
+            let tcp = words.first().map(String::as_str) == Some("pass")
+                && words.iter().position(|w| w == "proto").map(|p| words.get(p + 1).map(String::as_str) == Some("tcp")).unwrap_or(true);
+            if tcp {
+                let stateless = words.windows(2).any(|w| w[0] == "no" && w[1] == "state");
+                let flags = explicit_flags.unwrap_or_else(|| if stateless { "any".into() } else { "S/SA".into() });
+                words.push(format!("tcp-flags={flags}"));
+            } else if let Some(flags) = explicit_flags { if flags != "any" { words.push(format!("unexpected-flags={flags}")); } }
             for w in &mut words {
                 *w = match w.as_str() { "root" => "0", "bootpc" => "68", "bootps" => "67", "domain" => "53", "mdns" => "5353", "icmp6" => "ipv6-icmp", "dhcpv6-client" => "546", "dhcpv6-server" => "547", _ => w }.to_owned();
                 if w.ends_with("/32") { w.truncate(w.len() - 3); }
@@ -70,10 +81,10 @@ fn canonical_rules(text: &str) -> Vec<String> {
     // barrier may be reordered by pfctl's set expansion.
     let mut ordered = Vec::new(); let mut passes = Vec::new();
     for rule in out {
-        if rule.contains(" block ") { passes.sort(); ordered.append(&mut passes); ordered.push(rule); }
+        if rule.contains(" block ") { passes.sort(); passes.dedup(); ordered.append(&mut passes); ordered.push(rule); }
         else { passes.push(rule); }
     }
-    passes.sort(); ordered.append(&mut passes); ordered
+    passes.sort(); passes.dedup(); ordered.append(&mut passes); ordered
 }
 fn rules_match(actual: &str, expected: &str) -> bool {
     let lines: Vec<_> = actual.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
@@ -157,21 +168,22 @@ pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Ou
 /// Only fixed system binaries and read-only arguments are used.
 pub fn run(expected: &Expected) -> Vec<Item> {
     let deadline = Instant::now() + Duration::from_secs(2);
-    run_with(expected, |path, args| {
-        let left = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(400));
-        if left.is_zero() { return Output::default(); }
-        let Ok(mut child) = Command::new(path).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return Output::default() };
-        let Some(stdout) = child.stdout.take() else { let _ = child.kill(); let _ = child.wait(); return Output::default() };
-        let reader = std::thread::spawn(move || { let mut bytes = Vec::new(); let _ = stdout.take(512 * 1024 + 1).read_to_end(&mut bytes); bytes });
-        let stop = Instant::now() + left;
-        let ok = loop {
-            if let Ok(Some(status)) = child.try_wait() { break status.success(); }
-            if Instant::now() >= stop { let _ = child.kill(); let _ = child.wait(); break false; }
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        let bytes = reader.join().unwrap_or_default();
-        Output { ok: ok && bytes.len() <= 512 * 1024, text: String::from_utf8_lossy(&bytes).into_owned() }
-    })
+    run_with(expected, |path,args| read_command(path,args,deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(400))))
+}
+
+pub(crate) fn read_command(path: &str, args: &[String], limit: Duration) -> Output {
+    if limit.is_zero() { return Output::default(); }
+    let Ok(mut child) = Command::new(path).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return Output::default() };
+    let Some(stdout) = child.stdout.take() else { let _ = child.kill(); let _ = child.wait(); return Output::default() };
+    let reader = std::thread::spawn(move || { let mut bytes = Vec::new(); let _ = stdout.take(512 * 1024 + 1).read_to_end(&mut bytes); bytes });
+    let stop = Instant::now() + limit;
+    let ok = loop {
+        if let Ok(Some(status)) = child.try_wait() { break status.success(); }
+        if Instant::now() >= stop { let _ = child.kill(); let _ = child.wait(); break false; }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let bytes = reader.join().unwrap_or_default();
+    Output { ok: ok && bytes.len() <= 512 * 1024, text: String::from_utf8_lossy(&bytes).into_owned() }
 }
 
 #[cfg(test)]
@@ -209,6 +221,17 @@ mod tests {
             assert!(rows.iter().filter(|i|i.item!="仅当前 VPN 隧道可作为出口").any(|i|!i.passed),"{corruption}");
         }
     }
+    #[test]
+    fn kernel_parser_output_matches_implicit_flags_and_deduplicated_passes() {
+        let source = include_str!("../tests/fixtures/pf-source.conf");
+        let actual = include_str!("../tests/fixtures/pf-compiled.conf");
+        assert!(rules_match(actual, source));
+        let too_strict = actual.replace("on lo0 all no state", "on lo0 all flags S/SA no state");
+        assert!(!rules_match(&too_strict, source), "SYN-only pass cannot replace flags-any no-state pass");
+        let broader = actual.replace("fe80::/10 flags S/SA keep state", "fe80::/10 flags any keep state");
+        assert!(!rules_match(&broader, source), "explicit flags-any differs from the stateful default");
+    }
+
     #[test]
     fn pf_printer_variants_match_but_extra_passes_and_early_blocks_do_not() {
         let e=expected();let rules=e.rules.unwrap();

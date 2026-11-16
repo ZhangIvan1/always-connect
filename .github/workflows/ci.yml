@@ -79,6 +79,18 @@ jobs:
         run: scripts/gateway-resolution-test.sh
       - name: Emergency recovery route plan (stubbed, no network changes)
         run: scripts/reset-network-test.sh
+      - name: Initialise default PF only on an empty CI runner
+        run: |
+          RULES=$(sudo -n /sbin/pfctl -s rules)
+          if ! printf '%s\n' "$RULES" | grep -q 'anchor "com.apple/\*"'; then
+            test -z "$RULES" || { echo 'Non-default existing PF rules: refusing to replace them'; exit 1; }
+            sudo -n /sbin/pfctl -f /etc/pf.conf
+          fi
+      - name: Kernel DNS UID barrier (isolated localhost port)
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          scripts/pf-dns-uid-test.sh --ci "$HELPER"
       - name: Run Helper engine smoke test (no server)
         # Exercises spawn + stdin feed + Transient classification +
         # backoff + max-attempts, with no gateway and no tun device.

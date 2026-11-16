@@ -126,11 +126,13 @@ func isValidIPv4(_ value: String) -> Bool {
 /// keys, so they are never mistaken for these), else DHCP's.
 enum LocalDNS {
     static func servers(for interface: String) -> [String] {
+        var serviceID: String?
         if let store = SCDynamicStoreCreate(nil, "AlwaysConnect" as CFString, nil, nil),
            let keys = SCDynamicStoreCopyKeyList(store, "State:/Network/Service/.*/IPv4" as CFString) as? [String] {
             for key in keys {
                 guard let ipv4 = SCDynamicStoreCopyValue(store, key as CFString) as? [String: Any],
                       ipv4["InterfaceName"] as? String == interface else { continue }
+                serviceID = key.components(separatedBy: "/").dropFirst(3).first
                 let dnsKey = key.replacingOccurrences(of: "/IPv4", with: "/DNS")
                 if let dns = SCDynamicStoreCopyValue(store, dnsKey as CFString) as? [String: Any],
                    let servers = dns["ServerAddresses"] as? [String] {
@@ -139,16 +141,17 @@ enum LocalDNS {
                 }
             }
         }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/sbin/ipconfig")
-        p.arguments = ["getoption", interface, "domain_name_server"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return [] }
-        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        p.waitUntilExit()
-        return out.split(whereSeparator: \.isWhitespace).map(String.init).filter(isValidIPv4)
+        guard let serviceID,
+              let copied = ac_sc_copy_dhcp(nil, serviceID as CFString) else { return [] }
+        let info = copied.takeRetainedValue()
+        return withExtendedLifetime(info) {
+            guard let option = ac_sc_dhcp_option(info, 6) else { return [] }
+            let bytes = option.takeUnretainedValue() as Data
+            return bytes.withUnsafeBytes { raw in
+                let csv = NetworkGuard.take(ac_dhcp_dns(raw.bindMemory(to: UInt8.self).baseAddress, raw.count)) ?? ""
+                return csv.split(separator: ",").map(String.init)
+            }
+        }
     }
 }
 
@@ -187,3 +190,13 @@ final class PhysicalNetworkChanges {
     }
     deinit { cancel() }
 }
+
+@_silgen_name("ac_dhcp_dns")
+func ac_dhcp_dns(_ bytes: UnsafePointer<UInt8>?, _ count: Int) -> UnsafeMutablePointer<CChar>?
+
+// Public C APIs in SCDynamicStoreCopyDHCPInfo.h are not re-exported by the
+// Swift umbrella module. Copy returns +1; GetOptionData is borrowed.
+@_silgen_name("SCDynamicStoreCopyDHCPInfo")
+private func ac_sc_copy_dhcp(_ store: OpaquePointer?, _ service: CFString?) -> Unmanaged<CFDictionary>?
+@_silgen_name("DHCPInfoGetOptionData")
+private func ac_sc_dhcp_option(_ info: CFDictionary, _ code: UInt8) -> Unmanaged<CFData>?

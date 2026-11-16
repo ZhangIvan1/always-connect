@@ -29,6 +29,33 @@ fn is_entry(value: &str) -> bool {
     ipv4(value).is_some() || is_network(value)
 }
 
+/// DNS-learned gateway routes are for ordinary unicast, including RFC1918.
+/// Control, link-local, multicast and reserved addresses retain native routing.
+pub(crate) fn ordinary_unicast(ip: std::net::Ipv4Addr) -> bool {
+    let first=ip.octets()[0]; first!=0 && first!=127 && first<224 && !ip.is_link_local()
+}
+pub(crate) fn assigned_ipv4() -> Option<HashSet<std::net::Ipv4Addr>> {
+    let mut list=std::ptr::null_mut();
+    if unsafe {libc::getifaddrs(&mut list)} != 0 {return None;}
+    let mut own=HashSet::new(); let mut at=list;
+    while !at.is_null() {
+        let entry=unsafe{&*at}; at=entry.ifa_next;
+        if !entry.ifa_addr.is_null() && unsafe{(*entry.ifa_addr).sa_family} as i32==libc::AF_INET {
+            let addr=unsafe{&*(entry.ifa_addr as *const libc::sockaddr_in)};
+            own.insert(std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)));
+        }
+    }
+    unsafe {libc::freeifaddrs(list)};
+    Some(own)
+}
+fn gateway_entry(entry: &str, own: &HashSet<std::net::Ipv4Addr>) -> bool {
+    if let Ok(ip)=entry.parse::<std::net::Ipv4Addr>() {return ordinary_unicast(ip)&&!own.contains(&ip);}
+    let Some((lo,hi))=cidr_range(entry) else {return false};
+    if lo==hi {return ordinary_unicast(lo.into())&&!own.contains(&lo.into());}
+    ![(0x00000000,0x00ffffff),(0x7f000000,0x7fffffff),(0xa9fe0000,0xa9feffff),(0xe0000000,u32::MAX)]
+        .iter().any(|(a,b)|lo>=*a &&hi<=*b)
+}
+
 /// The IPv4 networks of every wired/Wi-Fi (en*) interface that is up,
 /// 169.254 left out (no network yet).
 pub fn attached_interfaces() -> Vec<(String, (u32, u32))> {
@@ -71,7 +98,7 @@ pub fn networks_to_route(networks: &[String], attached: &[(u32, u32)]) -> Vec<St
     networks
         .iter()
         .filter(|cidr| {
-            if !is_network(cidr) {
+            if !is_network(cidr) || !gateway_entry(cidr,&HashSet::new()) {
                 return false;
             }
             let Some((lo, hi)) = cidr_range(cidr) else { return false };
@@ -94,34 +121,87 @@ fn route(args: &[&str]) -> i32 {
 /// Takes one of our routes out. A network the Mac has meanwhile moved
 /// onto (ours was there first, so the system could not put its own
 /// interface route in) gets that interface route back.
-fn delete(entry: &str) -> bool {
+fn delete_with(entry: &str, run: &dyn Fn(&[&str]) -> i32) -> bool {
+    if !gateway_entry(entry,&HashSet::new()) {return true;}
+    let Some(own)=assigned_ipv4() else {return false};
+    if !gateway_entry(entry,&own) {return true;}
     if !is_network(entry) {
-        return route(&["-n", "delete", "-host", entry]) == 0;
+        return run(&["-n", "delete", "-host", entry]) == 0;
     }
-    if route(&["-n", "delete", "-net", entry]) != 0 { return false; }
+    if run(&["-n", "delete", "-net", entry]) != 0 { return false; }
     if let Some(r) = cidr_range(entry) {
         if let Some((iface, _)) = attached_interfaces().into_iter().find(|(_, n)| *n == r) {
-            route(&["-n", "add", "-net", entry, "-interface", &iface]);
+            run(&["-n", "add", "-net", entry, "-interface", &iface]);
         }
     }
     true
 }
 
-fn undo(journal: &Path, no_routes: bool) -> usize {
-    let Ok(text) = fs::read_to_string(journal) else { return 0 };
-    let mut count = 0;
-    for line in text.lines().filter(|l| !l.starts_with("boot ")) {
-        let Some(ip) = line.split(' ').next() else { continue };
-        if !is_entry(ip) {
+fn delete(entry: &str) -> bool { delete_with(entry, &route) }
+
+/// Parse the complete numeric IPv4 table. A failed read or unknown shape is
+/// not evidence of absence; a default route is not a host route to this IP.
+fn table_contains(text: &str, entry: &str) -> Option<bool> {
+    let wanted = cidr_range(&if is_network(entry) { entry.into() } else { format!("{entry}/32") })?;
+    let mut header = false; let mut found = false;
+    for line in text.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        if !header {
+            if line.starts_with("Destination") && line.contains("Gateway") && line.contains("Flags") && line.contains("Netif") { header = true; }
             continue;
         }
-        if !no_routes {
-            delete(ip);
-        }
-        count += 1;
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 4 { return None; }
+        if fields[0] == "default" { continue; }
+        let (ip,bits) = fields[0].split_once('/').map(|(ip,b)| (ip,Some(b))).unwrap_or((fields[0],None));
+        let mut labels: Vec<_> = ip.split('.').collect(); if labels.len()>4 { return None; }
+        let prefix = bits.map(str::to_owned).unwrap_or_else(|| (labels.len()*8).to_string());
+        while labels.len()<4 { labels.push("0"); }
+        let range = cidr_range(&format!("{}/{prefix}",labels.join(".")))?;
+        found |= range == wanted;
     }
-    let _ = fs::remove_file(journal);
-    count
+    header.then_some(found)
+}
+
+#[derive(Default)]
+struct Cleanup { retired: usize, pending: usize }
+fn atomic_journal(journal: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut random=[0;8]; fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let suffix=random.iter().map(|v|format!("{v:02x}")).collect::<String>();
+    let temporary=journal.with_file_name(format!("direct-routes.retire-{suffix}"));
+    let result=(|| {
+        let mut file=fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
+        file.write_all(contents.as_bytes())?; file.sync_all()?; fs::rename(&temporary,journal)
+    })();
+    if result.is_err(){let _=fs::remove_file(&temporary);}
+    result
+}
+fn undo_with(journal: &Path, no_routes: bool, remove: &dyn Fn(&str)->bool) -> Cleanup {
+    let text=match fs::read_to_string(journal) {
+        Ok(text)=>text, Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Cleanup::default(),
+        Err(_)=>return Cleanup {retired:0,pending:1},
+    };
+    let mut result=Cleanup::default(); let mut kept=Vec::new();
+    for line in text.lines().filter(|line|!line.is_empty()) {
+        if line.starts_with("boot "){kept.push(line.to_owned());continue;}
+        let Some(ip)=line.split_whitespace().next() else {continue};
+        if !is_entry(ip){continue;}
+        if no_routes || remove(ip) {result.retired+=1;}
+        else {result.pending+=1;kept.push(line.to_owned());}
+    }
+    let persisted=if result.pending==0 {fs::remove_file(journal)} else {atomic_journal(journal,&(kept.join("\n")+"\n"))};
+    if persisted.is_err(){result.pending=result.pending.max(1);}
+    result
+}
+fn undo(journal: &Path, no_routes: bool) -> Cleanup {
+    undo_with(journal,no_routes,&|ip| {
+        if delete(ip){return true;}
+        let table=crate::network_check::read_command("/usr/sbin/netstat", &["-rn".into(),"-f".into(),"inet".into()],std::time::Duration::from_millis(400));
+        table.ok && table_contains(&table.text,ip)==Some(false)
+    })
+}
+fn cleanup_status(result: Cleanup) -> String {
+    if result.pending>0 {format!("pending {}",result.pending)} else {format!("removed {}",result.retired)}
 }
 
 /// Daemon start: a journal from this boot is undone (its session died
@@ -136,7 +216,7 @@ pub fn undo_at_start(journal: &Path, boot: Option<&str>, no_routes: bool) -> Str
         let _ = fs::remove_file(journal);
         return "dropped".into();
     }
-    format!("removed {}", undo(journal, no_routes))
+    cleanup_status(undo(journal,no_routes))
 }
 
 pub struct DirectRoutes {
@@ -144,18 +224,38 @@ pub struct DirectRoutes {
     boot: String,
     no_routes: bool,
     routed: Mutex<HashSet<String>>,
+    #[cfg(test)]
+    test_system: Mutex<Option<(Box<dyn Fn(&[&str]) -> i32 + Send + Sync>, crate::network_check::Output)>>,
 }
 
 impl DirectRoutes {
     pub fn new(journal: PathBuf, boot: String, no_routes: bool) -> Self {
-        DirectRoutes { journal, boot, no_routes, routed: Mutex::new(HashSet::new()) }
+        DirectRoutes { journal, boot, no_routes, routed: Mutex::new(HashSet::new()), #[cfg(test)] test_system: Mutex::new(None) }
+    }
+
+    fn skip_routes(&self) -> bool {
+        #[cfg(test)] if self.test_system.lock().unwrap().is_some() { return false; }
+        self.no_routes
+    }
+    fn command(&self, args: &[&str]) -> i32 {
+        #[cfg(test)] if let Some((run,_)) = &*self.test_system.lock().unwrap() { return run(args); }
+        route(args)
+    }
+    fn table(&self) -> crate::network_check::Output {
+        #[cfg(test)] if let Some((_,out)) = &*self.test_system.lock().unwrap() { return out.clone(); }
+        crate::network_check::read_command("/usr/sbin/netstat", &["-rn".into(),"-f".into(),"inet".into()], std::time::Duration::from_millis(400))
+    }
+    #[cfg(test)]
+    pub(crate) fn test_commands(&self, run: Box<dyn Fn(&[&str]) -> i32 + Send + Sync>, table: crate::network_check::Output) {
+        *self.test_system.lock().unwrap() = Some((run,table));
     }
 
     /// Route `entries` via `gateway` (the physical default gateway).
     /// Returns once the routes are in place.
     pub fn add(&self, entries: &[String], gateway: &str) -> bool {
         let mut routed = self.routed.lock().unwrap();
-        let fresh: Vec<&String> = entries.iter().filter(|e| is_entry(e) && !routed.contains(*e)).collect();
+        let Some(own)=assigned_ipv4() else {return false};
+        let fresh: Vec<&String> = entries.iter().filter(|e| is_entry(e) && gateway_entry(e,&own) && !routed.contains(*e)).collect();
         if fresh.is_empty() { return true; }
         if ipv4(gateway).is_none() { return false; }
         // A failed journal write must never be followed by an untracked route.
@@ -177,12 +277,12 @@ impl DirectRoutes {
                 // subnet of another interface or the system's own: never
                 // `change` it, never record it, or its undo deletes the
                 // system's route and the LAN is gone (§30.2).
-                if !self.no_routes && route(&["-n", "add", "-net", entry, gateway]) != 0 {
+                if !self.skip_routes() && self.command(&["-n", "add", "-net", entry, gateway]) != 0 {
                     refused.push(entry.clone());
                     continue;
                 }
-            } else if !self.no_routes && route(&["-n", "add", "-host", entry, gateway]) != 0 {
-                if route(&["-n", "change", "-host", entry, gateway]) != 0 {
+            } else if !self.skip_routes() && self.command(&["-n", "add", "-host", entry, gateway]) != 0 {
+                if self.command(&["-n", "change", "-host", entry, gateway]) != 0 {
                     refused.push(entry.clone());
                     continue;
                 }
@@ -211,13 +311,14 @@ impl DirectRoutes {
     /// destinations, which is all the undo needs.
     pub fn repoint(&self, gateway: &str) {
         let routed = self.routed.lock().unwrap();
-        if ipv4(gateway).is_none() || self.no_routes {
+        if ipv4(gateway).is_none() || self.skip_routes() {
             return;
         }
-        for entry in routed.iter() {
+        let Some(own)=assigned_ipv4() else {return};
+        for entry in routed.iter().filter(|entry|gateway_entry(entry,&own)) {
             let kind = if is_network(entry) { "-net" } else { "-host" };
-            if route(&["-n", "change", kind, entry, gateway]) != 0 {
-                route(&["-n", "add", kind, entry, gateway]);
+            if self.command(&["-n", "change", kind, entry, gateway]) != 0 {
+                self.command(&["-n", "add", kind, entry, gateway]);
             }
         }
     }
@@ -227,16 +328,23 @@ impl DirectRoutes {
     pub fn remove(&self, entries: &[String]) -> bool {
         let mut routed = self.routed.lock().unwrap();
         let mut removed = Vec::new();
-        let mut ok = true;
+        let mut failed = Vec::new();
         for entry in entries {
             if !routed.contains(entry) { continue; }
-            if self.no_routes || delete(entry) {
-                routed.remove(entry);
-                removed.push(entry.clone());
-            } else { ok = false; }
+            if self.skip_routes() || delete_with(entry, &|args| self.command(args)) {
+                routed.remove(entry); removed.push(entry.clone());
+            } else { failed.push(entry.clone()); }
+        }
+        if !failed.is_empty() {
+            let actual = self.table();
+            failed.retain(|entry| {
+                if actual.ok && table_contains(&actual.text, entry) == Some(false) {
+                    routed.remove(entry); removed.push(entry.clone()); false
+                } else { true }
+            });
         }
         if !removed.is_empty() { self.forget(&removed); }
-        ok
+        failed.is_empty()
     }
 
     pub fn addresses(&self) -> Vec<String> {
@@ -244,11 +352,19 @@ impl DirectRoutes {
     }
 
     /// Every route in the journal out, then the journal.
-    pub fn remove_all(&self) {
-        let mut routed = self.routed.lock().unwrap();
-        undo(&self.journal, self.no_routes);
-        routed.clear();
+    pub fn remove_all(&self) -> bool {
+        let mut routed=self.routed.lock().unwrap();
+        #[cfg(test)] let fake=self.test_system.lock().unwrap().is_some();
+        #[cfg(not(test))] let fake=false;
+        let result=undo(&self.journal,self.no_routes||fake);
+        if result.pending==0 {routed.clear();}
+        else if let Ok(text)=fs::read_to_string(&self.journal) {
+            let pending:HashSet<_>=text.lines().filter_map(|line|line.split_whitespace().next()).collect();
+            routed.retain(|entry|pending.contains(entry.as_str()));
+        }
+        result.pending==0
     }
+
 }
 
 #[cfg(test)]
@@ -279,6 +395,53 @@ mod tests {
         assert!(!fs::read_to_string(&j).unwrap().contains("203.0.113.9"), "removed routes must leave the journal too");
         r.remove_all();
         assert!(!j.exists() && r.addresses().is_empty());
+    }
+
+    #[test]
+    fn unknown_or_failed_cleanup_keeps_only_pending_entries_for_retry() {
+        let journal=temp("cleanup-pending");
+        fs::write(&journal,"boot B1\n203.0.113.9 192.168.1.1\n203.0.113.10 192.168.1.1\n").unwrap();
+        let first=undo_with(&journal,false,&|ip|ip=="203.0.113.9");
+        assert_eq!(first.retired,1);assert_eq!(cleanup_status(first),"pending 1");
+        let text=fs::read_to_string(&journal).unwrap();assert!(!text.contains("203.0.113.9 "));assert!(text.contains("203.0.113.10 "));
+        let unknown=undo_with(&journal,false,&|_|false);assert_eq!(cleanup_status(unknown),"pending 1");assert!(journal.exists());
+        let done=undo_with(&journal,false,&|_|true);assert_eq!(cleanup_status(done),"removed 1");assert!(!journal.exists());
+        fs::remove_dir_all(journal.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn control_addresses_never_reach_add_change_delete_or_network_routes() {
+        let own=HashSet::from([std::net::Ipv4Addr::new(203,0,113,8)]);
+        for value in ["0.0.0.0","0.1.2.3","127.0.0.1","127.0.0.2","169.254.1.2","224.0.0.1","240.0.0.1","255.255.255.255","203.0.113.8"] {
+            assert!(!gateway_entry(value,&own));
+        }
+        for value in ["10.0.0.1","172.16.0.1","192.168.1.5","203.0.113.9"] {assert!(gateway_entry(value,&own));}
+        assert!(!gateway_entry("127.0.0.1/32",&own));
+        assert!(networks_to_route(&["127.0.0.0/8".into(),"224.0.0.0/4".into(),"169.254.0.0/16".into()],&[]).is_empty());
+        let journal=temp("control-protection");let routes=DirectRoutes::new(journal.clone(),"B1".into(),false);
+        routes.test_commands(Box::new(|_|panic!("control route must not issue a system command")),crate::network_check::Output::default());
+        assert!(routes.add(&["127.0.0.1".into(),"0.0.0.0".into(),"224.0.0.1".into()],"192.168.1.1"));
+        assert!(routes.addresses().is_empty());
+        assert!(delete_with("127.0.0.1",&|_|panic!("must not delete loopback")));
+        fs::remove_dir_all(journal.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn already_absent_routes_are_idempotent_but_unknown_or_present_are_not() {
+        let header = "Destination Gateway Flags Netif Expire\n";
+        for (suffix, expected) in [("default 192.168.1.1 UGSc en0\n",true),("203.0.113.9 192.168.1.1 UGHS en0\n",false)] {
+            let journal=temp(if expected {"already-absent"}else{"still-present"});
+            let routes=DirectRoutes::new(journal.clone(),"B1".into(),false);
+            routes.test_commands(Box::new(|args| if args.contains(&"delete") {1}else{0}), crate::network_check::Output {ok:true,text:format!("{header}{suffix}")});
+            assert!(routes.add(&["203.0.113.9".into()],"192.168.1.1"));
+            assert_eq!(routes.remove(&["203.0.113.9".into()]), expected);
+            assert_eq!(routes.addresses().is_empty(),expected);
+            assert_eq!(!fs::read_to_string(&journal).unwrap().contains("203.0.113.9"),expected);
+            fs::remove_dir_all(journal.parent().unwrap()).unwrap();
+        }
+        assert_eq!(table_contains("permission denied","203.0.113.9"),None);
+        assert_eq!(table_contains(&format!("{header}203.0.113 192.168.1.1 UGS en0\n"),"203.0.113.9"),Some(false));
+        assert_eq!(table_contains(&format!("{header}10.20/16 192.168.1.1 UGS en0\n"),"10.20.0.0/16"),Some(true));
     }
 
     #[test]

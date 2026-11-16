@@ -14,6 +14,7 @@ CALLS=$WORK/calls
 cat > "$STUBS/route" <<'STUB'
 #!/bin/sh
 echo "route $*" >> "$CALLS"
+[ "${FAKE_SCOPE_DELETE_FAIL:-}" = 1 ] && [ "$2 $3" = "delete -ifscope" ] && exit 1
 [ -n "$FAKE_HOST_ROUTE_FAIL" ] && [ "$2 $3" = "add -host" ] && exit 1
 [ -n "$FAKE_HOST_ROUTE_FAIL" ] && [ "$2 $3" = "change -host" ] && exit 1
 if [ "$1 $2 $3" = "-n get default" ]; then
@@ -35,11 +36,26 @@ cat > "$STUBS/ifconfig" <<'STUB'
 #!/bin/sh
 echo "ifconfig $*" >> "$CALLS"
 [ "$1" = "-l" ] && echo "${FAKE_IFLIST:-lo0 en0}"
+if [ "$1" = "-v" ]; then
+  if [ "$2" = "${TUNDEV:-}" ]; then
+    echo "$2: flags=8051 mtu 1300 index ${FAKE_TUN_INDEX:-107}"
+    echo "    inet ${FAKE_TUN_ADDR:-$INTERNAL_IP4_ADDRESS} --> $INTERNAL_IP4_ADDRESS netmask 0xffffffff"
+  elif [ "$2" = "${FAKE_OTHER_TUN:-}" ]; then
+    echo "$2: flags=8051 mtu 1300 index ${FAKE_OTHER_INDEX:-999}"
+    echo "    inet ${FAKE_OTHER_ADDR:-198.51.100.2} --> 198.51.100.2 netmask 0xffffffff"
+  else exit 1; fi
+fi
 exit 0
 STUB
 cat > "$STUBS/scutil" <<'STUB'
 #!/bin/sh
 echo "scutil $(tr '\n' ';')" >> "$CALLS"
+STUB
+cat > "$STUBS/netstat" <<'STUB'
+#!/bin/sh
+printf 'Destination Gateway Flags Netif Expire\n'
+[ "${FAKE_SCOPE_ROUTE_PRESENT:-}" = 1 ] && printf 'default link#107 UCSI %s\n' "${FAKE_SCOPE_ROUTE_TUN:-$TUNDEV}"
+exit 0
 STUB
 chmod +x "$STUBS"/*
 export CALLS PATH="$STUBS:$PATH"
@@ -86,7 +102,8 @@ OUT=$(TUNDEV=utun8 FAKE_DEFAULT="10.8.0.2 utun8" ALWAYSCONNECT_MANUAL_FLAG_PATH=
 echo "$OUT" | grep -q 'AC_HOOK disconnect-manual' || FAILS=$((FAILS+1))
 expect "remove State:/Network/Service/utun8/IPv4"
 expect "remove State:/Network/Service/utun7/DNS"
-expect "route -n delete -ifscope utun7 default"
+reject "route -n delete -ifscope utun7 default"
+expect "route -n delete -ifscope utun8 default"
 expect "route -n add default 192.168.1.1"
 expect "route -n delete -host 203.0.113.5"
 [ ! -f "$ALWAYSCONNECT_ROUTE_STATE_PATH" ] || { echo "  state not cleared"; FAILS=$((FAILS+1)); }
@@ -97,7 +114,7 @@ reject "route -n add default"
 reject "route -n delete"
 
 step "restore keeps a physical default configd already installed"
-printf 'AC_PHYS_GW=192.168.1.1\nAC_VPN_GW=203.0.113.5\nAC_TUN=utun8\n' > "$ALWAYSCONNECT_ROUTE_STATE_PATH"
+printf 'AC_BOOT=boot-1\nAC_PHYS_GW=192.168.1.1\nAC_VPN_GW=203.0.113.5\nAC_TUN=utun8\n' > "$ALWAYSCONNECT_ROUTE_STATE_PATH"
 FAKE_DEFAULT="172.20.0.1 en0" "$SCRIPT" restore >/dev/null
 reject "route -n add default"
 reject "route -n delete default"
@@ -123,6 +140,48 @@ OUT=$(FAKE_DEFAULT="192.168.1.1 en0" ALWAYSCONNECT_DNS_FIRST=127.0.0.1 "$SCRIPT"
 expect "d.add ServerAddresses * 127.0.0.1;set State:/Network/Service/utun7/DNS"
 reject "ServerAddresses * 127.0.0.1 10.1.1.1"
 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" restore >/dev/null
+
+step "retired utun reused by another VPN is not deleted again"
+rm -f "$ALWAYSCONNECT_ROUTE_STATE_PATH"
+FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" connect >/dev/null
+TUNDEV=utun8 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" connect >/dev/null
+: > "$CALLS"
+TUNDEV=utun8 FAKE_OTHER_TUN=utun7 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" restore >/dev/null
+reject "route -n delete -ifscope utun7 default"
+expect "route -n delete -ifscope utun8 default"
+step "current utun name with a different kernel index belongs to another owner"
+FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" connect >/dev/null
+: > "$CALLS"
+FAKE_TUN_INDEX=999 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" restore >/dev/null
+reject "route -n delete -ifscope utun7 default"
+step "already absent scoped route retires, actual failure preserves its ownership"
+FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" connect >/dev/null
+FAKE_SCOPE_DELETE_FAIL=1 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" restore >/dev/null
+[ ! -f "$ALWAYSCONNECT_ROUTE_STATE_PATH" ] || { echo "  absent scope was not retired"; FAILS=$((FAILS+1)); }
+FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" connect >/dev/null
+if FAKE_SCOPE_DELETE_FAIL=1 FAKE_SCOPE_ROUTE_PRESENT=1 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" restore >/dev/null 2>&1; then
+  echo "  scope failure was reported as restored"; FAILS=$((FAILS+1))
+fi
+grep -q '^AC_SCOPED_TUN=utun7$' "$ALWAYSCONNECT_ROUTE_STATE_PATH" || { echo "  pending scope lost its ownership"; FAILS=$((FAILS+1)); }
+# A new tunnel must not overwrite pending ownership from failed recovery.
+: > "$CALLS"
+if TUNDEV=utun8 FAKE_OTHER_TUN=utun7 FAKE_OTHER_INDEX=107 FAKE_OTHER_ADDR=10.8.0.2 \
+  FAKE_SCOPE_DELETE_FAIL=1 FAKE_SCOPE_ROUTE_PRESENT=1 FAKE_SCOPE_ROUTE_TUN=utun7 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" connect >/dev/null 2>&1; then
+  echo "  pending owner was overwritten by new connect"; FAILS=$((FAILS+1))
+fi
+grep -q '^AC_SCOPED_TUN=utun7$' "$ALWAYSCONNECT_ROUTE_STATE_PATH" || { echo "  old owner lost"; FAILS=$((FAILS+1)); }
+reject "route -n add -ifscope utun8"
+TUNDEV=utun8 FAKE_OTHER_TUN=utun7 FAKE_OTHER_INDEX=107 FAKE_OTHER_ADDR=10.8.0.2 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" connect >/dev/null
+grep -q '^AC_SCOPED_TUN=utun8$' "$ALWAYSCONNECT_ROUTE_STATE_PATH" || { echo "  successful retirement did not allow replacement"; FAILS=$((FAILS+1)); }
+TUNDEV=utun8 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" restore >/dev/null
+[ ! -f "$ALWAYSCONNECT_ROUTE_STATE_PATH" ] || { echo "  successful retry retained state"; FAILS=$((FAILS+1)); }
+
+step "another boot's ledger never changes routes"
+printf 'AC_BOOT=previous-boot\nAC_PHYS_GW=192.168.1.1\nAC_VPN_GW=203.0.113.1\nAC_TUN=utun7\nAC_SCOPED_TUN=utun7\nAC_SCOPED_INDEX=107\nAC_SCOPED_ADDR=10.8.0.2\n' > "$ALWAYSCONNECT_ROUTE_STATE_PATH"
+: > "$CALLS"
+FAKE_DEFAULT="" "$SCRIPT" restore >/dev/null
+reject "route -n delete"
+reject "route -n add"
 
 step "journal comes first: a session cut off at its first change leaves an undoable record (§26.3)"
 rm -f "$ALWAYSCONNECT_ROUTE_STATE_PATH"

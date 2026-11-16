@@ -1793,14 +1793,36 @@ pub extern "C" fn ac_oc_network_check(engine: *const crate::oc_engine::Engine) -
 
 
 #[no_mangle]
-pub extern "C" fn ac_resolve_gateway(host: *const c_char, servers: *const c_char, interface: *const c_char) -> *mut c_char {
+pub extern "C" fn ac_resolve_gateway(permit: *const crate::dns_forwarder::GatewayPermit, host: *const c_char, servers: *const c_char, interface: *const c_char) -> *mut c_char {
+    let Some(permit)=(unsafe {permit.as_ref()}) else {return CString::new("").unwrap().into_raw()};
+    if !permit.active() {return CString::new("").unwrap().into_raw();}
     let values = match (c_str(host), c_str(interface)) {
         (Some(host), Some(interface)) => {
             let servers = c_list(servers, ',');
             if crate::network_guard::shared().is_some_and(|g| !g.refresh_bootstrap_dns(&interface, &servers)) { vec![] }
-            else { crate::dns_forwarder::resolve_gateway(&host, &servers, &interface) }
+            else { crate::dns_forwarder::resolve_gateway_with(permit, &host, &servers, &interface) }
         },
         _ => vec![],
     };
     CString::new(values.join(",")).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+}
+
+
+#[no_mangle]
+pub extern "C" fn ac_gateway_claim() -> *mut crate::dns_forwarder::GatewayPermit {
+    crate::dns_forwarder::GatewayPermit::claim().map(|p|Box::into_raw(Box::new(p))).unwrap_or(std::ptr::null_mut())
+}
+#[no_mangle]
+pub extern "C" fn ac_gateway_active(p: *const crate::dns_forwarder::GatewayPermit) -> bool {
+    unsafe {p.as_ref()}.is_some_and(|p|p.active())
+}
+#[no_mangle]
+pub extern "C" fn ac_gateway_free(p: *mut crate::dns_forwarder::GatewayPermit) {
+    if !p.is_null() {unsafe {drop(Box::from_raw(p));}}
+}
+#[no_mangle]
+pub extern "C" fn ac_dhcp_dns(bytes: *const u8, count: usize) -> *mut c_char {
+    if bytes.is_null() || count>1024 {return CString::new("").unwrap().into_raw();}
+    let values=crate::dns_forwarder::dhcp_dns(unsafe{std::slice::from_raw_parts(bytes,count)});
+    CString::new(values.join(",")).unwrap().into_raw()
 }

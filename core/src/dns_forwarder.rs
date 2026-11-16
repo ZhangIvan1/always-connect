@@ -63,33 +63,33 @@ pub struct Question {
 /// (name, offset after the name in its own position), following
 /// compression pointers with a hop limit.
 pub fn read_name(m: &[u8], start: usize) -> Option<(String, usize)> {
-    let mut labels: Vec<String> = Vec::new();
-    let mut at = start;
-    let mut end: Option<usize> = None;
-    let mut hops = 0;
-    while at < m.len() {
-        let len = m[at] as usize;
-        if len == 0 {
-            return Some((labels.join("."), end.unwrap_or(at + 1)));
+    let mut name=String::with_capacity(64); let mut at=start; let mut end=None; let mut hops=0; let mut size=1;
+    while at<m.len() {
+        let len=m[at] as usize;
+        if len==0 {return Some((name,end.unwrap_or(at+1)));}
+        if len & 0xc0 == 0xc0 {
+            if at+1>=m.len() || hops>=16 {return None;}
+            end.get_or_insert(at+2); at=((len&0x3f)<<8)|m[at+1] as usize; hops+=1; continue;
         }
-        if len & 0xC0 == 0xC0 {
-            if at + 1 >= m.len() || hops >= 16 {
-                return None;
-            }
-            if end.is_none() {
-                end = Some(at + 2);
-            }
-            at = ((len & 0x3F) << 8) | m[at + 1] as usize;
-            hops += 1;
-            continue;
-        }
-        if at + 1 + len > m.len() {
-            return None;
-        }
-        labels.push(String::from_utf8_lossy(&m[at + 1..at + 1 + len]).into_owned());
-        at += 1 + len;
+        if len & 0xc0 != 0 || at+1+len>m.len() {return None;}
+        size+=1+len; if size>255 {return None;}
+        if !name.is_empty(){name.push('.');}
+        name.push_str(&String::from_utf8_lossy(&m[at+1..at+1+len])); at+=1+len;
     }
     None
+}
+
+/// Allocation-free common question shape; compressed/opaque names use the
+/// full decoder. The accepted characters match the strict address decoder.
+fn plain_name_end(m: &[u8], start: usize) -> Option<usize> {
+    let mut at=start;
+    loop {
+        let len=*m.get(at)? as usize;
+        if len==0 {return Some(at+1);}
+        if len>63 || at+len+2-start>255 {return None;}
+        if !m.get(at+1..at+1+len)?.iter().all(|c|c.is_ascii_alphanumeric()||*c==b'-'||*c==b'_') {return None;}
+        at+=1+len;
+    }
 }
 
 pub fn question(m: &[u8]) -> Option<Question> {
@@ -438,7 +438,7 @@ fn trim_domain(s: &str) -> String {
 }
 
 fn trim_dots(s: &str) -> String {
-    s.to_lowercase().trim_matches('.').to_string()
+    s.trim_matches('.').to_lowercase()
 }
 
 /// "a.b.c.d" as a number.
@@ -553,13 +553,11 @@ fn server_address(server: &str, port: u16) -> Option<SocketAddrV4> {
     Some(SocketAddrV4::new(Ipv4Addr::from_str(host).ok()?, p))
 }
 
-fn upstream_socket(ty: Type, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Socket> {
+fn upstream_socket(ty: Type, interface: Option<&InterfaceBinding>) -> Option<Socket> {
     let proto = if ty == Type::DGRAM { Protocol::UDP } else { Protocol::TCP };
     let s = Socket::new(Domain::IPV4, ty, Some(proto)).ok()?;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let _ = s.set_nosigpipe(true);
-    s.set_read_timeout(Some(timeout)).ok()?;
-    s.set_write_timeout(Some(timeout)).ok()?;
     if let Some(name) = interface {
         name.bind(&s)?;
     }
@@ -585,6 +583,12 @@ impl InterfaceBinding {
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         { let _ = index; Some(Self { name: name.into() }) }
     }
+    fn pinned(name: &str, index: u32) -> Option<Self> {
+        #[cfg(any(target_os="macos",target_os="ios"))]
+        { let _=name; Some(Self {index:std::num::NonZeroU32::new(index)?}) }
+        #[cfg(not(any(target_os="macos",target_os="ios")))]
+        { let c=std::ffi::CString::new(name).ok()?; if unsafe{libc::if_nametoindex(c.as_ptr())}!=index{return None;} Self::new(name) }
+    }
     fn bind(&self, socket: &Socket) -> Option<()> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         { socket.bind_device_by_index_v4(Some(self.index)).ok() }
@@ -599,6 +603,11 @@ fn same_id(answer: &[u8], query: &[u8]) -> bool {
         || answer[4..6] != [0, 1] || query[4..6] != [0, 1] {
         return false;
     }
+    if let Some(qe)=plain_name_end(query,12) {
+        if answer.get(12..qe).is_some_and(|name|name.eq_ignore_ascii_case(&query[12..qe])) {
+            return answer.get(qe..qe+4)==query.get(qe..qe+4) && query.get(qe..qe+4).is_some();
+        }
+    }
     let Some((a, ae)) = read_labels(answer, 12) else { return false };
     let Some((q, qe)) = read_labels(query, 12) else { return false };
     same_name(&a, &q) && answer.get(ae..ae + 4) == query.get(qe..qe + 4)
@@ -608,64 +617,123 @@ fn same_id(answer: &[u8], query: &[u8]) -> bool {
 /// Only addresses belonging to this question's validated IN CNAME chain.
 /// Strip the query's EDNS trailer for the shared bounded decoder.
 fn answer_addresses(answer: &[u8], query: &[u8]) -> Option<Vec<Ipv4Addr>> {
-    let (_, end) = read_labels(query, 12)?;
-    let mut question = query.get(..end + 4)?.to_vec();
-    question[6..12].fill(0);
-    crate::on_demand::dns_addresses(answer, &question)?
-        .iter().map(|ip| ip.parse().ok()).collect()
-}
-
-fn udp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
-    let addr = server_address(server, port)?;
-    let s = upstream_socket(Type::DGRAM, interface, timeout)?;
-    // A connected datagram socket accepts replies only from this upstream.
-    s.connect(&SockAddr::from(addr)).ok()?;
-    let sent = s.send(query).ok()?;
-    if sent != query.len() {
-        return None;
-    }
-    let socket: UdpSocket = s.into();
-    let deadline = Instant::now() + timeout;
-    let mut buffer = vec![0u8; 65535];
-    while Instant::now() < deadline {
-        socket.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))).ok()?;
-        let n = socket.recv(&mut buffer).ok()?;
-        if n == 0 {
-            return None;
-        }
-        // Require the exact question as well as its transaction ID.
-        if same_id(&buffer[..n], query) {
-            buffer.truncate(n);
-            return Some(buffer);
-        }
-    }
-    None
-}
-
-fn tcp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
-    let addr = server_address(server, port)?;
-    let s = upstream_socket(Type::STREAM, interface, timeout)?;
-    s.connect_timeout(&SockAddr::from(addr), timeout).ok()?;
-    let mut stream: TcpStream = s.into();
-    write_framed(&mut stream, query).ok()?;
-    let answer = read_framed(&mut stream)?;
-    same_id(&answer, query).then_some(answer)
-}
-
-/// Each server in turn: UDP, then TCP (also when the UDP answer is
-/// truncated). The first usable answer wins.
-pub fn exchange(query: &[u8], servers: &[String], port: u16, interface: Option<&str>, timeout: Duration) -> Option<Vec<u8>> {
-    let binding = match interface { Some(name) => Some(InterfaceBinding::new(name)?), None => None };
-    exchange_bound(query, servers, port, binding.as_ref(), timeout)
-}
-fn exchange_bound(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
-    for server in servers {
-        if let Some(answer) = udp_exchange(query, server, port, interface, timeout) {
-            if !is_truncated(&answer) {
-                return Some(answer);
+    // The overwhelmingly common single IN A answer needs no name maps. The
+    // general CNAME/section decoder remains the oracle for every other shape.
+    if answer.len()>=12 && query.len()>=12 && query[2]&0xf8==0 && answer[2]&0xfa==0x80
+        && answer[3]&0x0f==0 && answer[..2]==query[..2] && answer[4..12]==[0,1,0,1,0,0,0,0] && query[4..6]==[0,1] {
+        if let Some(qe)=plain_name_end(query,12) {
+            if query.get(qe..qe+4)==Some(&[0,1,0,1]) && answer.get(qe..qe+4)==Some(&[0,1,0,1])
+                && answer.get(12..qe).is_some_and(|name|name.eq_ignore_ascii_case(&query[12..qe])) {
+                let owner=qe+4;
+                let head=if answer.get(owner..owner+2)==Some(&[0xc0,12]) {Some(owner+2)}
+                    else {plain_name_end(answer,owner).filter(|end|answer[owner..*end].eq_ignore_ascii_case(&query[12..qe]))};
+                if let Some(head)=head {
+                    if answer.len()==head+14 && answer.get(head..head+4)==Some(&[0,1,0,1])
+                        && answer.get(head+8..head+10)==Some(&[0,4]) {
+                        return Some(vec![Ipv4Addr::new(answer[head+10],answer[head+11],answer[head+12],answer[head+13])]);
+                    }
+                }
             }
         }
-        if let Some(answer) = tcp_exchange(query, server, port, interface, timeout) {
+    }
+    strict_answer_addresses(answer,query)
+}
+fn strict_answer_addresses(answer: &[u8], query: &[u8]) -> Option<Vec<Ipv4Addr>> {
+    let (_,end)=read_labels(query,12)?;
+    let mut question=query.get(..end+4)?.to_vec(); question[6..12].fill(0);
+    crate::on_demand::dns_addresses(answer,&question)?.iter().map(|ip|ip.parse().ok()).collect()
+}
+
+fn remaining(deadline: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    (!left.is_zero()).then_some(left)
+}
+fn read_exact_until(stream: &mut TcpStream, mut bytes: &mut [u8], deadline: Instant) -> Option<()> {
+    while !bytes.is_empty() {
+        stream.set_read_timeout(Some(remaining(deadline)?)).ok()?;
+        match stream.read(bytes) {
+            Ok(0) => return None,
+            Ok(n) => bytes = &mut bytes[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+fn read_framed_until(stream: &mut TcpStream, deadline: Instant) -> Option<Vec<u8>> {
+    let mut head = [0;2]; read_exact_until(stream,&mut head,deadline)?;
+    let length=u16::from_be_bytes(head) as usize; if length==0 { return None; }
+    let mut out=vec![0;length]; read_exact_until(stream,&mut out,deadline)?; Some(out)
+}
+fn write_framed_until(stream: &mut TcpStream, message: &[u8], deadline: Instant) -> Option<()> {
+    let length=u16::try_from(message.len()).ok()?;
+    let mut frame=Vec::with_capacity(message.len()+2); frame.extend(length.to_be_bytes()); frame.extend(message);
+    let mut bytes=frame.as_slice();
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining(deadline)?)).ok()?;
+        match stream.write(bytes) {
+            Ok(0) => return None,
+            Ok(n) => bytes=&bytes[n..],
+            Err(e) if e.kind()==io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+fn udp_exchange_until(query: &[u8], server: &str, port: u16, interface: Option<&InterfaceBinding>, deadline: Instant) -> Option<Vec<u8>> {
+    let addr=server_address(server,port)?;
+    let s=upstream_socket(Type::DGRAM,interface)?;
+    s.connect(&SockAddr::from(addr)).ok()?;
+    s.set_write_timeout(Some(remaining(deadline)?)).ok()?;
+    if s.send(query).ok()? != query.len() { return None; }
+    let mut buffer=vec![std::mem::MaybeUninit::<u8>::uninit();65535];
+    loop {
+        s.set_read_timeout(Some(remaining(deadline)?)).ok()?;
+        let n=s.recv(&mut buffer).ok()?; if n==0 { return None; }
+        // socket2 guarantees the returned prefix has been initialised by recv.
+        // Bytes outside that prefix are never inspected or sent to a client.
+        let received=unsafe {std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(),n)};
+        if same_id(received,query) {
+            let buffer=std::mem::ManuallyDrop::new(buffer);
+            // MaybeUninit<u8> has the same allocation layout as u8. Transfer
+            // ownership once, with length n restricted to the initialised prefix.
+            return Some(unsafe {Vec::from_raw_parts(buffer.as_ptr().cast::<u8>() as *mut u8,n,buffer.capacity())});
+        }
+    }
+}
+#[cfg(test)]
+fn udp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
+    udp_exchange_until(query,server,port,interface,Instant::now()+timeout)
+}
+fn tcp_exchange_until(query: &[u8], server: &str, port: u16, interface: Option<&InterfaceBinding>, deadline: Instant) -> Option<Vec<u8>> {
+    let addr=server_address(server,port)?;
+    let s=upstream_socket(Type::STREAM,interface)?;
+    s.connect_timeout(&SockAddr::from(addr),remaining(deadline)?).ok()?;
+    let mut stream: TcpStream=s.into();
+    write_framed_until(&mut stream,query,deadline)?;
+    let answer=read_framed_until(&mut stream,deadline)?;
+    same_id(&answer,query).then_some(answer)
+}
+
+/// Each server in turn, within one absolute budget. Partial TCP reads/writes
+/// consume the same budget instead of starting another socket timeout.
+pub fn exchange(query: &[u8], servers: &[String], port: u16, interface: Option<&str>, timeout: Duration) -> Option<Vec<u8>> {
+    let binding=match interface {Some(name)=>Some(InterfaceBinding::new(name)?),None=>None};
+    exchange_bound(query,servers,port,binding.as_ref(),timeout)
+}
+fn exchange_bound(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
+    let attempts=u32::try_from(servers.len().saturating_mul(2)).unwrap_or(u32::MAX);
+    let budget=timeout.saturating_mul(attempts).min(Duration::from_secs(8));
+    exchange_until(query,servers,port,interface,timeout,Instant::now()+budget)
+}
+fn exchange_until(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>, attempt: Duration, deadline: Instant) -> Option<Vec<u8>> {
+    for server in servers {
+        remaining(deadline)?;
+        if let Some(answer)=udp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
+            if !is_truncated(&answer) { return Some(answer); }
+        }
+        remaining(deadline)?;
+        if let Some(answer)=tcp_exchange_until(query,server,port,interface,deadline.min(Instant::now()+attempt)) {
             if !is_truncated(&answer) { return Some(answer); }
         }
     }
@@ -695,15 +763,43 @@ pub fn write_framed<W: Write>(w: &mut W, message: &[u8]) -> io::Result<()> {
 /// Bootstrap exception for the VPN gateway itself, called by the signed App
 /// through the root service. Never a general resolver or a system fallback.
 /// Direct/company site queries continue through the split forwarder.
+static GATEWAY_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+const MAX_GATEWAY_INFLIGHT: usize = 4;
+pub struct GatewayPermit { deadline: Instant }
+impl GatewayPermit {
+    pub(crate) fn claim() -> Option<Self> {
+        let mut count=GATEWAY_INFLIGHT.load(Ordering::Acquire);
+        loop {
+            if count>=MAX_GATEWAY_INFLIGHT {return None;}
+            match GATEWAY_INFLIGHT.compare_exchange_weak(count,count+1,Ordering::AcqRel,Ordering::Acquire) {
+                Ok(_) => break, Err(actual) => count=actual,
+            }
+        }
+        Some(Self {deadline: Instant::now()+Duration::from_millis(800)})
+    }
+    pub(crate) fn active(&self) -> bool { remaining(self.deadline).is_some() }
+}
+impl Drop for GatewayPermit { fn drop(&mut self) { GATEWAY_INFLIGHT.fetch_sub(1,Ordering::AcqRel); } }
 pub fn resolve_gateway(host: &str, servers: &[String], physical_if: &str) -> Vec<String> {
-    if let Ok(ip) = host.parse::<Ipv4Addr>() { return vec![ip.to_string()]; }
-    let Some(mut query) = crate::on_demand::dns_query(host) else { return vec![] };
-    let mut id = [0; 2];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut id)).is_err() { return vec![]; }
+    let Some(permit)=GatewayPermit::claim() else {return vec![]};
+    resolve_gateway_with(&permit,host,servers,physical_if)
+}
+pub(crate) fn resolve_gateway_with(permit: &GatewayPermit, host: &str, servers: &[String], physical_if: &str) -> Vec<String> {
+    if !permit.active() { return vec![]; }
+    if let Ok(ip)=host.parse::<Ipv4Addr>() { return vec![ip.to_string()]; }
+    let Some(mut query)=crate::on_demand::dns_query(host) else {return vec![]};
+    let mut id=[0;2];
+    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut id)).is_err() {return vec![];}
     query[..2].copy_from_slice(&id);
-    let servers: Vec<_> = servers.iter().take(2).cloned().collect();
-    let Some(answer) = exchange(&query, &servers, 53, Some(physical_if), Duration::from_millis(200)) else { return vec![] };
-    answer_addresses(&answer, &query).unwrap_or_default().iter().map(ToString::to_string).collect()
+    let servers: Vec<_>=servers.iter().take(2).cloned().collect();
+    let Some(binding)=InterfaceBinding::new(physical_if) else {return vec![]};
+    let Some(answer)=exchange_until(&query,&servers,53,Some(&binding),Duration::from_millis(200),permit.deadline) else {return vec![]};
+    answer_addresses(&answer,&query).unwrap_or_default().iter().map(ToString::to_string).collect()
+}
+
+pub(crate) fn dhcp_dns(bytes: &[u8]) -> Vec<String> {
+    if bytes.len()%4 != 0 {return vec![];}
+    bytes.chunks_exact(4).map(|b| Ipv4Addr::new(b[0],b[1],b[2],b[3]).to_string()).collect()
 }
 
 // MARK: - The forwarder
@@ -786,9 +882,8 @@ impl Inner {
         if names.len() > NAME_CACHE_LIMIT {
             names.clear();
         }
-        for ip in ips {
-            names.insert(*ip, clean.clone());
-        }
+        if let [ip]=ips { names.insert(*ip,clean); }
+        else { for ip in ips { names.insert(*ip,clean.clone()); } }
     }
 
     fn direct(&self, entry: &str, ips: &[Ipv4Addr]) {
@@ -822,13 +917,13 @@ impl Inner {
         } else { Vec::new() };
         addresses.sort_unstable(); addresses.dedup();
         let direct: Vec<_> = addresses.iter().copied()
-            .filter(|ip| entry.is_some() || rules.contains(*ip)).collect();
+            .filter(|ip| crate::direct_routes::ordinary_unicast(*ip) && (entry.is_some() || rules.contains(*ip))).collect();
         if self.settings.read().unwrap().epoch != epoch { return None; }
         if q.qtype == TYPE_A {
             if let Some(hook) = &self.on_answer {
                 let name = trim_dots(&q.name);
-                let observed = (epoch, addresses.clone(), direct.clone());
-                let duplicate = self.acknowledged.lock().unwrap().get(&name) == Some(&observed);
+                let duplicate = self.acknowledged.lock().unwrap().get(&name)
+                    .is_some_and(|(seen,ips,allowed)|*seen==epoch&&*ips==addresses&&*allowed==direct);
                 if !duplicate {
                     if !hook(Observation { epoch, name: name.clone(), entry: entry.clone(), addresses: addresses.clone(), direct: direct.clone() }) {
                         self.acknowledged.lock().unwrap().clear();
@@ -839,7 +934,7 @@ impl Inner {
                     let mut known = self.acknowledged.lock().unwrap();
                     if known.len() >= NAME_CACHE_LIMIT
                         || known.values().map(|v| v.1.len() + v.2.len()).sum::<usize>() + addresses.len() + direct.len() > 8192 { known.clear(); }
-                    known.insert(name, observed);
+                    known.insert(name, (epoch, addresses.clone(), direct.clone()));
                 }
             }
         }
@@ -978,12 +1073,20 @@ impl Forwarder {
     }
 
     pub fn set_upstreams(&self, upstreams: Upstreams) {
-        let mut settings = self.inner.settings.write().unwrap();
+        self.update_upstreams(upstreams,None,false);
+    }
+    pub(crate) fn set_pinned_upstreams(&self, upstreams: Upstreams, index: Option<u32>) {
+        self.update_upstreams(upstreams,index,true);
+    }
+    fn update_upstreams(&self, upstreams: Upstreams, pinned: Option<u32>, require_pin: bool) {
+        let mut settings=self.inner.settings.write().unwrap();
         self.inner.acknowledged.lock().unwrap().clear();
-        settings.physical_binding = upstreams.physical_if.as_deref().and_then(InterfaceBinding::new);
-        settings.tunnel_binding = upstreams.tunnel_if.as_deref().and_then(InterfaceBinding::new);
-        settings.upstreams = upstreams;
-        settings.epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+        settings.physical_binding=upstreams.physical_if.as_deref().and_then(InterfaceBinding::new);
+        settings.tunnel_binding=upstreams.tunnel_if.as_deref().and_then(|name| {
+            if require_pin {pinned.and_then(|index|InterfaceBinding::pinned(name,index))}
+            else {InterfaceBinding::new(name)}
+        });
+        settings.upstreams=upstreams; settings.epoch=NEXT_EPOCH.fetch_add(1,Ordering::Relaxed);
     }
 
     /// Loaded binding, not the engine's intended interface name. Used only by
@@ -1059,9 +1162,9 @@ impl Forwarder {
                     let _ = client.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = client.set_write_timeout(Some(Duration::from_secs(5)));
                     inner.spawn(move |inner| {
-                        if let Some(query) = read_framed(&mut client) {
+                        if let Some(query) = read_framed_until(&mut client, Instant::now()+Duration::from_secs(5)) {
                             if let Some(answer) = inner.resolve(&query) {
-                                let _ = write_framed(&mut client, &answer);
+                                let _ = write_framed_until(&mut client, &answer, Instant::now()+Duration::from_secs(5));
                             }
                         }
                     });
@@ -1099,6 +1202,7 @@ impl Drop for Forwarder {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    static GATEWAY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn loopback_interface() -> &'static str {
         if cfg!(target_os = "macos") { "lo0" } else { "lo" }
@@ -1430,6 +1534,19 @@ mod tests {
     }
 
     #[test]
+    fn single_address_fast_path_matches_the_strict_decoder_for_mutations() {
+        for name in ["vpn.example", "V_Pn.Example", "xn--example.example"] {
+            let q=query(name,TYPE_A,42); let good=answer(&q,[198,51,100,9],false);
+            assert_eq!(answer_addresses(&good,&q),strict_answer_addresses(&good,&q));
+            for index in 0..good.len() { for value in [0,1,2,0x3f,0x40,0x80,0xc0,0xff] {
+                let mut mutated=good.clone(); mutated[index]=value;
+                assert_eq!(answer_addresses(&mutated,&q),strict_answer_addresses(&mutated,&q),"{name} at {index}={value}");
+            }}
+            for length in 0..good.len() {assert_eq!(answer_addresses(&good[..length],&q),strict_answer_addresses(&good[..length],&q));}
+        }
+    }
+
+    #[test]
     fn same_id_is_not_enough_to_accept_dns_answer() {
         let q = query("vpn.example", TYPE_A, 42);
         let wrong = answer(&query("direct.example", TYPE_A, 42), [203, 0, 113, 9], false);
@@ -1513,7 +1630,38 @@ mod tests {
     }
 
     #[test]
+    fn gateway_permits_cap_inflight_work_and_expired_work_does_not_query() {
+        let _serial=GATEWAY_TEST_LOCK.lock().unwrap();
+        let permits: Vec<_>=(0..MAX_GATEWAY_INFLIGHT).map(|_|GatewayPermit::claim().unwrap()).collect();
+        assert!(GatewayPermit::claim().is_none()); drop(permits);
+        let mut permit=GatewayPermit::claim().unwrap(); permit.deadline=Instant::now()-Duration::from_millis(1);
+        assert!(!permit.active());
+        assert!(resolve_gateway_with(&permit,"203.0.113.1",&[],"lo0").is_empty());
+    }
+
+    #[test]
+    fn slow_tcp_dns_cannot_extend_gateway_budget_or_keep_permits() {
+        let _serial=GATEWAY_TEST_LOCK.lock().unwrap();
+        let server=TcpListener::bind("127.0.0.1:0").unwrap(); let port=server.local_addr().unwrap().port();
+        let udp=UdpSocket::bind(("127.0.0.1",port)).unwrap();
+        let u=std::thread::spawn(move || { let mut b=[0;512]; let (n,peer)=udp.recv_from(&mut b).unwrap(); udp.send_to(&answer(&b[..n],[198,51,100,1],true),peer).unwrap(); });
+        let t=std::thread::spawn(move || {
+            let (mut peer,_)=server.accept().unwrap();
+            #[cfg(target_os="macos")] socket2::SockRef::from(&peer).set_nosigpipe(true).unwrap();
+            let q=read_framed(&mut peer).unwrap(); let a=answer(&q,[198,51,100,1],false);
+            if peer.write_all(&(a.len() as u16).to_be_bytes()).is_ok() { for byte in a { if peer.write_all(&[byte]).is_err(){break;} std::thread::sleep(Duration::from_millis(120)); } }
+        });
+        let start=Instant::now();
+        assert!(resolve_gateway("gw.example",&[format!("127.0.0.1:{port}")],loopback_interface()).is_empty());
+        assert!(start.elapsed()<Duration::from_millis(1400));
+        u.join().unwrap(); t.join().unwrap();
+        assert_eq!(dhcp_dns(&[192,168,1,1,192,168,1,2]),vec!["192.168.1.1","192.168.1.2"]);
+        assert!(dhcp_dns(&[1,2,3]).is_empty());
+    }
+
+    #[test]
     fn gateway_bootstrap_is_bounded_validated_and_interface_bound() {
+        let _serial=GATEWAY_TEST_LOCK.lock().unwrap();
         let (port, seen) = fake_udp([198, 51, 100, 2], false);
         let servers = vec![format!("127.0.0.1:{port}")];
         assert_eq!(resolve_gateway("gw.example", &servers, loopback_interface()), vec!["198.51.100.2"]);
