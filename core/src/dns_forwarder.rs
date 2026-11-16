@@ -1,14 +1,11 @@
 //! The domain split's DNS forwarder (DESIGN.md §26.4, §26.13, §28.3;
 //! moved from Swift to Rust in §32.6).
 //!
-//! The system resolver asks this forwarder first (127.0.0.1, with the
-//! tunnel's DNS servers listed after it, so a forwarder that is down
-//! costs the split, never the network). For a name on the direct list
-//! it asks the local network's DNS through the physical interface and,
-//! before handing the answer back, reports every IPv4 address in it
-//! (`on_direct`), which must return only once they are routed direct.
-//! Every other name goes to the tunnel's DNS servers, one after the
-//! other, over UDP and then TCP (also when the UDP answer is truncated).
+//! The system resolver uses only this forwarder in split mode (§48).
+//! Direct names use physical-interface DNS; other names use the current
+//! VPN interface's DNS, over UDP then TCP. Unavailable/invalid bindings
+//! fail closed. Validated address observations commit through the engine
+//! queue before an answer is returned; stale generations are discarded.
 //!
 //! The tunnel carries IPv4 only and pf drops IPv6 out of the Mac in
 //! split mode, so AAAA answers are empty for every name. HTTPS and SVCB
@@ -27,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -556,7 +553,7 @@ fn server_address(server: &str, port: u16) -> Option<SocketAddrV4> {
     Some(SocketAddrV4::new(Ipv4Addr::from_str(host).ok()?, p))
 }
 
-fn upstream_socket(ty: Type, interface: Option<&str>, timeout: Duration) -> Option<Socket> {
+fn upstream_socket(ty: Type, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Socket> {
     let proto = if ty == Type::DGRAM { Protocol::UDP } else { Protocol::TCP };
     let s = Socket::new(Domain::IPV4, ty, Some(proto)).ok()?;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -564,34 +561,66 @@ fn upstream_socket(ty: Type, interface: Option<&str>, timeout: Duration) -> Opti
     s.set_read_timeout(Some(timeout)).ok()?;
     s.set_write_timeout(Some(timeout)).ok()?;
     if let Some(name) = interface {
-        bind_interface(&s, name)?;
+        name.bind(&s)?;
     }
     Some(s)
 }
 
-/// Pins the socket to one interface: the local DNS is asked out the
-/// physical network although the default route is the tunnel.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn bind_interface(s: &Socket, name: &str) -> Option<()> {
-    let c = std::ffi::CString::new(name).ok()?;
-    let index = unsafe { libc::if_nametoindex(c.as_ptr()) };
-    let index = std::num::NonZeroU32::new(index)?;
-    s.bind_device_by_index_v4(Some(index)).ok()
+/// Resolve the interface once per configuration generation. Repeating
+/// if_nametoindex for each packet is expensive on macOS; sockets still bind
+/// before connect and an invalid index fails closed.
+#[derive(Clone, PartialEq, Eq)]
+struct InterfaceBinding {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    index: std::num::NonZeroU32,
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    name: String,
 }
-
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
-fn bind_interface(s: &Socket, name: &str) -> Option<()> {
-    s.bind_device(Some(name.as_bytes())).ok()
+impl InterfaceBinding {
+    fn new(name: &str) -> Option<Self> {
+        let c = std::ffi::CString::new(name).ok()?;
+        let index = std::num::NonZeroU32::new(unsafe { libc::if_nametoindex(c.as_ptr()) })?;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        { Some(Self { index }) }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        { let _ = index; Some(Self { name: name.into() }) }
+    }
+    fn bind(&self, socket: &Socket) -> Option<()> {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        { socket.bind_device_by_index_v4(Some(self.index)).ok() }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        { socket.bind_device(Some(self.name.as_bytes())).ok() }
+    }
 }
 
 fn same_id(answer: &[u8], query: &[u8]) -> bool {
-    answer.len() >= 2 && query.len() >= 2 && answer[0] == query[0] && answer[1] == query[1]
+    if answer.len() < 12 || query.len() < 12 || answer[..2] != query[..2]
+        || answer[2] & 0x80 == 0 || answer[2] & 0x78 != query[2] & 0x78
+        || answer[4..6] != [0, 1] || query[4..6] != [0, 1] {
+        return false;
+    }
+    let Some((a, ae)) = read_labels(answer, 12) else { return false };
+    let Some((q, qe)) = read_labels(query, 12) else { return false };
+    same_name(&a, &q) && answer.get(ae..ae + 4) == query.get(qe..qe + 4)
+        && query.get(qe..qe + 4).is_some()
 }
 
-fn udp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&str>, timeout: Duration) -> Option<Vec<u8>> {
+/// Only addresses belonging to this question's validated IN CNAME chain.
+/// Strip the query's EDNS trailer for the shared bounded decoder.
+fn answer_addresses(answer: &[u8], query: &[u8]) -> Option<Vec<Ipv4Addr>> {
+    let (_, end) = read_labels(query, 12)?;
+    let mut question = query.get(..end + 4)?.to_vec();
+    question[6..12].fill(0);
+    crate::on_demand::dns_addresses(answer, &question)?
+        .iter().map(|ip| ip.parse().ok()).collect()
+}
+
+fn udp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
     let addr = server_address(server, port)?;
     let s = upstream_socket(Type::DGRAM, interface, timeout)?;
-    let sent = s.send_to(query, &SockAddr::from(addr)).ok()?;
+    // A connected datagram socket accepts replies only from this upstream.
+    s.connect(&SockAddr::from(addr)).ok()?;
+    let sent = s.send(query).ok()?;
     if sent != query.len() {
         return None;
     }
@@ -599,11 +628,12 @@ fn udp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&str>, 
     let deadline = Instant::now() + timeout;
     let mut buffer = vec![0u8; 65535];
     while Instant::now() < deadline {
+        socket.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))).ok()?;
         let n = socket.recv(&mut buffer).ok()?;
         if n == 0 {
             return None;
         }
-        // Only the answer to this query (same id), never a stray one.
+        // Require the exact question as well as its transaction ID.
         if same_id(&buffer[..n], query) {
             buffer.truncate(n);
             return Some(buffer);
@@ -612,7 +642,7 @@ fn udp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&str>, 
     None
 }
 
-fn tcp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&str>, timeout: Duration) -> Option<Vec<u8>> {
+fn tcp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
     let addr = server_address(server, port)?;
     let s = upstream_socket(Type::STREAM, interface, timeout)?;
     s.connect_timeout(&SockAddr::from(addr), timeout).ok()?;
@@ -625,6 +655,10 @@ fn tcp_exchange(query: &[u8], server: &str, port: u16, interface: Option<&str>, 
 /// Each server in turn: UDP, then TCP (also when the UDP answer is
 /// truncated). The first usable answer wins.
 pub fn exchange(query: &[u8], servers: &[String], port: u16, interface: Option<&str>, timeout: Duration) -> Option<Vec<u8>> {
+    let binding = match interface { Some(name) => Some(InterfaceBinding::new(name)?), None => None };
+    exchange_bound(query, servers, port, binding.as_ref(), timeout)
+}
+fn exchange_bound(query: &[u8], servers: &[String], port: u16, interface: Option<&InterfaceBinding>, timeout: Duration) -> Option<Vec<u8>> {
     for server in servers {
         if let Some(answer) = udp_exchange(query, server, port, interface, timeout) {
             if !is_truncated(&answer) {
@@ -632,7 +666,7 @@ pub fn exchange(query: &[u8], servers: &[String], port: u16, interface: Option<&
             }
         }
         if let Some(answer) = tcp_exchange(query, server, port, interface, timeout) {
-            return Some(answer);
+            if !is_truncated(&answer) { return Some(answer); }
         }
     }
     None
@@ -658,6 +692,20 @@ pub fn write_framed<W: Write>(w: &mut W, message: &[u8]) -> io::Result<()> {
     w.write_all(&framed)
 }
 
+/// Bootstrap exception for the VPN gateway itself, called by the signed App
+/// through the root service. Never a general resolver or a system fallback.
+/// Direct/company site queries continue through the split forwarder.
+pub fn resolve_gateway(host: &str, servers: &[String], physical_if: &str) -> Vec<String> {
+    if let Ok(ip) = host.parse::<Ipv4Addr>() { return vec![ip.to_string()]; }
+    let Some(mut query) = crate::on_demand::dns_query(host) else { return vec![] };
+    let mut id = [0; 2];
+    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut id)).is_err() { return vec![]; }
+    query[..2].copy_from_slice(&id);
+    let servers: Vec<_> = servers.iter().take(2).cloned().collect();
+    let Some(answer) = exchange(&query, &servers, 53, Some(physical_if), Duration::from_millis(200)) else { return vec![] };
+    answer_addresses(&answer, &query).unwrap_or_default().iter().map(ToString::to_string).collect()
+}
+
 // MARK: - The forwarder
 
 #[derive(Clone, Debug)]
@@ -668,6 +716,8 @@ pub struct Upstreams {
     pub local: Vec<String>,
     /// Bind the local queries to this interface; None in tests.
     pub physical_if: Option<String>,
+    /// Required for VPN queries. None means the tunnel is unavailable.
+    pub tunnel_if: Option<String>,
 }
 
 /// Called with the list entry a direct name matched and its IPv4
@@ -675,11 +725,34 @@ pub struct Upstreams {
 /// are routed direct.
 pub type DirectHook = Box<dyn Fn(&str, &[Ipv4Addr]) + Send + Sync>;
 
+/// A DNS observation is committed by the engine's serial event queue before
+/// its answer is published. The epoch rejects old rules, networks and sessions.
+pub struct Observation {
+    pub epoch: u64,
+    pub name: String,
+    pub entry: Option<String>,
+    pub addresses: Vec<Ipv4Addr>,
+    pub direct: Vec<Ipv4Addr>,
+}
+pub type AnswerHook = Box<dyn Fn(Observation) -> bool + Send + Sync>;
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+struct Settings {
+    epoch: u64,
+    rules: Arc<SplitRules>,
+    upstreams: Upstreams,
+    enabled: bool,
+    physical_binding: Option<InterfaceBinding>,
+    tunnel_binding: Option<InterfaceBinding>,
+}
+
+type Acknowledged = (u64, Vec<Ipv4Addr>, Vec<Ipv4Addr>);
+
 pub struct Inner {
     upstream_port: u16,
     timeout: Duration,
-    rules: RwLock<Arc<SplitRules>>,
-    upstreams: Mutex<Upstreams>,
+    settings: RwLock<Settings>,
+    on_answer: Option<AnswerHook>,
+    acknowledged: Mutex<HashMap<String, Acknowledged>>,
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
     inflight: AtomicUsize,
@@ -704,9 +777,7 @@ struct PoolState {
 }
 
 impl Inner {
-    fn remember(&self, answer: Option<&Vec<u8>>, name: &str) {
-        let Some(answer) = answer else { return };
-        let ips = ipv4_answers(answer);
+    fn remember(&self, ips: &[Ipv4Addr], name: &str) {
         if ips.is_empty() {
             return;
         }
@@ -716,7 +787,7 @@ impl Inner {
             names.clear();
         }
         for ip in ips {
-            names.insert(ip, clean.clone());
+            names.insert(*ip, clean.clone());
         }
     }
 
@@ -730,46 +801,60 @@ impl Inner {
     /// client then retries or moves on to the next server).
     pub fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
         let q = question(query)?;
-        let rules = self.rules.read().unwrap().clone();
+        let (epoch, rules, up, physical_binding, tunnel_binding) = {
+            let settings = self.settings.read().unwrap();
+            if !settings.enabled { return None; }
+            (settings.epoch, settings.rules.clone(), settings.upstreams.clone(), settings.physical_binding.clone(), settings.tunnel_binding.clone())
+        };
         let entry = rules.matches(&q.name);
-        let up = self.upstreams.lock().unwrap().clone();
-        let Some(entry) = entry else {
-            if q.qtype == TYPE_AAAA {
-                return empty_answer(query);
-            }
-            let answer = exchange(query, &up.tunnel, self.upstream_port, None, self.timeout);
-            if q.qtype == TYPE_A {
-                self.remember(answer.as_ref(), &q.name);
-            }
-            // geoip rules (§26.13): a name that resolves (through the
-            // tunnel's DNS) into a listed range goes direct too, its
-            // addresses routed before the answer is handed back.
-            if let Some(a) = &answer {
-                if rules.has_ranges() && q.qtype == TYPE_A {
-                    let hits: Vec<Ipv4Addr> = ipv4_answers(a).into_iter().filter(|ip| rules.contains(*ip)).collect();
-                    if !hits.is_empty() {
-                        self.direct(&site_name(&q.name), &hits);
+        if q.qtype == TYPE_AAAA { return empty_answer(query); }
+        let (servers, interface) = if entry.is_some() {
+            let binding = if up.physical_if.is_some() { Some(physical_binding.as_ref()?) } else { None };
+            (&up.local, binding)
+        } else {
+            // Never create an unbound VPN socket, including before connect,
+            // after a drop, or while an interface change is being confirmed.
+            (&up.tunnel, Some(tunnel_binding.as_ref()?))
+        };
+        let answer = exchange_bound(query, servers, self.upstream_port, interface, self.timeout)?;
+        let mut addresses = if q.qtype == TYPE_A && answer[3] & 0x0f == 0 {
+            answer_addresses(&answer, query)?
+        } else { Vec::new() };
+        addresses.sort_unstable(); addresses.dedup();
+        let direct: Vec<_> = addresses.iter().copied()
+            .filter(|ip| entry.is_some() || rules.contains(*ip)).collect();
+        if self.settings.read().unwrap().epoch != epoch { return None; }
+        if q.qtype == TYPE_A {
+            if let Some(hook) = &self.on_answer {
+                let name = trim_dots(&q.name);
+                let observed = (epoch, addresses.clone(), direct.clone());
+                let duplicate = self.acknowledged.lock().unwrap().get(&name) == Some(&observed);
+                if !duplicate {
+                    if !hook(Observation { epoch, name: name.clone(), entry: entry.clone(), addresses: addresses.clone(), direct: direct.clone() }) {
+                        self.acknowledged.lock().unwrap().clear();
+                        return None;
                     }
+                    let current = self.settings.read().unwrap();
+                    if current.epoch != epoch { return None; }
+                    let mut known = self.acknowledged.lock().unwrap();
+                    if known.len() >= NAME_CACHE_LIMIT
+                        || known.values().map(|v| v.1.len() + v.2.len()).sum::<usize>() + addresses.len() + direct.len() > 8192 { known.clear(); }
+                    known.insert(name, observed);
                 }
             }
-            if is_service(q.qtype) {
-                return answer.map(|a| without_addresses(&a, false).unwrap_or(a));
-            }
-            return answer;
-        };
-        if q.qtype == TYPE_AAAA {
-            return empty_answer(query);
         }
-        let answer = exchange(query, &up.local, self.upstream_port, up.physical_if.as_deref(), self.timeout)?;
+
+        // Legacy harness hook is protected against concurrent updates too.
+        // Production uses on_answer, which commits under the engine's queue.
+        let settings = self.settings.read().unwrap();
+        if settings.epoch != epoch { return None; }
+        if !direct.is_empty() {
+            self.direct(entry.as_deref().unwrap_or(&site_name(&q.name)), &direct);
+        }
+        self.remember(&addresses, &q.name);
         if is_service(q.qtype) {
-            // Nothing to route: no addresses are left in it.
-            return without_addresses(&answer, true).or_else(|| empty_answer(query));
+            return without_addresses(&answer, entry.is_some()).or_else(|| empty_answer(query));
         }
-        let addresses = ipv4_answers(&answer);
-        if !addresses.is_empty() {
-            self.direct(&entry, &addresses);
-        }
-        self.remember(Some(&answer), &q.name);
         Some(answer)
     }
 
@@ -855,12 +940,21 @@ fn listener(ty: Type, address: SocketAddrV4) -> io::Result<Socket> {
 impl Forwarder {
     pub fn new(listen: SocketAddrV4, upstream_port: u16, timeout: Duration, direct: Vec<String>,
                upstreams: Upstreams, on_direct: Option<DirectHook>) -> Self {
+        Self::with_answer_hook(listen, upstream_port, timeout, direct, upstreams, on_direct, None)
+    }
+
+    pub fn with_answer_hook(listen: SocketAddrV4, upstream_port: u16, timeout: Duration,
+        direct: Vec<String>, upstreams: Upstreams, on_direct: Option<DirectHook>, on_answer: Option<AnswerHook>) -> Self {
+        let physical_binding = upstreams.physical_if.as_deref().and_then(InterfaceBinding::new);
+        let tunnel_binding = upstreams.tunnel_if.as_deref().and_then(InterfaceBinding::new);
         Forwarder {
             inner: Arc::new(Inner {
                 upstream_port,
                 timeout,
-                rules: RwLock::new(Arc::new(SplitRules::new(&direct))),
-                upstreams: Mutex::new(upstreams),
+                settings: RwLock::new(Settings { epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
+                    rules: Arc::new(SplitRules::new(&direct)), upstreams, enabled: true, physical_binding, tunnel_binding }),
+                on_answer,
+                acknowledged: Mutex::new(HashMap::new()),
                 names: Mutex::new(HashMap::new()),
                 on_direct,
                 inflight: AtomicUsize::new(0),
@@ -877,11 +971,35 @@ impl Forwarder {
 
     pub fn set_rules(&self, direct: &[String]) {
         let parsed = Arc::new(SplitRules::new(direct));
-        *self.inner.rules.write().unwrap() = parsed;
+        let mut settings = self.inner.settings.write().unwrap();
+        settings.rules = parsed;
+        self.inner.acknowledged.lock().unwrap().clear();
+        settings.epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_upstreams(&self, upstreams: Upstreams) {
-        *self.inner.upstreams.lock().unwrap() = upstreams;
+        let mut settings = self.inner.settings.write().unwrap();
+        self.inner.acknowledged.lock().unwrap().clear();
+        settings.physical_binding = upstreams.physical_if.as_deref().and_then(InterfaceBinding::new);
+        settings.tunnel_binding = upstreams.tunnel_if.as_deref().and_then(InterfaceBinding::new);
+        settings.upstreams = upstreams;
+        settings.epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Loaded binding, not the engine's intended interface name. Used only by
+    /// the on-demand check, including detecting interface-index replacement.
+    pub fn bound_tunnel_interface(&self) -> Option<String> {
+        let settings = self.inner.settings.read().unwrap();
+        if !settings.enabled { return None; }
+        let name = settings.upstreams.tunnel_if.as_ref()?;
+        let binding = settings.tunnel_binding.as_ref()?;
+        (InterfaceBinding::new(name).as_ref() == Some(binding)).then(|| name.clone())
+    }
+
+    pub fn epoch(&self) -> u64 { self.inner.settings.read().unwrap().epoch }
+
+    pub fn is_current(&self, epoch: u64) -> bool {
+        self.inner.settings.read().unwrap().epoch == epoch
     }
 
     pub fn name_for(&self, ip: Ipv4Addr) -> Option<String> {
@@ -896,6 +1014,7 @@ impl Forwarder {
         let tcp: TcpListener = listener(Type::STREAM, self.listen)?.into();
         udp.set_nonblocking(true)?;
         tcp.set_nonblocking(true)?;
+        self.inner.settings.write().unwrap().enabled = true;
         let mut fds = [0i32; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
@@ -957,6 +1076,13 @@ impl Forwarder {
     /// already being answered finish on their own.
     pub fn stop(&self) {
         use std::os::fd::AsRawFd;
+        {
+            let mut settings = self.inner.settings.write().unwrap();
+            settings.epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+            settings.enabled = false;
+        }
+        *self.inner.acknowledged.lock().unwrap() = HashMap::new();
+        *self.inner.names.lock().unwrap() = HashMap::new();
         let Some(listening) = self.listening.lock().unwrap().take() else { return };
         unsafe { libc::write(listening.wake.as_raw_fd(), [1u8].as_ptr() as *const libc::c_void, 1) };
         let _ = listening.thread.join();
@@ -973,6 +1099,10 @@ impl Drop for Forwarder {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    fn loopback_interface() -> &'static str {
+        if cfg!(target_os = "macos") { "lo0" } else { "lo" }
+    }
 
     fn query(name: &str, qtype: u16, id: u16) -> Vec<u8> {
         let mut m = vec![(id >> 8) as u8, id as u8, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
@@ -1265,6 +1395,135 @@ mod tests {
     }
 
     #[test]
+    fn rule_change_rejects_late_direct_answer() {
+      for change in ["rules", "network", "stop"] {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = socket.local_addr().unwrap().to_string();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let upstream = std::thread::spawn(move || {
+            let mut buf = [0; 512];
+            let (n, from) = socket.recv_from(&mut buf).unwrap();
+            seen_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            socket.send_to(&answer(&buf[..n], [203, 0, 113, 1], false), from).unwrap();
+        });
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let fwd = Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 53,
+            Duration::from_secs(1), vec!["example.com".into()],
+            Upstreams { tunnel: vec![], local: vec![server], physical_if: None, tunnel_if: Some(loopback_interface().into()) },
+            Some(Box::new(move |_, _| { h.fetch_add(1, Ordering::SeqCst); })));
+        let inner = fwd.inner().clone();
+        let pending = std::thread::spawn(move || inner.resolve(&query("example.com", TYPE_A, 33)));
+        seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        match change {
+            "rules" => fwd.set_rules(&[]),
+            "network" => fwd.set_upstreams(Upstreams { tunnel: vec![], local: vec![], physical_if: None, tunnel_if: None }),
+            _ => fwd.stop(),
+        }
+        release_tx.send(()).unwrap();
+        assert!(pending.join().unwrap().is_none(), "old rules must not publish a late answer");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "old reply must not add a route");
+        upstream.join().unwrap();
+      }
+    }
+
+    #[test]
+    fn same_id_is_not_enough_to_accept_dns_answer() {
+        let q = query("vpn.example", TYPE_A, 42);
+        let wrong = answer(&query("direct.example", TYPE_A, 42), [203, 0, 113, 9], false);
+        assert!(!same_id(&wrong, &q), "a different question must be rejected");
+    }
+
+    #[test]
+    fn vpn_queries_require_a_current_interface_for_udp_and_tcp() {
+        let (port, seen) = fake_udp([198, 51, 100, 2], false);
+        let fwd = Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), port,
+            Duration::from_millis(100), vec!["direct.example".into()],
+            Upstreams { tunnel: vec!["127.0.0.1".into()], local: vec!["127.0.0.1".into()],
+                physical_if: Some(loopback_interface().into()), tunnel_if: None }, None);
+        let q = query("vpn.example", TYPE_A, 1);
+        assert!(fwd.inner.resolve(&q).is_none());
+        assert!(fwd.bound_tunnel_interface().is_none());
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        // Direct DNS remains on the physical interface while VPN DNS waits.
+        assert!(fwd.inner.resolve(&query("direct.example", TYPE_A, 2)).is_some());
+        for interface in ["ac-missing-interface", loopback_interface()] {
+            fwd.set_upstreams(Upstreams { tunnel: vec!["127.0.0.1".into()], local: vec![],
+                physical_if: None, tunnel_if: Some(interface.into()) });
+            assert_eq!(fwd.inner.resolve(&q).is_some(), interface == loopback_interface());
+            assert_eq!(fwd.bound_tunnel_interface().is_some(), interface == loopback_interface());
+            assert_eq!(exchange(&q, &["127.0.0.1".into()], port, Some("ac-missing-interface"), Duration::from_millis(50)), None);
+        }
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "invalid binding never falls back to an unbound socket");
+    }
+
+    #[test]
+    fn udp_rejects_a_reply_from_another_source_and_wrong_question() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            let mut buf = [0; 512];
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+            other.send_to(&answer(&buf[..n], [203, 0, 113, 66], false), peer).unwrap();
+            let wrong = query("wrong.example", TYPE_A, 77);
+            server.send_to(&answer(&wrong, [203, 0, 113, 77], false), peer).unwrap();
+            server.send_to(&answer(&buf[..n], [198, 51, 100, 2], false), peer).unwrap();
+        });
+        let a = udp_exchange(&query("vpn.example", TYPE_A, 77), "127.0.0.1", port,
+            InterfaceBinding::new(loopback_interface()).as_ref(), Duration::from_secs(1)).unwrap();
+        assert_eq!(ipv4_answers(&a), vec![Ipv4Addr::new(198, 51, 100, 2)]);
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn only_related_cname_addresses_can_change_routes() {
+        let q = query("direct.example", TYPE_A, 10);
+        let here = [0xc0, 12];
+        let records = [rr(&here, TYPE_CNAME, 60, &wire("edge.example")),
+            rr(&wire("edge.example"), TYPE_A, 60, &[198, 51, 100, 2]),
+            rr(&wire("unrelated.example"), TYPE_A, 60, &[203, 0, 113, 9])];
+        let a = reply(&q, &records, &[], &[]);
+        assert_eq!(answer_addresses(&a, &q), Some(vec![Ipv4Addr::new(198, 51, 100, 2)]));
+        let mut bad_class = a.clone();
+        let (_, end) = read_labels(&bad_class, q.len()).unwrap();
+        bad_class[end + 3] = 3;
+        assert_eq!(answer_addresses(&bad_class, &q), None);
+    }
+
+    #[test]
+    fn repeated_observation_skips_only_engine_work_not_dns_or_epoch_validation() {
+        let (port, queries) = fake_udp([198, 51, 100, 2], false);
+        let commits = Arc::new(AtomicUsize::new(0)); let count = commits.clone();
+        let fwd = Forwarder::with_answer_hook(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), port,
+            Duration::from_millis(100), vec![], Upstreams { tunnel: vec!["127.0.0.1".into()], local: vec![],
+                physical_if: None, tunnel_if: Some(loopback_interface().into()) }, None,
+            Some(Box::new(move |_| { count.fetch_add(1, Ordering::SeqCst); true })));
+        let q = query("vpn.example", TYPE_A, 1);
+        assert!(fwd.inner.resolve(&q).is_some()); assert!(fwd.inner.resolve(&q).is_some());
+        assert_eq!(queries.load(Ordering::SeqCst), 2); assert_eq!(commits.load(Ordering::SeqCst), 1);
+        fwd.set_rules(&["another.example".into()]);
+        assert!(fwd.inner.resolve(&q).is_some());
+        assert_eq!(commits.load(Ordering::SeqCst), 2, "old acknowledgements cannot survive a rule generation");
+        fwd.stop(); assert!(fwd.inner.resolve(&q).is_none());
+        assert_eq!(fwd.inner.acknowledged.lock().unwrap().capacity(), 0);
+        assert_eq!(fwd.inner.names.lock().unwrap().capacity(), 0);
+    }
+
+    #[test]
+    fn gateway_bootstrap_is_bounded_validated_and_interface_bound() {
+        let (port, seen) = fake_udp([198, 51, 100, 2], false);
+        let servers = vec![format!("127.0.0.1:{port}")];
+        assert_eq!(resolve_gateway("gw.example", &servers, loopback_interface()), vec!["198.51.100.2"]);
+        assert!(resolve_gateway("gw.example", &servers, "ac-no-interface").is_empty());
+        assert!(resolve_gateway("not a name;command", &servers, loopback_interface()).is_empty());
+        assert_eq!(resolve_gateway("203.0.113.1", &[], "ac-no-interface"), vec!["203.0.113.1"]);
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "invalid bindings/hosts never fall back to another resolver");
+    }
+
+    #[test]
     fn forwards_and_routes_before_answering() {
         let (local, local_count) = fake_udp([203, 0, 113, 1], false);
         let (tunnel, tunnel_count) = fake_udp([198, 51, 100, 2], false);
@@ -1286,6 +1545,7 @@ mod tests {
                 tunnel: vec![format!("127.0.0.1:{dead}"), format!("127.0.0.1:{tunnel}")],
                 local: vec![format!("127.0.0.1:{local}")],
                 physical_if: None,
+                tunnel_if: Some(loopback_interface().into()),
             },
             Some(hook),
         );
@@ -1319,6 +1579,7 @@ mod tests {
             tunnel: vec![format!("127.0.0.1:{trunc}")],
             local: vec![format!("127.0.0.1:{local}")],
             physical_if: None,
+            tunnel_if: Some(loopback_interface().into()),
         });
         let a = ask(&query("big.example", TYPE_A, 6), port).unwrap();
         assert_eq!(ipv4_answers(&a), vec![Ipv4Addr::new(198, 51, 100, 4)]);

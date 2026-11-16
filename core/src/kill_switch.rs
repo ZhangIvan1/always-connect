@@ -157,6 +157,7 @@ impl KillSwitch {
             allow_dns: true,
             local_dns_servers: Vec::new(),
             direct_table: false,
+            strict_dns: false,
         };
         if let Some(problem) = self.guard.apply(CISCO_HOLDER, !blocking, &inputs) {
             return (false, problem);

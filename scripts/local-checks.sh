@@ -65,6 +65,8 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
   INTERNAL_IP4_DNS="8.8.8.8 1.1.1.1" $S connect | grep -q 'AC_HOOK connect tun=utun9 gateway=10.0.0.1 dns=8.8.8.8,1.1.1.1' || exit 6
   ALWAYSCONNECT_GATEWAY_IP=198.51.100.7 VPNGATEWAY=127.0.0.1 $S connect | grep -q 'gateway=198.51.100.7' || exit 8
   $S pre-init && $S attempt-reconnect && $S bogus-reason || exit 7 ) && pass vpnc-script || fail "vpnc-script rc=$?"
+"$REPO/scripts/reset-network-test.sh" && pass reset-network-plan || fail reset-network-plan
+"$REPO/scripts/gateway-resolution-test.sh" && pass gateway-resolution || fail gateway-resolution
 # 4b vpnc-script route plan (stubbed route/ifconfig/scutil, routes ON)
 "$REPO/core/scripts/vpnc-route-plan-test.sh" $S > /tmp/ac-route-plan.log 2>&1 && pass vpnc-route-plan || { fail vpnc-route-plan; grep -v '^AC-SCRIPT' /tmp/ac-route-plan.log; }
 # 4c Cisco engine against a fake Cisco CLI

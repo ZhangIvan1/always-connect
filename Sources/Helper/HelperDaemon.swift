@@ -680,6 +680,15 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         reply(direction, reason)
     }
 
+    func resolveGatewayIPv4(_ host: String, withReply reply: @escaping ([String]) -> Void) {
+        DispatchQueue.global(qos: .utility).async {
+            guard let network = PhysicalNetwork.current(preferring: "") else { reply([]); return }
+            let servers = LocalDNS.servers(for: network.interface)
+            let csv = NetworkGuard.take(ac_resolve_gateway(host, servers.joined(separator: ","), network.interface)) ?? ""
+            reply(csv.split(separator: ",").map(String.init))
+        }
+    }
+
     func getStats(withReply reply: @escaping (Int64, Int64, String) -> Void) {
         queue.async {
             guard let tunnelIf = self.engine?.tunnelInterface else {
@@ -694,6 +703,12 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     func runLeakCheck(withReply reply: @escaping (String) -> Void) {
         queue.async {
             let engine = self.engine
+            if let engine {
+                // Read-only subprocesses must not occupy the session's serial
+                // queue: disconnect and recovery stay responsive.
+                DispatchQueue.global(qos: .utility).async { reply(engine.runNetworkCheck()) }
+                return
+            }
             // Cisco engine (DESIGN.md §二十一): no engine of ours, the
             // kill switch knows the tunnel and the gateways.
             let cisco = engine?.tunnelInterface == nil ? KillSwitch.shared.snapshot : nil
@@ -724,3 +739,6 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         proxy.statusChanged(state: state, detail: detail)
     }
 }
+
+@_silgen_name("ac_resolve_gateway")
+func ac_resolve_gateway(_ host: UnsafePointer<CChar>, _ servers: UnsafePointer<CChar>, _ interface: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?

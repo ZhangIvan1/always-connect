@@ -20,6 +20,7 @@ final class NetworkGuard {
         var localDNSServers: [String] = []
         /// Plan v2 (§25.8): declare and pass `<ac_direct>`.
         var directTable: Bool = false
+        var strictDNS: Bool = false
     }
 
     /// guard.json as written (the harness writes records of earlier runs).
@@ -162,7 +163,7 @@ extension JSONDecoder {
 
 extension NetworkGuard.Inputs {
     private enum CodingKeys: String, CodingKey {
-        case tunnelIf, gatewayIps, physicalIf, allowNetworks, allowDNS, localDNSServers, directTable
+        case tunnelIf, gatewayIps, physicalIf, allowNetworks, allowDNS, localDNSServers, directTable, strictDNS
     }
 
     /// Records written before plan v2 lack the last two keys (synthesized
@@ -176,6 +177,7 @@ extension NetworkGuard.Inputs {
         allowDNS = try c.decode(Bool.self, forKey: .allowDNS)
         localDNSServers = try c.decodeIfPresent([String].self, forKey: .localDNSServers) ?? []
         directTable = try c.decodeIfPresent(Bool.self, forKey: .directTable) ?? false
+        strictDNS = try c.decodeIfPresent(Bool.self, forKey: .strictDNS) ?? false
     }
 }
 

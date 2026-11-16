@@ -58,6 +58,9 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// list (DESIGN.md §十九). When the gateway never sent a DNS
     /// set, the DNS row is informational, not a verdict.
     func runLeakCheck(withReply reply: @escaping (String) -> Void)
+    /// Gateway bootstrap only: physical-interface DNS in the root service.
+    /// Same signing/uid requirement as every message; 3-second App fallback.
+    func resolveGatewayIPv4(_ host: String, withReply reply: @escaping ([String]) -> Void)
     /// Live pf allowlist update (DESIGN.md §十九): replace the
     /// networks the connected/blocking pf sets let out directly.
     /// The App calls this right after connect accepts and whenever
@@ -131,7 +134,7 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
 /// Upgrade safety for the additive methods above (evaluateRule,
 /// getStats, runLeakCheck, updateAllowNetworks, getSessionInfo,
 /// getNetworkHeld, setKillSwitch, prepareRelay, getLastRelease,
-/// setDirectDomains, getSplitActivity, setDropProtection, getConnections):
+/// setDirectDomains, getSplitActivity, setDropProtection, getConnections, resolveGatewayIPv4):
 /// the Helper is installed independently of the App, so a new App
 /// may talk to an old Helper that never replies to them. The App
 /// therefore wraps every call in a 3-second timeout and falls back

@@ -379,8 +379,10 @@ struct SessionHarness {
             routes.remove(["10.20.0.0/16"])
             check(!routes.addresses.contains("10.20.0.0/16") && routes.addresses.contains("203.0.113.9"),
                   "a removed network is no longer routed")
-            check(DirectRoutes.undoAtStart(supportDir: support, noRoutes: true) == "removed 2",
-                  "networks and addresses are both undone")
+            let afterRemoval = (try? String(contentsOf: journal, encoding: .utf8)) ?? ""
+            check(!afterRemoval.contains("10.20.0.0/16"), "removed network also leaves the journal (§48)")
+            check(DirectRoutes.undoAtStart(supportDir: support, noRoutes: true) == "removed 1",
+                  "only the remaining address is undone; removed routes are not deleted twice")
             // §28.5: a wider network around the LAN is routed, the LAN itself and its parts are not.
             let lan = IPv4.range("192.168.50.0/24")
             check(DirectRoutes.networksToRoute(["192.168.0.0/16", "192.168.50.0/24", "192.168.50.128/25", "10.9.0.0/16"],

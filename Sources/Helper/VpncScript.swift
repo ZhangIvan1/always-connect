@@ -111,6 +111,9 @@ enum VpncScript {
     # installed one for a new network while the drop was held).
     restore() {
       load_state
+      for t in $AC_TUNS $AC_TUN; do
+        route -n delete -ifscope "$t" default >/dev/null 2>&1 || true
+      done
       for t in $AC_TUNS; do remove_service_keys "$t"; done
       remove_service_keys "$AC_TUN"
       remove_service_keys "$TUNDEV"
@@ -154,6 +157,7 @@ enum VpncScript {
           [ -n "$AC_PHYS_GW" ] || { log connect "no physical default gateway"; exit 1; }
           if [ -n "$AC_TUN" ] && [ "$AC_TUN" != "$TUNDEV" ]; then
             remove_service_keys "$AC_TUN"
+            route -n delete -ifscope "$AC_TUN" default >/dev/null 2>&1 || true
           fi
           # Journal before any change: this boot, the physical default
           # to put back, the gateway host route, every tunnel whose DNS
@@ -169,8 +173,15 @@ enum VpncScript {
           route -n delete default >/dev/null 2>&1 || true
           route -n add default -interface "$TUNDEV" >/dev/null 2>&1 || {
             log connect "default route via $TUNDEV failed"; exit 1; }
-          if [ -n "$INTERNAL_IP4_DNS" ]; then
-            servers="${ALWAYSCONNECT_DNS_FIRST:+$ALWAYSCONNECT_DNS_FIRST }$INTERNAL_IP4_DNS"
+          # Interface-bound DNS and WebRTC's tunnel UDP candidates need a
+          # scoped default too; the unscoped default alone is insufficient.
+          route -n add -ifscope "$TUNDEV" default -interface "$TUNDEV" >/dev/null 2>&1 ||
+            route -n change -ifscope "$TUNDEV" default -interface "$TUNDEV" >/dev/null 2>&1 || {
+            log connect "scoped default via $TUNDEV failed"; exit 1; }
+          if [ -n "$INTERNAL_IP4_DNS$ALWAYSCONNECT_DNS_FIRST" ]; then
+            # With split DNS, only the bound forwarder may query upstreams.
+            # A system fallback would bypass its interface and epoch checks.
+            servers="${ALWAYSCONNECT_DNS_FIRST:-$INTERNAL_IP4_DNS}"
             printf 'open\nd.init\nd.add ServerAddresses * %s\nset State:/Network/Service/%s/DNS\nd.init\nd.add Router %s\nd.add Addresses * %s\nd.add SubnetMasks * 255.255.255.255\nd.add InterfaceName %s\nd.add OverridePrimary # 1\nset State:/Network/Service/%s/IPv4\nclose\n' \
               "$servers" "$TUNDEV" "$INTERNAL_IP4_ADDRESS" "$INTERNAL_IP4_ADDRESS" "$TUNDEV" "$TUNDEV" | scutil >/dev/null 2>&1 || {
               log connect "scutil DNS setup failed"; exit 1; }
@@ -288,7 +299,9 @@ enum VpncScript {
         # openconnect 9: the session is back on the same tun after an
         # internal reconnect; routes and DNS are still in place.
         log reconnect "tunnel re-established"
-        hook "reconnect"
+        dns_csv=""
+        for d in $INTERNAL_IP4_DNS; do dns_csv="${dns_csv:+$dns_csv,}$d"; done
+        hook "reconnect tun=$TUNDEV dns=$dns_csv"
         exit 0
         ;;
       *)

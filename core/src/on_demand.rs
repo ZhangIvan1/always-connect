@@ -235,7 +235,7 @@ pub struct ProbePlan {
     pub dns_query: Vec<u8>,
     pub dns_query_v6: Vec<u8>,
 }
-fn dns_query(host: &str) -> Option<Vec<u8>> {
+pub(crate) fn dns_query(host: &str) -> Option<Vec<u8>> {
     let host = host.trim_end_matches('.');
     if host.is_empty() || host.len() > 253 {
         return None;
@@ -370,7 +370,7 @@ fn dns_question(packet: &[u8]) -> Option<(String, u16, usize)> {
 }
 /// Return addresses only for the exact outstanding query, following a unique
 /// IN CNAME chain from its question. Malformed or unrelated replies fail closed.
-fn dns_addresses(packet: &[u8], query: &[u8]) -> Option<Vec<String>> {
+pub(crate) fn dns_addresses(packet: &[u8], query: &[u8]) -> Option<Vec<String>> {
     let flags = dns_u16(packet, 2)?;
     if flags & 0x8000 == 0
         || flags & (0x7800 | 0x0200 | 0x000f) != 0

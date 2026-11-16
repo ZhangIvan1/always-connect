@@ -1017,6 +1017,23 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         return true
     }
 
+    /// Never ask a method an older service does not implement. Empty results
+    /// use the existing gateway memory; they never request system DNS fallback.
+    private func resolveGatewayIPv4(_ host: String, completion: @escaping ([String]) -> Void) {
+        guard HelperInstaller.installedHelperMatchesBundle else { completion([]); return }
+        ensureConnection { proxy in
+            var finished = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                if !finished { finished = true; completion([]) }
+            }
+            proxy.resolveGatewayIPv4(host) { addresses in
+                DispatchQueue.main.async {
+                    if !finished { finished = true; completion(addresses) }
+                }
+            }
+        }
+    }
+
     /// Own connection (DESIGN.md §二十三): start a certificate relay
     /// for `server` with the chosen keychain certificate and tell the
     /// Helper to go through it; with no certificate in use, tell it to
@@ -1063,39 +1080,46 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 defer { self.gatewayToAvoid = nil }
                 return self.gatewayToAvoid
             }
-            let prepared: CertificateRelay.Prepared
-            do {
-                prepared = try relay.prepare(prefer: memory.last, avoid: avoid, known: memory.addresses)
-            } catch {
-                finish(error.localizedDescription)
-                return
-            }
-            GatewayMemory.save(address.host, last: prepared.gatewayIp,
-                               addresses: prepared.addresses.isEmpty ? memory.addresses : prepared.addresses)
-            relay.onGatewayUnreachable = { [weak self] silent in
-                DispatchQueue.main.async { self?.gatewayUnreachable(silent, host: address.host, generation: generation) }
-            }
             DispatchQueue.main.async {
                 guard generation == self.relayGeneration else { return }
-                self.sendPrepareRelay(gatewayIp: prepared.gatewayIp,
-                                      serverPin: prepared.serverPin) { pem in
-                    guard let pem, let der = Self.certificateDER(pem: pem) else {
-                        finish("后台服务需要更新：在菜单栏面板里点「更新」")
-                        return
-                    }
-                    relay.start(clientCertificate: der) { error in
+                self.resolveGatewayIPv4(address.host) { addresses in
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let prepared: CertificateRelay.Prepared
+                        do {
+                            prepared = try relay.prepare(prefer: memory.last, avoid: avoid, known: memory.addresses, resolved: addresses)
+                        } catch {
+                            finish(error.localizedDescription)
+                            return
+                        }
+                        GatewayMemory.save(address.host, last: prepared.gatewayIp,
+                                           addresses: prepared.addresses.isEmpty ? memory.addresses : prepared.addresses)
+                        relay.onGatewayUnreachable = { [weak self] silent in
+                            DispatchQueue.main.async { self?.gatewayUnreachable(silent, host: address.host, generation: generation) }
+                        }
                         DispatchQueue.main.async {
-                            guard generation == self.relayGeneration else {
-                                relay.stop()
-                                return
+                            guard generation == self.relayGeneration else { return }
+                            self.sendPrepareRelay(gatewayIp: prepared.gatewayIp,
+                                                  serverPin: prepared.serverPin) { pem in
+                                guard let pem, let der = Self.certificateDER(pem: pem) else {
+                                    finish("后台服务需要更新：在菜单栏面板里点「更新」")
+                                    return
+                                }
+                                relay.start(clientCertificate: der) { error in
+                                    DispatchQueue.main.async {
+                                        guard generation == self.relayGeneration else {
+                                            relay.stop()
+                                            return
+                                        }
+                                        if let error {
+                                            relay.stop()
+                                            completion(error.localizedDescription)
+                                            return
+                                        }
+                                        self.relay = relay
+                                        completion(nil)
+                                    }
+                                }
                             }
-                            if let error {
-                                relay.stop()
-                                completion(error.localizedDescription)
-                                return
-                            }
-                            self.relay = relay
-                            completion(nil)
                         }
                     }
                 }

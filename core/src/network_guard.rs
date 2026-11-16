@@ -56,6 +56,8 @@ pub struct Inputs {
     /// Declare and pass `<ac_direct>`.
     #[serde(default)]
     pub direct_table: bool,
+    #[serde(rename = "strictDNS", default)]
+    pub strict_dns: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -110,6 +112,7 @@ pub fn text(connected: bool, i: &Inputs) -> Option<String> {
         allow_dns: i.allow_dns,
         dns_servers: clean(&i.local_dns_servers),
         direct_table: i.direct_table,
+        strict_dns: i.strict_dns,
     })
     .ok()
 }
@@ -328,6 +331,10 @@ impl Guard {
         self.state.lock().unwrap().record.as_ref().map(|r| (r.holder.clone(), r.inputs.clone()))
     }
 
+    pub fn expected_rules(&self) -> Option<String> {
+        self.state.lock().unwrap().record.as_ref().and_then(|r| text(r.connected, &r.inputs))
+    }
+
     pub fn holder(&self) -> Option<String> {
         self.state.lock().unwrap().record.as_ref().map(|r| r.holder.clone())
     }
@@ -359,6 +366,25 @@ impl Guard {
         self.persist(&s);
     }
 
+    /// The gateway resolver runs before a replacement engine exists. Refresh
+    /// only its root DNS whitelist from current physical system facts; never
+    /// relax the blocking policy or change Cisco's configuration.
+    pub fn refresh_bootstrap_dns(&self, physical: &str, servers: &[String]) -> bool {
+        let mut s = self.state.lock().unwrap();
+        let Some(mut current) = s.record.clone() else { return true };
+        if current.holder == CISCO_HOLDER || !(current.inputs.strict_dns || current.inputs.direct_table) { return true; }
+        if current.inputs.physical_if == physical && current.inputs.local_dns_servers == servers { return true; }
+        current.inputs.physical_if = physical.into(); current.inputs.local_dns_servers = servers.to_vec();
+        let Some(anchor) = text(current.connected, &current.inputs) else { return false };
+        if s.pf.load(&anchor).is_err() { return false; }
+        current.token = s.pf.token.clone();
+        let table = current.inputs.direct_table;
+        s.record = Some(current);
+        if table { Self::reload_direct(&s); }
+        self.persist(&s);
+        true
+    }
+
     /// Addresses that may leave outside the tunnel. When this returns
     /// true pf already passes them. Invalid entries fail the whole call.
     pub fn add_direct(&self, ips: &[String]) -> bool {
@@ -382,14 +408,13 @@ impl Guard {
         true
     }
 
-    pub fn remove_direct(&self, ips: &[String]) {
+    pub fn remove_direct(&self, ips: &[String]) -> bool {
         let mut s = self.state.lock().unwrap();
         let gone: Vec<String> = ips.iter().filter(|i| s.direct.contains(*i)).cloned().collect();
-        if gone.is_empty() {
-            return;
-        }
-        if s.record.as_ref().is_some_and(|r| r.inputs.direct_table) {
-            let _ = s.pf.table("delete", &gone);
+        if gone.is_empty() { return true; }
+        if s.record.as_ref().is_some_and(|r| r.inputs.direct_table) && s.pf.table("delete", &gone).is_err() {
+            log("guard: direct table removal failed");
+            return false;
         }
         for g in &gone {
             s.direct.remove(g);
@@ -399,6 +424,7 @@ impl Guard {
             r.direct = Some(all);
         }
         self.persist(&s);
+        true
     }
 
     pub fn flush_direct(&self) {
@@ -603,6 +629,35 @@ impl Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_table_removal_is_not_reported_as_clean() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ac-guard-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("pfctl-stub");
+        std::fs::write(&tool, "#!/bin/sh\ncase \"$*\" in *delete*) exit 1;; -E) echo 'Token : 123' >&2;; esac\ncat >/dev/null\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = Arc::new(Guard::new(Settings { support_dir: dir.clone(), boot: Some("B1".into()),
+            grace: Duration::from_secs(120), pfctl: Some(tool.to_string_lossy().into()) }));
+        let inputs = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["198.51.100.1".into()],
+            physical_if: "en0".into(), allow_networks: vec![], allow_dns: false, local_dns_servers: vec![], direct_table: true, strict_dns: false };
+        let holder = guard.new_own_holder();
+        assert!(guard.apply(&holder, false, &inputs).is_none());
+        assert!(guard.add_direct(&["203.0.113.9".into()]));
+        assert!(guard.refresh_bootstrap_dns("en5", &["192.168.2.1".into()]));
+        let (_, refreshed) = guard.held().unwrap();
+        assert_eq!(refreshed.physical_if, "en5");
+        assert_eq!(refreshed.local_dns_servers, vec!["192.168.2.1"]);
+        assert_eq!(guard.direct_addresses(), vec!["203.0.113.9"]);
+        assert!(!guard.remove_direct(&["203.0.113.9".into()]));
+        assert_eq!(guard.direct_addresses(), vec!["203.0.113.9"]);
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(guard.remove_direct(&["203.0.113.9".into()]));
+        assert!(guard.direct_addresses().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn swift_records_still_decode() {

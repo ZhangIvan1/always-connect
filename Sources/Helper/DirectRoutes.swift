@@ -148,7 +148,42 @@ enum LocalDNS {
         guard (try? p.run()) != nil else { return [] }
         let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         p.waitUntilExit()
-        let one = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        return isValidIPv4(one) ? [one] : []
+        return out.split(whereSeparator: \.isWhitespace).map(String.init).filter(isValidIPv4)
     }
+}
+
+
+/// Thin SystemConfiguration event shell. Rust decides whether these facts
+/// change the active path; no timers, retries or policy live here.
+final class PhysicalNetworkChanges {
+    private final class Callback {
+        let changed: () -> Void
+        init(_ changed: @escaping () -> Void) { self.changed = changed }
+    }
+    private var store: SCDynamicStore?
+    init?(_ changed: @escaping () -> Void) {
+        let callback = Callback(changed)
+        var context = SCDynamicStoreContext(version: 0,
+            info: Unmanaged.passUnretained(callback).toOpaque(),
+            retain: { info in
+                _ = Unmanaged<Callback>.fromOpaque(info).retain()
+                return UnsafeRawPointer(info)
+            }, release: { info in
+                Unmanaged<Callback>.fromOpaque(info).release()
+            }, copyDescription: nil)
+        guard let store = SCDynamicStoreCreate(nil, "AlwaysConnect path changes" as CFString, { _, _, info in
+            guard let info else { return }
+            Unmanaged<Callback>.fromOpaque(info).takeUnretainedValue().changed()
+        }, &context) else { return nil }
+        let patterns = ["State:/Network/Service/[^/]+/IPv4", "State:/Network/Service/[^/]+/IPv6",
+                        "State:/Network/Service/[^/]+/DNS", "State:/Network/Global/IPv4"]
+        guard SCDynamicStoreSetNotificationKeys(store, nil, patterns as CFArray),
+              SCDynamicStoreSetDispatchQueue(store, DispatchQueue.global(qos: .utility)) else { return nil }
+        self.store = store
+    }
+    func cancel() {
+        if let store { SCDynamicStoreSetDispatchQueue(store, nil) }
+        store = nil
+    }
+    deinit { cancel() }
 }

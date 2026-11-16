@@ -84,6 +84,8 @@ pub struct PfInput {
     /// pass outbound to it; the background service fills it with the
     /// addresses of the domains that skip the VPN.
     pub direct_table: bool,
+    /// Restrict physical DNS to the root forwarder/bootstrap resolver.
+    pub strict_dns: bool,
 }
 
 /// The direct-address table's name (Sources/Helper/NetworkGuard.swift).
@@ -222,7 +224,15 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
     let tuns: Vec<String> = (0..64).map(|n| format!("utun{n}")).collect();
     out.push_str(&format!("pass out quick on {{ {} }} all no state\n", tuns.join(" ")));
     out.push_str("pass out quick on lo0 all no state\n");
-    out.push_str("pass out quick proto udp from any port 68 to any port 67\n");
+    if input.strict_dns || input.direct_table {
+        for ip in &dns_servers {
+            out.push_str(&format!("pass out quick proto {{ udp tcp }} to {ip} port 53 user root no state\n"));
+        }
+        // Before gateway/LAN/direct exceptions: those may include DNS IPs.
+        // mDNSResponder (not root) cannot fall back to the physical DNS.
+        out.push_str("block drop out quick proto { udp tcp } to any port 53\n");
+    }
+    out.push_str("pass out quick inet proto udp from any port 68 to any port 67\n");
     // Passes and the final block apply to EVERY interface (DESIGN.md
     // §25.3): a drop that moves the default route to another interface
     // (Ethernet, a dock, a phone hotspot) must not leak around a block
@@ -235,9 +245,15 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
     }
     out.push_str("pass out quick proto udp to 224.0.0.251 port 5353\n");
     out.push_str("pass out quick proto udp to ff02::fb port 5353\n");
+    // Link-scoped multicast cannot carry traffic to the public Internet.
+    // Keep neighbour/router discovery and DHCPv6 working on the LAN.
+    out.push_str("pass out quick inet6 proto icmp6 to ff02::/16 no state\n");
+    out.push_str("pass out quick inet6 proto udp from fe80::/10 port 546 to ff02::1:2 port 547 no state\n");
     out.push_str("pass out quick inet6 to fe80::/10\n");
-    for ip in &dns_servers {
-        out.push_str(&format!("pass out quick proto {{ udp tcp }} to {ip} port 53 no state\n"));
+    if !input.strict_dns && !input.direct_table {
+        for ip in &dns_servers {
+            out.push_str(&format!("pass out quick proto {{ udp tcp }} to {ip} port 53 no state\n"));
+        }
     }
     if input.direct_table {
         out.push_str(&format!("pass out quick to <{DIRECT_TABLE}> no state\n"));
@@ -256,6 +272,48 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipv6_cannot_use_the_dhcp_exception_and_lan_discovery_is_retained() {
+        let text = generate(&secure_input()).unwrap();
+        assert!(text.contains("pass out quick inet proto udp from any port 68 to any port 67"));
+        assert!(!text.contains("pass out quick proto udp from any port 68"));
+        assert!(text.contains("pass out quick inet6 to fe80::/10"));
+        assert!(text.contains("to ff02::fb port 5353"));
+        assert!(text.contains("inet6 proto icmp6 to ff02::/16 no state"));
+        assert!(text.contains("from fe80::/10 port 546 to ff02::1:2 port 547"));
+        assert!(text.ends_with("block drop out quick all\n"));
+    }
+
+    #[test]
+    fn system_dns_fallback_is_blocked_before_lan_even_when_forwarder_is_unavailable() {
+        for table in [false, true] {
+            let mut input = secure_input(); input.strict_dns = true; input.direct_table = table;
+            input.dns_servers = vec!["192.168.1.1".into()];
+            let text = generate(&input).unwrap();
+            let root = text.find("to 192.168.1.1 port 53 user root no state").unwrap();
+            let deny = text.find("block drop out quick proto { udp tcp } to any port 53").unwrap();
+            let lan = text.find("pass out quick to 192.168.0.0/16").unwrap();
+            assert!(root < deny && deny < lan);
+            assert!(!text.contains("to 192.168.1.1 port 53 no state"));
+            assert!(text.find("on lo0 all").unwrap() < deny);
+            assert!(text.find("on utun5 all").unwrap() < deny);
+        }
+    }
+
+    #[test]
+    fn vpn_allows_udp_including_stun_and_dynamic_webrtc_ports() {
+        let mut input = secure_input();
+        input.direct_table = true;
+        let rules = generate(&input).unwrap();
+        assert!(rules.contains("pass out quick on utun5 all no state"));
+        assert!(rules.contains("pass out quick to <ac_direct> no state"));
+        assert!(rules.ends_with("block drop out quick all\n"));
+        for port in [3478, 5349, 19302, 49152, 65535] {
+            assert!(!rules.contains(&format!("block drop out quick proto udp to any port {port}")), "UDP is carried by the VPN, not disabled by port");
+        }
+        assert!(!rules.contains("pass out quick on en0 all"), "unlisted physical UDP must remain blocked on a drop");
+    }
 
     #[test]
     fn dns_pass_only_when_asked_and_before_final_block() {
@@ -278,6 +336,7 @@ mod tests {
             allow_dns: false,
             dns_servers: vec![],
             direct_table: false,
+            strict_dns: false,
         }
     }
 
@@ -288,11 +347,13 @@ mod tests {
 pass out quick on utun5 all no state\n\
 pass out quick on { utun0 utun1 utun2 utun3 utun4 utun5 utun6 utun7 utun8 utun9 utun10 utun11 utun12 utun13 utun14 utun15 utun16 utun17 utun18 utun19 utun20 utun21 utun22 utun23 utun24 utun25 utun26 utun27 utun28 utun29 utun30 utun31 utun32 utun33 utun34 utun35 utun36 utun37 utun38 utun39 utun40 utun41 utun42 utun43 utun44 utun45 utun46 utun47 utun48 utun49 utun50 utun51 utun52 utun53 utun54 utun55 utun56 utun57 utun58 utun59 utun60 utun61 utun62 utun63 } all no state\n\
 pass out quick on lo0 all no state\n\
-pass out quick proto udp from any port 68 to any port 67\n\
+pass out quick inet proto udp from any port 68 to any port 67\n\
 pass out quick to 203.0.113.10 no state\n\
 pass out quick to 192.168.0.0/16 no state\n\
 pass out quick proto udp to 224.0.0.251 port 5353\n\
 pass out quick proto udp to ff02::fb port 5353\n\
+pass out quick inet6 proto icmp6 to ff02::/16 no state\n\
+pass out quick inet6 proto udp from fe80::/10 port 546 to ff02::1:2 port 547 no state\n\
 pass out quick inet6 to fe80::/10\n\
 block drop out quick all\n";
         assert_eq!(generate(&secure_input()).unwrap(), expected);
@@ -310,11 +371,13 @@ block drop out quick all\n";
 pass out quick on utun5 all no state\n\
 pass out quick on { utun0 utun1 utun2 utun3 utun4 utun5 utun6 utun7 utun8 utun9 utun10 utun11 utun12 utun13 utun14 utun15 utun16 utun17 utun18 utun19 utun20 utun21 utun22 utun23 utun24 utun25 utun26 utun27 utun28 utun29 utun30 utun31 utun32 utun33 utun34 utun35 utun36 utun37 utun38 utun39 utun40 utun41 utun42 utun43 utun44 utun45 utun46 utun47 utun48 utun49 utun50 utun51 utun52 utun53 utun54 utun55 utun56 utun57 utun58 utun59 utun60 utun61 utun62 utun63 } all no state\n\
 pass out quick on lo0 all no state\n\
-pass out quick proto udp from any port 68 to any port 67\n\
+pass out quick inet proto udp from any port 68 to any port 67\n\
 pass out quick to 203.0.113.10 no state\n\
 pass out quick to 192.168.0.0/16 no state\n\
 pass out quick proto udp to 224.0.0.251 port 5353\n\
 pass out quick proto udp to ff02::fb port 5353\n\
+pass out quick inet6 proto icmp6 to ff02::/16 no state\n\
+pass out quick inet6 proto udp from fe80::/10 port 546 to ff02::1:2 port 547 no state\n\
 pass out quick inet6 to fe80::/10\n\
 pass out quick on en0 all\n";
         assert_eq!(generate(&input).unwrap(), expected);
@@ -372,6 +435,7 @@ pass out quick on en0 all\n";
         let input = PfInput {
             dns_servers: vec!["192.168.1.1".to_string(), "192.168.1.1".to_string(), "fd00::1".to_string()],
             direct_table: true,
+            strict_dns: false,
             ..secure_input()
         };
         let text = generate(&input).unwrap();
@@ -379,13 +443,15 @@ pass out quick on en0 all\n";
         let first_rule = text.find("pass out quick on utun5 all").unwrap();
         assert!(table < first_rule, "tables come before rules");
         assert_eq!(
-            text.matches("pass out quick proto { udp tcp } to 192.168.1.1 port 53 no state\n").count(),
+            text.matches("pass out quick proto { udp tcp } to 192.168.1.1 port 53 user root no state\n").count(),
             1
         );
-        assert!(text.contains("pass out quick proto { udp tcp } to fd00::1 port 53 no state\n"));
+        assert!(text.contains("pass out quick proto { udp tcp } to fd00::1 port 53 user root no state\n"));
         let direct = text.find("pass out quick to <ac_direct> no state\n").expect("direct pass");
         assert!(direct < text.find("block drop out quick all").unwrap());
-        assert!(!text.contains("to any port 53"), "no blanket DNS pass in split mode");
+        assert!(!text.contains("pass out quick proto { udp tcp } to any port 53"), "no blanket DNS pass in split mode");
+        let dns_block = text.find("block drop out quick proto { udp tcp } to any port 53").unwrap();
+        assert!(dns_block < text.find("pass out quick to 192.168.0.0/16").unwrap());
         let mut bad = input.clone();
         bad.dns_servers = vec!["999.1.1.1".to_string()];
         assert_eq!(generate(&bad), Err(PfError::BadIp("999.1.1.1".to_string())));

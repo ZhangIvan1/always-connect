@@ -89,7 +89,7 @@ final class DNSForwarder {
 
     func update(tunnelServers: [String], localServers: [String], physicalIf: String?) {
         ac_dns_set_upstreams(handle, tunnelServers.joined(separator: ","),
-                             localServers.joined(separator: ","), physicalIf)
+                             localServers.joined(separator: ","), physicalIf, "lo0")
     }
 
     func name(for ip: String) -> String? {
@@ -128,6 +128,6 @@ func ac_dns_free(_ f: OpaquePointer)
 func ac_dns_set_rules(_ f: OpaquePointer, _ rules: UnsafePointer<CChar>)
 @_silgen_name("ac_dns_set_upstreams")
 func ac_dns_set_upstreams(_ f: OpaquePointer, _ tunnel: UnsafePointer<CChar>, _ local: UnsafePointer<CChar>,
-                          _ physicalIf: UnsafePointer<CChar>?)
+                          _ physicalIf: UnsafePointer<CChar>?, _ tunnelIf: UnsafePointer<CChar>?)
 @_silgen_name("ac_dns_name_for")
 func ac_dns_name_for(_ f: OpaquePointer, _ ip: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?

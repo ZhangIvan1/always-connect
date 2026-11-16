@@ -59,6 +59,7 @@ expect "ifconfig utun7 inet 10.8.0.2 10.8.0.2 netmask 255.255.255.255 mtu 1390 u
 expect "route -n add -host 203.0.113.5 192.168.1.1"
 expect "route -n delete default"
 expect "route -n add default -interface utun7"
+expect "route -n add -ifscope utun7 default -interface utun7"
 expect "d.add ServerAddresses * 10.1.1.1 10.1.1.2;set State:/Network/Service/utun7/DNS"
 expect "d.add OverridePrimary # 1;set State:/Network/Service/utun7/IPv4"
 grep -q '^AC_PHYS_GW=192.168.1.1$' "$ALWAYSCONNECT_ROUTE_STATE_PATH" || { echo "  state gw"; FAILS=$((FAILS+1)); }
@@ -85,6 +86,7 @@ OUT=$(TUNDEV=utun8 FAKE_DEFAULT="10.8.0.2 utun8" ALWAYSCONNECT_MANUAL_FLAG_PATH=
 echo "$OUT" | grep -q 'AC_HOOK disconnect-manual' || FAILS=$((FAILS+1))
 expect "remove State:/Network/Service/utun8/IPv4"
 expect "remove State:/Network/Service/utun7/DNS"
+expect "route -n delete -ifscope utun7 default"
 expect "route -n add default 192.168.1.1"
 expect "route -n delete -host 203.0.113.5"
 [ ! -f "$ALWAYSCONNECT_ROUTE_STATE_PATH" ] || { echo "  state not cleared"; FAILS=$((FAILS+1)); }
@@ -115,10 +117,11 @@ expect "route -n add -host 198.51.100.20 192.168.1.1"
 reject "route -n add -host 127.0.0.1"
 grep -q '^AC_VPN_GW=198.51.100.20$' "$ALWAYSCONNECT_ROUTE_STATE_PATH" || { echo "  state vpn gw"; FAILS=$((FAILS+1)); }
 
-step "domain split: the forwarder is asked first, the tunnel's DNS after (§26.5)"
+step "domain split: only the forwarder can resolve names (§48)"
 rm -f "$ALWAYSCONNECT_ROUTE_STATE_PATH"
 OUT=$(FAKE_DEFAULT="192.168.1.1 en0" ALWAYSCONNECT_DNS_FIRST=127.0.0.1 "$SCRIPT" connect)
-expect "d.add ServerAddresses * 127.0.0.1 10.1.1.1 10.1.1.2;set State:/Network/Service/utun7/DNS"
+expect "d.add ServerAddresses * 127.0.0.1;set State:/Network/Service/utun7/DNS"
+reject "ServerAddresses * 127.0.0.1 10.1.1.1"
 FAKE_DEFAULT="192.168.1.1 en0" "$SCRIPT" restore >/dev/null
 
 step "journal comes first: a session cut off at its first change leaves an undoable record (§26.3)"
@@ -164,7 +167,7 @@ reject "route -n change"
 echo "$OUT" | grep -q 'AC_HOOK attempt-reconnect' || { echo "  hook without network"; FAILS=$((FAILS+1)); }
 
 step "reconnected: reported"
-"$SCRIPT" reconnect 2>/dev/null | grep -q '^AC_HOOK reconnect$' || { echo "  reconnect hook"; FAILS=$((FAILS+1)); }
+"$SCRIPT" reconnect 2>/dev/null | grep -q '^AC_HOOK reconnect tun=utun7 dns=10.1.1.1,10.1.1.2$' || { echo "  reconnect hook"; FAILS=$((FAILS+1)); }
 FAKE_DEFAULT="" "$SCRIPT" restore >/dev/null 2>&1
 
 step "drop, then another network: the next connect uses the router there, not the journal's (§30.2)"

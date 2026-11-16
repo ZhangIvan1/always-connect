@@ -81,6 +81,7 @@ final class CLIOrchestrator {
     }
 
     private let box = Box()
+    private var networkChanges: PhysicalNetworkChanges?
     private let handle: OpaquePointer
 
     init(config: Config) {
@@ -146,11 +147,19 @@ final class CLIOrchestrator {
         text = String(repeating: " ", count: text.count)
     }
 
-    deinit { ac_oc_free(handle) }
+    deinit { networkChanges?.cancel(); ac_oc_free(handle) }
 
     // MARK: - Lifecycle
 
-    func start() { ac_oc_start(handle) }
+    func start() {
+        if !TestSeam.isActive {
+            networkChanges = PhysicalNetworkChanges { [weak self] in
+                guard let self else { return }
+                ac_oc_network_changed(self.handle)
+            }
+        }
+        ac_oc_start(handle)
+    }
 
     /// The network gate's holder name for this engine (§25.2).
     var holder: String { NetworkGuard.take(ac_oc_holder(handle)) ?? "" }
@@ -158,6 +167,8 @@ final class CLIOrchestrator {
     /// `completion` runs once openconnect has exited and routes and pf
     /// are restored (§25.7). `keepSession`: SIGHUP, no log-off (§30.1).
     func stop(keepSession: Bool = false, completion: (() -> Void)? = nil) {
+        networkChanges?.cancel()
+        networkChanges = nil
         if let completion {
             box.lock.lock(); box.completions.append(completion); box.lock.unlock()
         }
@@ -209,6 +220,7 @@ final class CLIOrchestrator {
     var gatewayAddresses: [String] { info?.gatewayIps ?? [] }
     var physicalInterface: String { info?.physicalIf ?? "en0" }
     var tunnelDnsServers: [String] { info?.tunnelDns ?? [] }
+    func runNetworkCheck() -> String { NetworkGuard.take(ac_oc_network_check(handle)) ?? "[]" }
     var redactedLogTail: [String] { info?.tail ?? [] }
 
     /// (entries, address count); empty when no split is running.
@@ -332,3 +344,9 @@ enum SystemRoots {
         return file.path
     }
 }
+
+@_silgen_name("ac_oc_network_changed")
+func ac_oc_network_changed(_ engine: OpaquePointer)
+
+@_silgen_name("ac_oc_network_check")
+func ac_oc_network_check(_ engine: OpaquePointer) -> UnsafeMutablePointer<CChar>?

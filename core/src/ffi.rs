@@ -412,6 +412,7 @@ pub extern "C" fn ac_pf_generate(
         allow_dns: flags & 2 != 0,
         dns_servers: split_csv(&dns_servers_csv),
         direct_table: flags & 4 != 0,
+        strict_dns: flags & 8 != 0,
     };
     match crate::pf::generate(&input) {
         Ok(text) => match CString::new(text) {
@@ -738,7 +739,7 @@ mod tests {
         assert!(!out.is_null());
         let text = unsafe { CStr::from_ptr(out).to_str().unwrap().to_owned() };
         assert!(text.contains("table <ac_direct> persist\n"));
-        assert!(text.contains("to 192.168.1.1 port 53 no state\n"));
+        assert!(text.contains("to 192.168.1.1 port 53 user root no state\n"));
         ac_string_free(out);
         ac_string_free(std::ptr::null_mut());
     }
@@ -815,7 +816,7 @@ pub extern "C" fn ac_dns_new(
             (context.direct)(context.ctx, entry.as_ptr(), ips.as_ptr());
         }) as dns_forwarder::DirectHook
     });
-    let upstreams = Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None };
+    let upstreams = Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None };
     Box::into_raw(Box::new(Forwarder::new(
         SocketAddrV4::new(address, port),
         upstream_port,
@@ -860,19 +861,22 @@ pub extern "C" fn ac_dns_set_rules(f: *const Forwarder, rules: *const c_char) {
 }
 
 /// Comma-separated servers ("a.b.c.d" or "a.b.c.d:port"); `physical_if`
-/// may be null or empty (no binding).
+/// may be null or empty in the loopback harness. `tunnel_if` is required
+/// for VPN queries; missing/invalid never falls back to an unbound socket.
 #[no_mangle]
 pub extern "C" fn ac_dns_set_upstreams(
     f: *const Forwarder,
     tunnel: *const c_char,
     local: *const c_char,
     physical_if: *const c_char,
+    tunnel_if: *const c_char,
 ) {
     if let Some(f) = unsafe { f.as_ref() } {
         f.set_upstreams(Upstreams {
             tunnel: c_list(tunnel, ','),
             local: c_list(local, ','),
             physical_if: c_str(physical_if).filter(|s| !s.is_empty()),
+            tunnel_if: c_str(tunnel_if).filter(|s| !s.is_empty()),
         });
     }
 }
@@ -1770,4 +1774,33 @@ pub extern "C" fn ac_on_demand_step(request: *const c_char) -> *mut c_char {
         .and_then(|v| CString::new(v.to_string()).ok())
         .map(CString::into_raw)
         .unwrap_or(std::ptr::null_mut())
+}
+
+
+/// SystemConfiguration notifications are facts, not Swift decisions.
+#[no_mangle]
+pub extern "C" fn ac_oc_network_changed(engine: *const crate::oc_engine::Engine) {
+    if let Some(engine) = unsafe { engine.as_ref() } { engine.network_changed(); }
+}
+
+
+/// Existing leak-check RPC uses this read-only Rust implementation.
+#[no_mangle]
+pub extern "C" fn ac_oc_network_check(engine: *const crate::oc_engine::Engine) -> *mut c_char {
+    let Some(engine) = (unsafe { engine.as_ref() }) else { return std::ptr::null_mut() };
+    CString::new(engine.run_network_check()).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
+}
+
+
+#[no_mangle]
+pub extern "C" fn ac_resolve_gateway(host: *const c_char, servers: *const c_char, interface: *const c_char) -> *mut c_char {
+    let values = match (c_str(host), c_str(interface)) {
+        (Some(host), Some(interface)) => {
+            let servers = c_list(servers, ',');
+            if crate::network_guard::shared().is_some_and(|g| !g.refresh_bootstrap_dns(&interface, &servers)) { vec![] }
+            else { crate::dns_forwarder::resolve_gateway(&host, &servers, &interface) }
+        },
+        _ => vec![],
+    };
+    CString::new(values.join(",")).map(CString::into_raw).unwrap_or(std::ptr::null_mut())
 }

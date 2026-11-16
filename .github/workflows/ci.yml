@@ -75,6 +75,10 @@ jobs:
           xcodebuild -project AlwaysConnect.xcodeproj
           -scheme AlwaysConnect -destination 'platform=macOS'
           build CODE_SIGNING_ALLOWED=NO
+      - name: Gateway resolution XPC wiring (substitutes only)
+        run: scripts/gateway-resolution-test.sh
+      - name: Emergency recovery route plan (stubbed, no network changes)
+        run: scripts/reset-network-test.sh
       - name: Run Helper engine smoke test (no server)
         # Exercises spawn + stdin feed + Transient classification +
         # backoff + max-attempts, with no gateway and no tun device.

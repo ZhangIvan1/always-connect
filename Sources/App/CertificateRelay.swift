@@ -209,10 +209,10 @@ final class CertificateRelay {
     /// answering) is skipped while another exists, and `known` (the
     /// addresses seen before) stands in when the name does not resolve
     /// right now (DNS points into a dead tunnel during a drop).
-    func prepare(prefer: String? = nil, avoid: String? = nil, known: [String] = []) throws -> Prepared {
+    func prepare(prefer: String? = nil, avoid: String? = nil, known: [String] = [], resolved: [String]? = nil) throws -> Prepared {
         guard #available(macOS 15.0, *) else { throw RelayError.unsupportedSystem }
         let (identity, pin) = try Self.makeListenerIdentity()
-        let resolved = Self.resolveAllIPv4(host, port: upstreamPort)
+        let resolved = resolved ?? Self.resolveAllIPv4(host, port: upstreamPort)
         guard let ip = Self.pick(resolved.isEmpty ? known : resolved, prefer: prefer, avoid: avoid)
         else { throw RelayError.unresolved }
         queue.sync {

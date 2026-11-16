@@ -94,17 +94,17 @@ fn route(args: &[&str]) -> i32 {
 /// Takes one of our routes out. A network the Mac has meanwhile moved
 /// onto (ours was there first, so the system could not put its own
 /// interface route in) gets that interface route back.
-fn delete(entry: &str) {
+fn delete(entry: &str) -> bool {
     if !is_network(entry) {
-        route(&["-n", "delete", "-host", entry]);
-        return;
+        return route(&["-n", "delete", "-host", entry]) == 0;
     }
-    route(&["-n", "delete", "-net", entry]);
+    if route(&["-n", "delete", "-net", entry]) != 0 { return false; }
     if let Some(r) = cidr_range(entry) {
         if let Some((iface, _)) = attached_interfaces().into_iter().find(|(_, n)| *n == r) {
             route(&["-n", "add", "-net", entry, "-interface", &iface]);
         }
     }
+    true
 }
 
 fn undo(journal: &Path, no_routes: bool) -> usize {
@@ -153,23 +153,23 @@ impl DirectRoutes {
 
     /// Route `entries` via `gateway` (the physical default gateway).
     /// Returns once the routes are in place.
-    pub fn add(&self, entries: &[String], gateway: &str) {
+    pub fn add(&self, entries: &[String], gateway: &str) -> bool {
         let mut routed = self.routed.lock().unwrap();
         let fresh: Vec<&String> = entries.iter().filter(|e| is_entry(e) && !routed.contains(*e)).collect();
-        if fresh.is_empty() || ipv4(gateway).is_none() {
-            return;
-        }
-        // Journal first.
-        if !self.journal.exists() {
-            if let Ok(mut f) = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&self.journal) {
-                let _ = f.write_all(format!("boot {}\n", self.boot).as_bytes());
+        if fresh.is_empty() { return true; }
+        if ipv4(gateway).is_none() { return false; }
+        // A failed journal write must never be followed by an untracked route.
+        let recorded = (|| -> std::io::Result<()> {
+            if !self.journal.exists() {
+                let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&self.journal)?;
+                f.write_all(format!("boot {}\n", self.boot).as_bytes())?;
             }
-        }
-        if let Ok(mut f) = fs::OpenOptions::new().append(true).open(&self.journal) {
+            let mut f = fs::OpenOptions::new().append(true).open(&self.journal)?;
             let lines: String = fresh.iter().map(|e| format!("{e} {gateway}\n")).collect();
-            let _ = f.write_all(lines.as_bytes());
-            let _ = f.sync_all();
-        }
+            f.write_all(lines.as_bytes())?;
+            f.sync_all()
+        })();
+        if recorded.is_err() { return false; }
         let mut refused: Vec<String> = Vec::new();
         for entry in fresh {
             if is_network(entry) {
@@ -182,13 +182,17 @@ impl DirectRoutes {
                     continue;
                 }
             } else if !self.no_routes && route(&["-n", "add", "-host", entry, gateway]) != 0 {
-                route(&["-n", "change", "-host", entry, gateway]);
+                if route(&["-n", "change", "-host", entry, gateway]) != 0 {
+                    refused.push(entry.clone());
+                    continue;
+                }
             }
             routed.insert(entry.clone());
         }
         if !refused.is_empty() {
             self.forget(&refused);
         }
+        refused.is_empty()
     }
 
     /// Journal lines for routes that were never added.
@@ -219,14 +223,20 @@ impl DirectRoutes {
     }
 
     /// Takes routes out again mid-session (a network rule removed from
-    /// the list). Their journal lines stay; deleting twice is harmless.
-    pub fn remove(&self, entries: &[String]) {
+    /// the list). Successfully removed routes leave the journal too.
+    pub fn remove(&self, entries: &[String]) -> bool {
         let mut routed = self.routed.lock().unwrap();
+        let mut removed = Vec::new();
+        let mut ok = true;
         for entry in entries {
-            if routed.remove(entry) && !self.no_routes {
-                delete(entry);
-            }
+            if !routed.contains(entry) { continue; }
+            if self.no_routes || delete(entry) {
+                routed.remove(entry);
+                removed.push(entry.clone());
+            } else { ok = false; }
         }
+        if !removed.is_empty() { self.forget(&removed); }
+        ok
     }
 
     pub fn addresses(&self) -> Vec<String> {
@@ -266,8 +276,19 @@ mod tests {
         assert_eq!(r.addresses().len(), 2, "no gateway, no route");
         r.remove(&["203.0.113.9".into()]);
         assert_eq!(r.addresses(), vec!["198.51.100.0/24"]);
+        assert!(!fs::read_to_string(&j).unwrap().contains("203.0.113.9"), "removed routes must leave the journal too");
         r.remove_all();
         assert!(!j.exists() && r.addresses().is_empty());
+    }
+
+    #[test]
+    fn failed_journal_does_not_claim_a_route() {
+        let j = temp("bad-journal");
+        fs::create_dir_all(&j).unwrap();
+        let r = DirectRoutes::new(j.clone(), "B1".into(), true);
+        assert!(!r.add(&["203.0.113.9".into()], "192.168.1.1"));
+        assert!(r.addresses().is_empty());
+        fs::remove_dir_all(j.parent().unwrap()).unwrap();
     }
 
     #[test]

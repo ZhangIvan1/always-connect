@@ -142,10 +142,11 @@ enum Event {
     Exited { generation: u64 },
     Fire { timer: Timer, token: u64 },
     StopKill { pid: i32, generation: u64 },
+    NetworkChanged,
     DirectDomains(Vec<String>),
     DropProtection(bool),
     AllowNetworks(Vec<String>),
-    SplitHit(String, Vec<String>),
+    DnsAnswer(dns_forwarder::Observation, Sender<bool>),
     /// A scheduled retry: spawn again unless a manual stop landed first.
     Respawn,
     Release,
@@ -390,6 +391,9 @@ struct Core {
     last_pf: Option<(String, Vec<String>)>,
     last_allow_direct_egress: bool,
     tunnel_dns: Vec<String>,
+    tunnel_if: Option<String>,
+    split_policy: crate::split_policy::SplitPolicy,
+    split_needs_sync: bool,
     tunnel_retrying: bool,
     gateway_lan_excludes: Vec<String>,
     watching: bool,
@@ -463,6 +467,9 @@ impl Engine {
                 last_pf: None,
                 last_allow_direct_egress: false,
                 tunnel_dns: Vec::new(),
+                tunnel_if: None,
+                split_policy: crate::split_policy::SplitPolicy::default(),
+                split_needs_sync: false,
                 tunnel_retrying: false,
                 gateway_lan_excludes: Vec::new(),
                 watching: false,
@@ -504,6 +511,8 @@ impl Engine {
     pub fn stop(&self, keep_session: bool, notify: bool) {
         self.send(Event::Stop { keep_session, notify });
     }
+    pub fn network_changed(&self) { self.send(Event::NetworkChanged); }
+
     pub fn update_direct_domains(&self, d: Vec<String>) {
         self.send(Event::DirectDomains(d));
     }
@@ -535,6 +544,30 @@ impl Engine {
 
     pub fn info(&self) -> Info {
         self.shared.info.lock().unwrap().clone()
+    }
+
+    fn check_expected(&self) -> crate::network_check::Expected {
+        let c = self.shared.core.lock().unwrap();
+        crate::network_check::Expected {
+            tunnel: c.last_pf.as_ref().map(|p| p.0.clone()), dns_interface: c.forwarder.as_ref().and_then(|f| f.bound_tunnel_interface()),
+            physical: c.config.physical_if.clone(), gateway: c.physical_gateway.clone(),
+            vpn_gateways: c.last_pf.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
+            dns: c.tunnel_dns.clone(), split: c.forwarder.is_some(), protection: c.config.drop_protection,
+            rules: self.shared.guard.expected_rules(), direct: self.shared.guard.direct_addresses(),
+            routes: self.shared.routes.addresses(), error: c.pf_error.clone(),
+            epoch: c.forwarder.as_ref().map(|f| f.epoch()).unwrap_or(c.generation),
+        }
+    }
+    pub fn run_network_check(&self) -> String {
+        self.run_network_check_with(crate::network_check::run)
+    }
+    fn run_network_check_with(&self, collect: impl FnOnce(&crate::network_check::Expected) -> Vec<crate::network_check::Item>) -> String {
+        let expected = self.check_expected();
+        let mut items = collect(&expected);
+        if expected != self.check_expected() {
+            for item in &mut items { item.passed = false; item.informational = false; item.detail = "检查期间连接状态已变化，请重新检查".into(); }
+        }
+        serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
     }
 
     /// The connections page for this session (§28.7).
@@ -656,26 +689,40 @@ impl Shared {
                         unsafe { libc::kill(pid, libc::SIGKILL) };
                     }
                 }
+                Event::NetworkChanged => {
+                    if c.watching && !c.stop_requested { self.refresh_network(&mut c); }
+                }
                 Event::DirectDomains(d) => {
                     if let Some(f) = &c.forwarder {
                         f.set_rules(&d);
                     }
+                    c.split_policy.revalidate(&dns_forwarder::SplitRules::new(&d));
+                    self.sync_split_routes(&mut c);
                     c.config.direct_domains = Some(d);
                 }
                 Event::DropProtection(on) => self.update_drop_protection(&mut c, on),
                 Event::AllowNetworks(n) => {
                     c.config.allow_networks = n.iter().map(|x| x.trim().to_string()).filter(|x| crate::kill_switch::is_cidr(x)).collect();
+                    self.sync_split_routes(&mut c);
                     self.route_networks_direct(&mut c);
                     if let Some((tun, gws)) = c.last_pf.clone() {
                         let allow = c.last_allow_direct_egress;
                         self.load_pf(&mut c, Some(tun), gws, allow);
                     }
                 }
-                Event::SplitHit(entry, ips) => {
-                    c.split_hits.retain(|e| *e != entry);
-                    c.split_hits.insert(0, entry);
-                    c.split_hits.truncate(20);
-                    c.split_addresses.extend(ips);
+                Event::DnsAnswer(answer, reply) => {
+                    let current = !c.stop_requested && c.forwarder.as_ref().is_some_and(|f| f.is_current(answer.epoch));
+                    let committed = if current {
+                        let changed = c.split_policy.observe(answer.name, &answer.addresses, &answer.direct);
+                        let ok = if changed || c.split_needs_sync { self.sync_split_routes(&mut c) } else { true };
+                        if let Some(entry) = answer.entry {
+                            c.split_hits.retain(|e| *e != entry);
+                            c.split_hits.insert(0, entry);
+                            c.split_hits.truncate(20);
+                        }
+                        ok
+                    } else { false };
+                    let _ = reply.send(committed);
                 }
                 Event::Respawn => {
                     if !c.stop_requested {
@@ -792,39 +839,17 @@ impl Shared {
         let Some(domains) = c.config.direct_domains.clone() else { return };
         let port = if c.config.test_active { 15353 } else { 53 };
         let weak = Arc::downgrade(self);
-        let hook: dns_forwarder::DirectHook = Box::new(move |entry, ips| {
-            let Some(me) = weak.upgrade() else { return };
-            let list: Vec<String> = ips.iter().map(|i| i.to_string()).collect();
-            me.send(Event::SplitHit(entry.to_string(), list.clone()));
-            // Routed and let through pf before the answer goes back —
-            // unless the session is ending (§30.3).
-            let (ending, gateway, vpn_gateways) = {
-                let c = me.core.lock().unwrap();
-                let mut gws: HashSet<String> = c.last_pf.as_ref().map(|p| p.1.iter().cloned().collect()).unwrap_or_default();
-                if let Some(r) = &c.config.relay {
-                    gws.insert(r.gateway_ip.clone());
-                }
-                (c.stop_requested, c.physical_gateway.clone(), gws)
-            };
-            if ending {
-                return;
-            }
-            // Never the VPN gateway's own address, never a host on a
-            // network the Mac sits on.
-            let lans = direct_routes::attached_networks();
-            let routable: Vec<String> = ips
-                .iter()
-                .filter(|ip| !vpn_gateways.contains(&ip.to_string()))
-                .filter(|ip| { let v = u32::from(**ip); !lans.iter().any(|l| l.0 <= v && v <= l.1) })
-                .map(|ip| ip.to_string())
-                .collect();
-            if let Some(gw) = gateway {
-                me.routes.add(&routable, &gw);
-            }
-            me.guard.add_direct(&list);
+        let hook: dns_forwarder::AnswerHook = Box::new(move |answer| {
+            let Some(me) = weak.upgrade() else { return false };
+            let (tx, rx) = std::sync::mpsc::channel();
+            me.send(Event::DnsAnswer(answer, tx));
+            // Never acquire the engine lock from a DNS worker. Configuration
+            // and route/pf commits share the engine queue, so old replies cannot
+            // re-add a bypass after its rule or session was removed.
+            rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
         });
-        let forwarder = Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
-            Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None }, Some(hook));
+        let forwarder = Forwarder::with_answer_hook(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(2), domains,
+            Upstreams { tunnel: Vec::new(), local: Vec::new(), physical_if: None, tunnel_if: None }, None, Some(hook));
         match forwarder.start() {
             Ok(()) => c.forwarder = Some(forwarder),
             Err(_) => {
@@ -832,6 +857,51 @@ impl Shared {
                 c.last_error = Some(e.clone());
                 self.report(c, &e);
             }
+        }
+    }
+
+    fn sync_split_routes(&self, c: &mut Core) -> bool {
+        c.split_needs_sync = true;
+        let desired = c.split_policy.direct();
+        let actual: HashSet<_> = self.guard.direct_addresses().into_iter().collect();
+        let gone: Vec<_> = actual.difference(&desired).cloned().collect();
+        // Close the firewall exception before removing its route; never grant
+        // an exception until the corresponding route is installed.
+        let firewall_ok = self.guard.remove_direct(&gone);
+        let gateways: HashSet<_> = c.last_pf.as_ref().map(|p| p.1.iter().cloned().collect()).unwrap_or_default();
+        let lans = direct_routes::attached_networks();
+        let explicit = dns_forwarder::SplitRules::new(&c.direct_networks().iter().map(|n| format!("ipcidr:{n}")).collect::<Vec<_>>());
+        let routable: HashSet<_> = desired.iter().filter(|ip| !gateways.contains(*ip))
+            .filter(|ip| dns_forwarder::ipv4(ip).is_some_and(|v| !lans.iter().any(|l| l.0 <= v && v <= l.1)))
+            .filter(|ip| !ip.parse().is_ok_and(|ip| explicit.contains(ip)))
+            .cloned().collect();
+        let routed: HashSet<_> = self.routes.addresses().into_iter().filter(|e| !direct_routes::is_network(e)).collect();
+        let removed: Vec<_> = routed.difference(&routable).cloned().collect();
+        let routes_ok = self.routes.remove(&removed);
+        if !firewall_ok || !routes_ok {
+            let e = "直连例外清理失败，网络保护状态未确认；可使用恢复网络".to_string();
+            c.pf_error = Some(e.clone()); self.report(c, &e);
+            return false;
+        }
+        let new: Vec<_> = routable.difference(&routed).cloned().collect();
+        if !new.is_empty() {
+            let Some(gateway) = &c.physical_gateway else { return false };
+            if !self.routes.add(&new, gateway) { return false; }
+        }
+        let fresh: Vec<_> = desired.difference(&actual).cloned().collect();
+        if !self.guard.add_direct(&fresh) { return false; }
+        c.split_addresses = desired;
+        c.split_needs_sync = false;
+        true
+    }
+
+    fn update_forwarder(&self, c: &Core) {
+        if let Some(f) = &c.forwarder {
+            f.set_upstreams(Upstreams {
+                tunnel: c.tunnel_dns.clone(), local: c.local_dns.clone(),
+                physical_if: if c.config.no_routes { None } else { Some(c.config.physical_if.clone()) },
+                tunnel_if: c.tunnel_if.clone(),
+            });
         }
     }
 
@@ -849,6 +919,7 @@ impl Shared {
             }
         } else {
             self.guard.release(Some(&self.holder), network_guard::reason::USER);
+            c.split_needs_sync = true;
             c.pf_error = None;
             if c.in_drop_episode && c.child.is_none() {
                 self.give_back_local_network(c);
@@ -901,9 +972,17 @@ impl Shared {
         c.watch_stop = Some(write_end);
         let weak = Arc::downgrade(self);
         let _ = std::thread::Builder::new().name("ac-engine-netwatch".into()).stack_size(64 * 1024).spawn(move || {
-            let Some(watch) = crate::route_watch::RouteWatch::new() else { return };
+            let watch = crate::route_watch::RouteWatch::new();
             loop {
-                match watch.wait(Duration::from_secs(60), Duration::from_millis(500), Some(read_end.as_raw_fd())) {
+                let wake = if let Some(watch) = &watch {
+                    watch.wait(Duration::from_secs(60), Duration::from_millis(500), Some(read_end.as_raw_fd()))
+                } else {
+                    // A failed routing socket must not remove the fallback.
+                    let mut stop = libc::pollfd { fd: read_end.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                    unsafe { libc::poll(&mut stop, 1, 60_000) };
+                    if stop.revents != 0 { crate::route_watch::Wake::Stopped } else { crate::route_watch::Wake::Timeout }
+                };
+                match wake {
                     crate::route_watch::Wake::Stopped => return,
                     _ => match weak.upgrade() {
                         Some(me) => me.send(Event::Fire { timer: Timer::NetWatch, token: u64::MAX }),
@@ -926,6 +1005,8 @@ impl Shared {
         self.routes.remove_all();
         c.split_hits.clear();
         c.split_addresses.clear();
+        c.split_policy = crate::split_policy::SplitPolicy::default();
+        c.split_needs_sync = false;
     }
 
     // MARK: Timers
@@ -958,12 +1039,7 @@ impl Shared {
                 if !c.watching || c.stop_requested {
                     return;
                 }
-                let Some(known) = c.physical_gateway.clone() else { return };
-                if let Some((gw, iface)) = (self.hooks.physical_network)(&c.config.physical_if) {
-                    if gw != known || iface != c.config.physical_if {
-                        self.follow_network(c, &gw, &iface, true);
-                    }
-                }
+                self.refresh_network(c);
             }
         }
     }
@@ -1018,6 +1094,8 @@ impl Shared {
         c.tunnel_retrying = false;
         c.saw_login_failed = false;
         c.tunnel_dns.clear();
+        c.tunnel_if = None;
+        self.update_forwarder(c);
         if c.in_drop_episode {
             c.episode_retries += 1;
         }
@@ -1223,6 +1301,7 @@ impl Shared {
         let pairs: Vec<(&str, &str)> = parts.filter_map(|p| p.split_once('=')).collect();
         match event {
             "connect" => {
+                c.tunnel_dns.clear();
                 let mut tun = None;
                 let mut gateway = None;
                 for (k, v) in &pairs {
@@ -1248,16 +1327,11 @@ impl Shared {
                 }
                 c.hook_fired = true;
                 c.tunnel_retrying = false;
-                if c.forwarder.is_some() {
+                if c.forwarder.is_some() || c.config.relay.is_some() {
                     c.local_dns = if c.config.no_routes { Vec::new() } else { (self.hooks.local_dns)(&c.config.physical_if) };
                 }
-                if let Some(f) = &c.forwarder {
-                    f.set_upstreams(Upstreams {
-                        tunnel: c.tunnel_dns.clone(),
-                        local: c.local_dns.clone(),
-                        physical_if: if c.config.no_routes { None } else { Some(c.config.physical_if.clone()) },
-                    });
-                }
+                c.tunnel_if = tun.clone();
+                self.update_forwarder(c);
                 Self::cancel(c, Timer::ApprovalTimeout);
                 c.unanswered_since = None;
                 c.expired_approvals = 0;
@@ -1273,6 +1347,8 @@ impl Shared {
             "attempt-reconnect" => {
                 // openconnect is retrying inside the same process (§28.1).
                 c.tunnel_retrying = true;
+                c.tunnel_if = None;
+                self.update_forwarder(c);
                 let phys = pairs.iter().find(|(k, v)| *k == "phys" && !v.is_empty()).map(|(_, v)| v.to_string());
                 let gw = pairs.iter().find(|(k, v)| *k == "physgw" && is_ipv4(v)).map(|(_, v)| v.to_string());
                 if let (Some(gw), Some(phys)) = (gw, phys) {
@@ -1280,10 +1356,22 @@ impl Shared {
                         self.follow_network(c, &gw, &phys, false);
                     }
                 }
+                if !c.config.no_routes { self.refresh_network(c); }
                 self.report(c, "隧道断了，正在重连…");
             }
             "reconnect" => {
                 c.tunnel_retrying = false;
+                if !c.config.no_routes { self.refresh_network(c); }
+                c.tunnel_if = pairs.iter().find(|(k,v)| *k == "tun" && !v.is_empty()).map(|(_,v)| v.to_string())
+                    .or_else(|| c.last_pf.as_ref().map(|p| p.0.clone()));
+                if let Some((_, dns)) = pairs.iter().find(|(k,_)| *k == "dns") {
+                    c.tunnel_dns = dns.split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();
+                }
+                self.update_forwarder(c);
+                if let Some((_, gateways)) = c.last_pf.clone() {
+                    let allow = c.last_allow_direct_egress;
+                    self.load_pf(c, c.tunnel_if.clone(), gateways, allow);
+                }
                 self.report(c, "tunnel up");
             }
             _ => {}
@@ -1398,6 +1486,8 @@ impl Shared {
                 return;
             }
         }
+        c.tunnel_if = None;
+        self.update_forwarder(c);
         if c.hook_fired {
             if let DriverAction::Reauthenticate { delay } = c.driver.on_drop(false) {
                 c.in_drop_episode = true;
@@ -1470,17 +1560,15 @@ impl Shared {
             physical_if: c.config.physical_if.clone(),
             allow_networks: c.direct_networks(),
             allow_dns: false,
-            local_dns_servers: Vec::new(),
+            local_dns_servers: c.local_dns.clone(),
             direct_table: false,
+            strict_dns: c.config.relay.is_some(),
         };
         let mut connected = allow_direct_egress;
         if c.forwarder.is_some() {
-            // Addresses sent direct earlier this session: a release emptied
-            // the gate's table, and programs still use cached answers.
-            let known: Vec<String> = c.split_addresses.iter().filter(|a| network_guard::is_ip(a)).cloned().collect();
-            if !known.is_empty() {
-                self.guard.add_direct(&known);
-            }
+            // Reconcile the current policy, never replay an append-only list
+            // from an older rule set after protection is re-enabled.
+            if !self.sync_split_routes(c) { return; }
             // Domain split (§26.7): one set, connected and dropped alike.
             inputs.local_dns_servers = c.local_dns.clone();
             inputs.direct_table = true;
@@ -1528,6 +1616,38 @@ impl Shared {
         }
     }
 
+    /// Configd can change DNS without a routing event or a different router.
+    /// All watchers feed this one reducer path; unchanged facts do no work.
+    fn refresh_network(&self, c: &mut Core) {
+        let Some((gateway, interface)) = (self.hooks.physical_network)(&c.config.physical_if) else {
+            if c.physical_gateway.is_some() || c.tunnel_if.is_some() || !c.local_dns.is_empty() {
+                c.physical_gateway = None;
+                c.tunnel_if = None;
+                c.local_dns.clear();
+                self.update_forwarder(c);
+                if let Some((tun, gws)) = c.last_pf.clone() {
+                    self.load_pf(c, Some(tun), gws, false);
+                }
+            }
+            return;
+        };
+        if c.physical_gateway.as_ref() != Some(&gateway) || c.config.physical_if != interface {
+            self.follow_network(c, &gateway, &interface, true);
+            return;
+        }
+        if c.forwarder.is_some() || c.config.relay.is_some() {
+            let dns = (self.hooks.local_dns)(&interface);
+            if dns != c.local_dns {
+                c.local_dns = dns;
+                self.update_forwarder(c);
+                if let Some((tun, gws)) = c.last_pf.clone() {
+                    let allow = c.last_allow_direct_egress;
+                    self.load_pf(c, Some(tun), gws, allow);
+                }
+            }
+        }
+    }
+
     /// The physical network changed under a live session (§28.1).
     fn follow_network(&self, c: &mut Core, gateway: &str, interface: &str, move_gateway_route: bool) {
         network_guard::log(&format!("network changed: now via {interface}"));
@@ -1539,14 +1659,12 @@ impl Shared {
         // The session's direct routes (the split's addresses and the
         // direct networks, §40.1) go via the new router.
         self.routes.repoint(gateway);
-        if let Some(f) = &c.forwarder {
+        c.tunnel_if = None;
+        if c.forwarder.is_some() || c.config.relay.is_some() {
             c.local_dns = if c.config.no_routes { Vec::new() } else { (self.hooks.local_dns)(interface) };
-            f.set_upstreams(Upstreams {
-                tunnel: c.tunnel_dns.clone(),
-                local: c.local_dns.clone(),
-                physical_if: if c.config.no_routes { None } else { Some(interface.to_string()) },
-            });
         }
+        self.update_forwarder(c);
+        self.sync_split_routes(c);
         self.route_networks_direct(c);
         if let Some((tun, gws)) = c.last_pf.clone() {
             // pf passes the gateway on the physical interface.
@@ -1568,6 +1686,157 @@ fn wipe(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn split_engine(name: &str) -> (Engine, PathBuf) {
+        split_engine_with_hooks(name, Hooks {
+            state: Box::new(|_, _| {}), terminal: Box::new(|_| {}),
+            physical_network: Box::new(|_| None), local_dns: Box::new(|_| vec![]),
+            system_roots: Box::new(|| None), stopped: Box::new(|| {}),
+        })
+    }
+    fn split_engine_with_hooks(name: &str, hooks: Hooks) -> (Engine, PathBuf) {
+        let support = std::env::temp_dir().join(format!("ac-split-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&support);
+        std::fs::create_dir_all(&support).unwrap();
+        let guard = Arc::new(Guard::new(network_guard::Settings {
+            support_dir: support.clone(), boot: Some("test-boot".into()),
+            grace: Duration::from_secs(120), pfctl: None,
+        }));
+        let engine = Engine::new(Config { no_routes: true, test_active: true,
+            support_dir: support.to_string_lossy().into_owned(), boot_session: "test-boot".into(),
+            script_path: "/usr/bin/true".into(), ..Config::default() }, hooks, guard);
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            c.physical_gateway = Some("192.168.1.1".into());
+            c.forwarder = Some(Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 53,
+                Duration::from_millis(50), vec!["direct.example".into()],
+                Upstreams { tunnel: vec![], local: vec![], physical_if: None, tunnel_if: None }, None));
+        }
+        (engine, support)
+    }
+    fn dns_event(engine: &Engine, epoch: u64, name: &str, direct: bool) -> bool {
+        let (tx, rx) = mpsc::channel();
+        let ip = Ipv4Addr::new(203, 0, 113, 9);
+        engine.send(Event::DnsAnswer(dns_forwarder::Observation {
+            epoch, name: name.into(), entry: direct.then(|| name.into()),
+            addresses: vec![ip], direct: if direct { vec![ip] } else { vec![] },
+        }, tx));
+        rx.recv_timeout(Duration::from_secs(2)).unwrap()
+    }
+    #[test]
+    fn queued_rule_removal_revokes_route_pf_and_rejects_late_reply() {
+        let (engine, support) = split_engine("remove");
+        let epoch = engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        assert!(dns_event(&engine, epoch, "direct.example", true));
+        assert_eq!(engine.shared.routes.addresses(), vec!["203.0.113.9"]);
+        assert_eq!(engine.shared.guard.direct_addresses(), vec!["203.0.113.9"]);
+        engine.update_direct_domains(vec![]);
+        assert!(!dns_event(&engine, epoch, "direct.example", true), "old query must stay invalid after removal");
+        assert!(engine.shared.routes.addresses().is_empty());
+        assert!(engine.shared.guard.direct_addresses().is_empty());
+        assert!(!std::fs::read_to_string(support.join("direct-routes")).unwrap().contains("203.0.113.9"));
+        engine.stop(false, false);
+        assert!(!dns_event(&engine, epoch, "direct.example", true));
+        drop(engine);
+        std::fs::remove_dir_all(support).unwrap();
+    }
+    #[test]
+    fn vpn_observation_revokes_shared_ip_before_ack_and_protection_rearm() {
+        let (engine, support) = split_engine("shared");
+        let epoch = engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        assert!(dns_event(&engine, epoch, "direct.example", true));
+        assert!(dns_event(&engine, epoch, "vpn.example", false));
+        assert!(engine.shared.routes.addresses().is_empty());
+        assert!(engine.shared.guard.direct_addresses().is_empty());
+        // Reconciliation after a guard release cannot resurrect stale IPs.
+        engine.shared.guard.release(Some(&engine.holder()), network_guard::reason::USER);
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            assert!(engine.shared.sync_split_routes(&mut c));
+            assert!(c.split_addresses.is_empty());
+        }
+        engine.stop(false, false);
+        assert!(!dns_event(&engine, epoch, "direct.example", true));
+        drop(engine);
+        std::fs::remove_dir_all(support).unwrap();
+    }
+    #[test]
+    fn reconnect_and_network_change_invalidate_vpn_dns_interface() {
+        let (engine, support) = split_engine("reconnect");
+        let mut c = engine.shared.core.lock().unwrap();
+        c.last_pf = Some(("utun5".into(), vec!["198.51.100.1".into()]));
+        c.tunnel_if = Some("utun5".into());
+        engine.shared.update_forwarder(&c);
+        let epoch = c.forwarder.as_ref().unwrap().epoch();
+        engine.shared.handle_hook(&mut c, "attempt-reconnect");
+        assert_eq!(c.tunnel_if, None);
+        assert!(!c.forwarder.as_ref().unwrap().is_current(epoch));
+        engine.shared.handle_hook(&mut c, "reconnect");
+        assert_eq!(c.tunnel_if.as_deref(), Some("utun5"));
+        engine.shared.handle_hook(&mut c, "reconnect tun=utun6 dns=10.2.2.2");
+        assert_eq!(c.tunnel_if.as_deref(), Some("utun6"));
+        assert_eq!(c.tunnel_dns, vec!["10.2.2.2"]);
+        let epoch = c.forwarder.as_ref().unwrap().epoch();
+        engine.shared.follow_network(&mut c, "192.168.2.1", "en5", false);
+        assert_eq!(c.tunnel_if, None, "new physical path cannot silently reuse an unconfirmed VPN interface");
+        assert!(!c.forwarder.as_ref().unwrap().is_current(epoch));
+        drop(c);
+        engine.stop(false, false);
+        assert!(!dns_event(&engine, epoch, "direct.example", true));
+        drop(engine);
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn unchanged_interface_and_gateway_still_refresh_changed_dns_and_invalidate_old_answers() {
+        let facts = Arc::new(Mutex::new(Some(("192.168.1.1".into(), "en0".into()))));
+        let dns = Arc::new(Mutex::new(vec!["192.168.1.2".into(), "192.168.1.3".into()]));
+        let f = facts.clone(); let d = dns.clone();
+        let (engine, support) = split_engine_with_hooks("dns-only", Hooks {
+            state: Box::new(|_, _| {}), terminal: Box::new(|_| {}),
+            physical_network: Box::new(move |_| f.lock().unwrap().clone()),
+            local_dns: Box::new(move |_| d.lock().unwrap().clone()),
+            system_roots: Box::new(|| None), stopped: Box::new(|| {}),
+        });
+        let epoch = {
+            let mut c = engine.shared.core.lock().unwrap();
+            c.config.physical_if = "en0".into(); c.watching = true;
+            c.local_dns = vec!["192.168.1.1".into()]; c.tunnel_if = Some("utun5".into());
+            engine.shared.update_forwarder(&c); c.forwarder.as_ref().unwrap().epoch()
+        };
+        engine.network_changed();
+        assert!(!dns_event(&engine, epoch, "direct.example", true));
+        {
+            let mut c = engine.shared.core.lock().unwrap();
+            assert_eq!(c.local_dns, *dns.lock().unwrap());
+            assert_eq!(c.tunnel_if.as_deref(), Some("utun5"), "DNS-only updates do not falsely disconnect the VPN");
+            let epoch = c.forwarder.as_ref().unwrap().epoch();
+            engine.shared.refresh_network(&mut c);
+            assert!(c.forwarder.as_ref().unwrap().is_current(epoch), "same facts do not churn configuration");
+            *facts.lock().unwrap() = None; // sleep/offline: no physical service
+            engine.shared.refresh_network(&mut c);
+            assert!(c.local_dns.is_empty() && c.tunnel_if.is_none() && c.physical_gateway.is_none());
+            assert!(!c.forwarder.as_ref().unwrap().is_current(epoch));
+        }
+        engine.stop(false, false); assert!(!dns_event(&engine, epoch, "direct.example", true));
+        drop(engine); std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn self_check_cannot_report_a_green_snapshot_across_a_rule_or_network_change() {
+        let (engine, support) = split_engine("check-generation");
+        let result = engine.run_network_check_with(|_| {
+            engine.update_direct_domains(vec!["new.example".into()]);
+            // A queue barrier: update above is applied before this stale reply.
+            assert!(!dns_event(&engine, 0, "old.example", true));
+            vec![crate::network_check::Item { item:"fixture".into(), passed:true, informational:false, detail:"old pass".into() }]
+        });
+        let rows: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rows[0]["passed"], false);
+        assert!(rows[0]["detail"].as_str().unwrap().contains("已变化"));
+        engine.stop(false, false); assert!(!dns_event(&engine, 0, "old.example", true));
+        drop(engine); std::fs::remove_dir_all(support).unwrap();
+    }
 
     #[test]
     fn root_default_never_falls_back_to_user_tools() {

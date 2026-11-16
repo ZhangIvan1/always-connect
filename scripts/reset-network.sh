@@ -46,6 +46,18 @@ say() { echo "• $*"; }
 run() {
     if [ $DRY = 1 ]; then echo "  [dry-run] $*"; else "$@" >/dev/null 2>&1; fi
 }
+# Standalone fallback if the generated vpnc-script is absent or damaged.
+# Read only our private journal; never source it or interpolate commands.
+restore_scoped_routes_from_journal() {
+    [ -f "$1" ] || return 0
+    for tun in $(/usr/bin/awk -F= '/^AC_TUN(S)?=/ {
+        gsub(/"/, "", $2); n=split($2, values, " ")
+        for (i=1; i<=n; i++) if (values[i] ~ /^utun[0-9]+$/) print values[i]
+    }' "$1" | /usr/bin/sort -u); do
+        run /sbin/route -n delete -ifscope "$tun" default
+    done
+}
+
 web() { curl -s -m 6 -o /dev/null -w '%{http_code}' https://www.apple.com 2>/dev/null || true; }
 webok() { case "$(web)" in 200|301|302) return 0;; *) return 1;; esac; }
 
@@ -90,6 +102,7 @@ done
 # 2 held state (and our pf enable reference, released in step 5).
 # The route journal is undone by the script that wrote it first
 # (DESIGN.md §26.3): gateway host route, default route, tunnel DNS.
+restore_scoped_routes_from_journal "$SUPPORT/route-state"
 TOKEN=$(plutil -extract token raw -o - "$SUPPORT/guard.json" 2>/dev/null || true)
 if [ -f "$SUPPORT/route-state" ] && [ -x "$SUPPORT/alwaysconnect-vpnc.sh" ]; then
     say "undo the route journal"
