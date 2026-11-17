@@ -112,27 +112,47 @@ fn routes_match(output: &str, expected: &Expected) -> bool {
 
 /// Confirm the small, unconditional Apple wildcard/direct call chain. Unknown
 /// filter rules and populated sibling anchors are conservatively unconfirmed.
-fn anchor_call(text: &str) -> Option<String> {
+fn anchor_calls(text: &str) -> Option<Vec<String>> {
     let lines:Vec<_>=text.lines().map(str::trim).filter(|s|!s.is_empty()&&!s.starts_with('#')&&!s.starts_with("scrub-anchor ")).collect();
-    if lines.len()!=1 {return None;}
-    let words:Vec<_>=lines[0].split_whitespace().collect();
-    if words.len()!=3 || words[0]!="anchor" || words[2]!="all" {return None;}
-    let name=words[1].strip_prefix('"')?.strip_suffix('"')?;
-    Some(name.into())
+    if lines.is_empty() || lines.len()>8 {return None;}
+    lines.into_iter().map(|line| {
+        let words:Vec<_>=line.split_whitespace().collect();
+        if words.len()!=3 || words[0]!="anchor" || words[2]!="all" {return None;}
+        Some(words[1].strip_prefix('"')?.strip_suffix('"')?.to_owned())
+    }).collect()
+}
+fn anchor_call(text: &str) -> Option<String> {
+    let mut calls=anchor_calls(text)?;
+    if calls.len()==1 {calls.pop()} else {None}
 }
 fn anchor_chain(get: &mut impl FnMut(&str,&[&str])->Output) -> bool {
     let main=get("/sbin/pfctl",&["-s","rules"]); if !main.ok {return false;}
-    match anchor_call(&main.text).as_deref() {
-        Some(crate::pf::ANCHOR)=>true,
-        Some("com.apple/*")=>apple_children(get),
-        Some("com.apple")=>{
-            let parent=get("/sbin/pfctl",&["-a","com.apple","-s","rules"]);if !parent.ok{return false;}
-            match anchor_call(&parent.text).as_deref() {
-                Some("300.AlwaysConnect")|Some(crate::pf::ANCHOR)=>true,
-                Some("*")=>apple_children(get),_=>false,
-            }
-        },_=>false,
+    let Some(calls)=anchor_calls(&main.text) else {return false;};
+    let mut target=false;
+    for name in calls {
+        let current=match name.as_str() {
+            crate::pf::ANCHOR=>Some(true),
+            "com.apple/*"=>Some(apple_children(get)),
+            "com.apple"=>{
+                let parent=get("/sbin/pfctl",&["-a","com.apple","-s","rules"]);if !parent.ok{return false;}
+                Some(match anchor_call(&parent.text).as_deref() {
+                    Some("300.AlwaysConnect")|Some(crate::pf::ANCHOR)=>true,
+                    Some("*")=>apple_children(get),_=>false,
+                })
+            },_=>None,
+        };
+        if let Some(reachable)=current {
+            if target || !reachable {return false;}
+            target=true;
+        } else {
+            // A vendor's bare anchor may coexist with ours, but only after
+            // a successful read proves it contains no filtering rules.
+            if name.is_empty() || name.starts_with('-') || !name.bytes().all(|c|c.is_ascii_alphanumeric()||b"._-".contains(&c)) {return false;}
+            let other=get("/sbin/pfctl",&["-a",&name,"-s","rules"]);
+            if !other.ok || !other.text.trim().is_empty() {return false;}
+        }
     }
+    target
 }
 fn apple_children(get: &mut impl FnMut(&str,&[&str])->Output) -> bool {
     let names=get("/sbin/pfctl",&["-a","com.apple","-s","Anchors"]);if !names.ok{return false;}
@@ -265,6 +285,28 @@ mod tests {
         assert!(!rows.iter().find(|i|i.item=="物理公网 IPv6 受保护").unwrap().passed);
         let direct=run_with(&e,|p,a|if a==["-s","rules"] {Output{ok:true,text:format!("anchor \"{}\" all",crate::pf::ANCHOR)}}else{fixture(&e,p,a)});
         assert!(direct.iter().find(|i|i.item=="物理公网 IPv6 受保护").unwrap().passed);
+    }
+
+    #[test]
+    fn empty_vendor_anchor_must_not_hide_a_reachable_protection_anchor() {
+        let e=expected();
+        let main="scrub-anchor \"vendor.vpn\" all fragment reassemble\nanchor \"vendor.vpn\" all\nanchor \"com.apple/*\" all";
+        let rows=run_with(&e,|p,a| {
+            if a==["-s","rules"] {Output{ok:true,text:main.into()}}
+            else if a==["-a","vendor.vpn","-s","rules"] {Output{ok:true,text:String::new()}}
+            else {fixture(&e,p,a)}
+        });
+        assert!(rows.iter().find(|i|i.item=="断线保护规则调用链已确认").unwrap().passed,
+            "an inspected empty sibling cannot bypass our outbound protection");
+        for (ok,text) in [(false,""),(true,"pass out quick all"),(true,"anchor \"unknown/*\" all")] {
+            let rows=run_with(&e,|p,a| {
+                if a==["-s","rules"] {Output{ok:true,text:main.into()}}
+                else if a==["-a","vendor.vpn","-s","rules"] {Output{ok,text:text.into()}}
+                else {fixture(&e,p,a)}
+            });
+            assert!(!rows.iter().find(|i|i.item=="断线保护规则调用链已确认").unwrap().passed,
+                "unknown or populated vendor rules must stay unconfirmed");
+        }
     }
 
     #[test]
