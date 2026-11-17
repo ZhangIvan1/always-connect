@@ -5,7 +5,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
 . "$ROOT/scripts/lib-test-identity.sh"
 trap 'test_identity_cleanup; rm -rf "$WORK"' EXIT
-swiftc -O -parse-as-library "$ROOT/Sources/App/AppIdentity.swift" \
+(cd "$ROOT/core" && cargo build --release --quiet)
+swiftc -O -parse-as-library "$ROOT/Sources/Shared/PrivatePipe.swift" "$ROOT/core/target/release/libalwaysconnect_core.a" "$ROOT/Sources/App/AppIdentity.swift" \
     "$ROOT/Sources/App/AdminScript.swift" "$ROOT/core/scripts/AdminParentTest.swift" -o "$WORK/test"
 codesign --force --sign - --identifier com.alwaysconnect.app "$WORK/test" 2>/dev/null
 "$WORK/test"

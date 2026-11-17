@@ -147,7 +147,7 @@ fn lookup(addr: Ipv4Addr, netmask: Option<Ipv4Addr>) -> Option<String> {
     fn pad(n: usize) -> usize {
         if n > 0 { 1 + ((n - 1) | (size_of::<u32>() - 1)) } else { size_of::<u32>() }
     }
-    let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_INET) };
+    let fd = {use std::os::fd::IntoRawFd;crate::child_io::raw_socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_INET).ok()?.into_raw_fd()};
     if fd < 0 {
         return None;
     }
@@ -241,10 +241,10 @@ pub fn route_interface(_ip: &str) -> Option<String> {
 }
 
 fn lsof() -> String {
-    std::process::Command::new("/usr/sbin/lsof")
-        .args(["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-iUDP", "+c", "0", "-F", "pcPn"])
-        .stderr(std::process::Stdio::null())
-        .output()
+    let mut command=std::process::Command::new("/usr/sbin/lsof");
+    command.args(["-nP", "-iTCP", "-sTCP:ESTABLISHED", "-iUDP", "+c", "0", "-F", "pcPn"])
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    crate::child_io::spawn(&mut command).and_then(|child|child.wait_with_output())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
 }
@@ -358,7 +358,9 @@ mod tests {
     #[test]
     fn kernel_route_lookup() {
         assert_eq!(route_interface("127.0.0.1").as_deref(), Some("lo0"));
-        let out = std::process::Command::new("/sbin/route").args(["-n", "get", "default"]).output().unwrap();
+        let mut command=std::process::Command::new("/sbin/route");
+        command.args(["-n","get","default"]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let out=crate::child_io::spawn(&mut command).unwrap().wait_with_output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         let want = text.lines().find_map(|l| l.trim().strip_prefix("interface: ").map(str::to_string));
         assert_eq!(default_route_interface(), want, "same answer as route -n get default");

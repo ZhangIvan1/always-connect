@@ -215,7 +215,8 @@ pub fn run(expected: &Expected) -> Vec<Item> {
 
 pub(crate) fn read_command(path: &str, args: &[String], limit: Duration) -> Output {
     if limit.is_zero() { return Output::default(); }
-    let Ok(mut child) = Command::new(path).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return Output::default() };
+    let mut command=Command::new(path);
+    let Ok(mut child) = crate::child_io::spawn(command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())) else { return Output::default() };
     let Some(stdout) = child.stdout.take() else { let _ = child.kill(); let _ = child.wait(); return Output::default() };
     let reader = std::thread::spawn(move || { let mut bytes = Vec::new(); let _ = stdout.take(512 * 1024 + 1).read_to_end(&mut bytes); bytes });
     let stop = Instant::now() + limit;

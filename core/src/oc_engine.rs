@@ -229,7 +229,7 @@ pub fn run_script(reason: &str, script: &str, support: &Path, no_routes: bool, t
     if no_routes || test_active {
         cmd.env("ALWAYSCONNECT_NO_ROUTES", "1");
     }
-    let success=cmd.status().is_ok_and(|status|status.success());
+    let success=crate::child_io::status(&mut cmd).is_ok_and(|status|status.success());
     if !success { network_guard::log("CLIOrchestrator: route operation did not complete"); }
     success
 }
@@ -1119,14 +1119,7 @@ impl Shared {
             return;
         }
         c.watching = true;
-        let mut fds = [0i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return;
-        }
-        use std::os::fd::FromRawFd;
-        let (read_end, write_end) = unsafe {
-            (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1]))
-        };
+        let Ok((read_end, write_end)) = crate::child_io::pipe() else { return };
         c.watch_stop = Some(write_end);
         let weak = Arc::downgrade(self);
         let _ = std::thread::Builder::new().name("ac-engine-netwatch".into()).stack_size(64 * 1024).spawn(move || {
@@ -1345,7 +1338,7 @@ impl Shared {
         c.driver.on_authenticated();
         let label = if c.fed == Credential::Cookie { "cookie" } else { "password" };
         self.report(c, &format!("spawning openconnect (attempt {}, credential {label})", c.attempts));
-        let mut child = match cmd.spawn() {
+        let mut child = match crate::child_io::spawn(&mut cmd) {
             Ok(child) => child,
             Err(e) => {
                 wipe(&mut credential);

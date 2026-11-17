@@ -1843,3 +1843,24 @@ pub extern "C" fn ac_dhcp_dns(bytes: *const u8, count: usize) -> *mut c_char {
     let values=crate::dns_forwarder::dhcp_dns(unsafe{std::slice::from_raw_parts(bytes,count)});
     CString::new(values.join(",")).unwrap().into_raw()
 }
+
+/// Private descriptors are marked close-on-exec before publication to Swift.
+/// kind 0 = pipe, 1 = anonymous duplex settings channel. Caller owns both FDs.
+#[no_mangle]
+pub extern "C" fn ac_private_fd_pair(kind:i32,out:*mut i32,count:usize)->bool {
+    use std::os::fd::{OwnedFd,IntoRawFd};
+    if out.is_null()||count<2{return false;}
+    let pair:std::io::Result<(OwnedFd,OwnedFd)>=match kind {
+        0=>crate::child_io::pipe(),
+        1=>crate::child_io::unix_pair().map(|(a,b)|(a.into(),b.into())),
+        _=>return false,
+    };
+    let Ok((a,b))=pair else {return false;};
+    unsafe{out.write(a.into_raw_fd());out.add(1).write(b.into_raw_fd());}
+    true
+}
+#[no_mangle]
+pub extern "C" fn ac_private_fd_duplicate(fd:i32)->i32 {
+    use std::os::fd::IntoRawFd;
+    crate::child_io::duplicate(fd).map(IntoRawFd::into_raw_fd).unwrap_or(-1)
+}

@@ -283,11 +283,11 @@ pub fn stop_totals() {
 static PREVIOUS: Mutex<Option<Snapshot>> = Mutex::new(None);
 
 fn read_nettop() -> String {
-    std::process::Command::new("/usr/bin/nettop")
-        .args(["-L", "1", "-n", "-x", "-J", "bytes_in,bytes_out"])
+    let mut command=std::process::Command::new("/usr/bin/nettop");
+    command.args(["-L", "1", "-n", "-x", "-J", "bytes_in,bytes_out"])
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    crate::child_io::spawn(&mut command).and_then(|child|child.wait_with_output())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default()
 }

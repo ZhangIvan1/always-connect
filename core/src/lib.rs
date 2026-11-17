@@ -5,6 +5,7 @@
 //! Keychain, and UI. Mirrors DESIGN.md v0.4 §4-§6.
 
 pub mod backoff;
+pub(crate) mod child_io;
 pub mod cisco;
 pub mod cisco_import;
 pub mod connections;

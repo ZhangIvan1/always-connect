@@ -33,11 +33,13 @@ enum AdminScript {
         let p = Process()
         p.executableURL = executable
         p.arguments = [flag]
-        let input = Pipe(), output = Pipe()
-        p.standardInput = input
-        p.standardOutput = output
+        guard let input = PrivatePipe(), let output = PrivatePipe() else { return nil }
+        p.standardInput = input.fileHandleForReading
+        p.standardOutput = output.fileHandleForWriting
         p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil else { return nil }
+        try? input.fileHandleForReading.close()
+        try? output.fileHandleForWriting.close()
         try? input.fileHandleForWriting.write(contentsOf: Data(source.utf8))
         try? input.fileHandleForWriting.close()
         let data = output.fileHandleForReading.readDataToEndOfFile()

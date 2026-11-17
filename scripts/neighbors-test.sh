@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-swiftc -O -parse-as-library "$ROOT/Sources/App/NetworkNeighbors.swift" \
+(cd "$ROOT/core" && cargo build --release --quiet)
+swiftc -O -parse-as-library "$ROOT/Sources/Shared/PrivatePipe.swift" "$ROOT/core/target/release/libalwaysconnect_core.a" "$ROOT/Sources/App/NetworkNeighbors.swift" \
     "$ROOT/core/scripts/NeighborsTest.swift" -o "$WORK/test"
 "$WORK/test"

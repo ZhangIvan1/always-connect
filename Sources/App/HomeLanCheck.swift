@@ -47,10 +47,11 @@ enum HomeLanCheck {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: tool)
         process.arguments = args
-        let pipe = Pipe()
-        process.standardOutput = pipe
+        guard let pipe = PrivatePipe() else { return "" }
+        process.standardOutput = pipe.fileHandleForWriting
         process.standardError = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return "" }
+        try? pipe.fileHandleForWriting.close()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return String(data: data, encoding: .utf8) ?? ""

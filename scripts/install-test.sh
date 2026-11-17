@@ -236,7 +236,7 @@ fi
 
 # 8 the App's "更新" button: UpdateChecker + the Rust decision + install.sh
 (cd "$ROOT/core" && cargo build --release --quiet)
-swiftc -O -parse-as-library "$ROOT/Sources/App/UpdateChecker.swift" "$ROOT/Sources/App/AppQuit.swift" "$ROOT/core/scripts/UpdateInstallTest.swift" \
+swiftc -O -parse-as-library "$ROOT/Sources/Shared/PrivatePipe.swift" "$ROOT/Sources/App/UpdateChecker.swift" "$ROOT/Sources/App/AppQuit.swift" "$ROOT/core/scripts/UpdateInstallTest.swift" \
     "$ROOT/core/target/release/libalwaysconnect_core.a" -o "$WORK/apptest" 2>&1 | grep -v "built for newer" || true
 run releases.json --version v0.1.0 --allow-downgrade
 set +e

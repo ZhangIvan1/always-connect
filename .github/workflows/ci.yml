@@ -75,6 +75,8 @@ jobs:
           xcodebuild -project AlwaysConnect.xcodeproj
           -scheme AlwaysConnect -destination 'platform=macOS'
           build CODE_SIGNING_ALLOWED=NO
+      - name: Private descriptor creation and explicit child IO
+        run: scripts/private-descriptors-test.sh
       - name: Gateway resolution XPC wiring (substitutes only)
         run: scripts/gateway-resolution-test.sh
       - name: Emergency recovery route plan (stubbed, no network changes)

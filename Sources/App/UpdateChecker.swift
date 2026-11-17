@@ -259,9 +259,9 @@ final class UpdateChecker: ObservableObject {
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [script] + arguments
         process.environment = scriptEnvironment
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
+        guard let pipe = PrivatePipe() else { return (-1, "") }
+        process.standardOutput = pipe.fileHandleForWriting
+        process.standardError = pipe.fileHandleForWriting
         process.standardInput = FileHandle.nullDevice
         do { try process.run() } catch { return (-1, "") }
         try? pipe.fileHandleForWriting.close()

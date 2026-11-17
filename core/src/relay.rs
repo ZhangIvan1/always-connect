@@ -27,7 +27,7 @@
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -411,19 +411,15 @@ pub struct DatagramRelay {
 
 impl DatagramRelay {
     pub fn open(gateway: SocketAddrV4, interface: &str, pair: u32, log: Option<Log>) -> io::Result<Self> {
-        let local = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+        let local = crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
         let local_port = local.local_addr()?.port();
-        let upstream = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        let upstream = crate::child_io::socket(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         bind_interface(&upstream, interface)?;
         upstream.connect(&SockAddr::from(gateway))?;
         let upstream: UdpSocket = upstream.into();
         local.set_nonblocking(true)?;
         upstream.set_nonblocking(true)?;
-        let mut fds = [0i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let (read_end, write_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let (read_end, write_end) = crate::child_io::pipe()?;
         let counters = Arc::new(Counters::default());
         let c = Arc::clone(&counters);
         let thread = std::thread::Builder::new()
@@ -440,6 +436,7 @@ impl DatagramRelay {
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+            crate::child_io::after_close();
         }
         let c = &self.counters;
         format!(

@@ -99,10 +99,11 @@ enum NetworkNeighbors {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/sbin/route")
         p.arguments = ["-n", "get", "default"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
+        guard let pipe = PrivatePipe() else { return nil }
+        p.standardOutput = pipe.fileHandleForWriting
         p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil else { return nil }
+        try? pipe.fileHandleForWriting.close()
         let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         p.waitUntilExit()
         for line in out.split(separator: "\n") {

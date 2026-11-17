@@ -135,9 +135,10 @@ impl Pfctl {
 
     fn run_input(&self, args: &[&str], input: Option<&str>) -> Result<String, String> {
         let Some(path) = &self.path else { return Err("pfctl not available on this host".into()) };
-        let mut child = Command::new(path).args(args)
+        let mut command=Command::new(path);
+        let mut child = crate::child_io::spawn(command.args(args)
             .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+            .stdout(Stdio::piped()).stderr(Stdio::piped()))
             .map_err(|e| e.to_string())?;
         // Drain output while feeding rules, even if pfctl rejects early or
         // produces more diagnostics than a pipe can hold. Always reap it.

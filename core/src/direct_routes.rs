@@ -109,11 +109,11 @@ pub fn networks_to_route(networks: &[String], attached: &[(u32, u32)]) -> Vec<St
 }
 
 fn route(args: &[&str]) -> i32 {
-    Command::new("/sbin/route")
-        .args(args)
+    let mut command=Command::new("/sbin/route");
+    command.args(args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null());
+    crate::child_io::status(&mut command)
         .map(|s| s.code().unwrap_or(-1))
         .unwrap_or(-1)
 }

@@ -139,11 +139,12 @@ enum SystemChecks {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = args
-        let pipe = Pipe()
-        proc.standardOutput = pipe
+        guard let pipe = PrivatePipe() else { return (-1, "") }
+        proc.standardOutput = pipe.fileHandleForWriting
         proc.standardError = FileHandle.nullDevice
         do {
             try proc.run()
+            try? pipe.fileHandleForWriting.close()
         } catch {
             return (-1, "")
         }

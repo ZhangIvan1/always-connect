@@ -52,10 +52,7 @@ final class SettingsLink {
         let p = Process()
         p.executableURL = executable
         p.arguments = ["--settings"]
-        var pair: [Int32] = [-1, -1]
-        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0 else { return }
-        _ = fcntl(pair[0], F_SETFD, FD_CLOEXEC)
-        _ = fcntl(pair[1], F_SETFD, FD_CLOEXEC)
+        guard let pair = PrivateDescriptors.pair(kind: 1) else { return }
         let child = FileHandle(fileDescriptor: pair[1], closeOnDealloc: true)
         p.standardInput = child
         p.standardOutput = child
@@ -72,7 +69,7 @@ final class SettingsLink {
             try p.run()
             try? child.close()
             process = p
-            let output = dup(pair[0])
+            let output = PrivateDescriptors.duplicate(pair[0])
             guard output >= 0 else { Darwin.close(pair[0]); p.terminate(); return }
             transport = SettingsTransport(input: pair[0], output: output, receive: { [weak self] info in
                 guard self?.process === p else { return }

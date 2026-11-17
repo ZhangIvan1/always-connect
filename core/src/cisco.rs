@@ -25,7 +25,7 @@
 
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -63,25 +63,17 @@ pub struct RunResult {
 /// (": " or "] "), too. `on_start` gets the child's pid.
 pub fn run(cli: &str, args: &[&str], input: Option<&str>, timeout: Duration,
            on_start: &mut dyn FnMut(u32), on_line: &mut dyn FnMut(&str)) -> RunResult {
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    let Ok((read_end, write_end)) = crate::child_io::pipe() else {
         return RunResult { status: -1, output: String::new() };
-    }
-    for fd in fds {
-        // Only the child's stdout/stderr may hold the write end: a stray
-        // copy kept the pipe open past the CLI's exit.
-        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    }
-    let (read_end, write_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    };
     let Ok(err_end) = write_end.try_clone() else { return RunResult { status: -1, output: String::new() } };
     let mut cmd = Command::new(cli);
     crate::reset_child_signals(&mut cmd);
-    let child = cmd
+    let child = crate::child_io::spawn(cmd
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(write_end))
-        .stderr(Stdio::from(err_end))
-        .spawn();
+        .stderr(Stdio::from(err_end)));
     // The command holds our copies of the pipe's write end: gone now, or
     // the CLI's exit would never read as end-of-output.
     drop(cmd);

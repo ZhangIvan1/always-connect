@@ -334,10 +334,11 @@ enum SystemRoots {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         p.arguments = ["find-certificate", "-a", "-p", "/System/Library/Keychains/SystemRootCertificates.keychain"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
+        guard let pipe = PrivatePipe() else { return fm.fileExists(atPath: file.path) ? file.path : nil }
+        p.standardOutput = pipe.fileHandleForWriting
         p.standardError = FileHandle.nullDevice
         guard (try? p.run()) != nil else { return fm.fileExists(atPath: file.path) ? file.path : nil }
+        try? pipe.fileHandleForWriting.close()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         guard p.terminationStatus == 0, data.count > 1000 else { return fm.fileExists(atPath: file.path) ? file.path : nil }

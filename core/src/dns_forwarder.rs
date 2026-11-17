@@ -555,7 +555,7 @@ fn server_address(server: &str, port: u16) -> Option<SocketAddrV4> {
 
 fn upstream_socket(ty: Type, interface: Option<&InterfaceBinding>) -> Option<Socket> {
     let proto = if ty == Type::DGRAM { Protocol::UDP } else { Protocol::TCP };
-    let s = Socket::new(Domain::IPV4, ty, Some(proto)).ok()?;
+    let s = crate::child_io::socket(Domain::IPV4, ty, Some(proto)).ok()?;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let _ = s.set_nosigpipe(true);
     if let Some(name) = interface {
@@ -1051,7 +1051,7 @@ pub struct Forwarder {
 
 fn listener(ty: Type, address: SocketAddrV4) -> io::Result<Socket> {
     let proto = if ty == Type::DGRAM { Protocol::UDP } else { Protocol::TCP };
-    let s = Socket::new(Domain::IPV4, ty, Some(proto))?;
+    let s = crate::child_io::socket(Domain::IPV4, ty, Some(proto))?;
     s.set_reuse_address(true)?;
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     s.set_nosigpipe(true)?;
@@ -1141,18 +1141,14 @@ impl Forwarder {
 
     /// Listens on UDP and TCP; Err when the port is taken.
     pub fn start(&self) -> io::Result<()> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::fd::AsRawFd;
         let mut listening = self.listening.lock().unwrap();
         self.stop_locked(&mut listening);
         let udp: UdpSocket = listener(Type::DGRAM, self.listen)?.into();
         let tcp: TcpListener = listener(Type::STREAM, self.listen)?.into();
         udp.set_nonblocking(true)?;
         tcp.set_nonblocking(true)?;
-        let mut fds = [0i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let (read_end, write_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let (read_end, write_end) = crate::child_io::pipe()?;
         let inner = Arc::clone(&self.inner);
         let replies = Arc::new(Replies {
             active: std::sync::atomic::AtomicBool::new(true),
@@ -1192,7 +1188,7 @@ impl Forwarder {
                     });
                 }
                 while send_gate.active.load(Ordering::Acquire) {
-                    let Ok((mut client, _)) = tcp.accept() else { break };
+                    let Ok((mut client, _)) = crate::child_io::accept(&tcp) else { break };
                     #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let _ = socket2::SockRef::from(&client).set_nosigpipe(true);
                     let _ = client.set_nonblocking(false);
@@ -1236,6 +1232,9 @@ impl Forwarder {
         let Some(listening) = listening.take() else { return };
         unsafe { libc::write(listening.wake.as_raw_fd(), [1u8].as_ptr() as *const libc::c_void, 1) };
         let _ = listening.thread.join();
+        drop(listening.wake);
+        drop(listening.replies);
+        crate::child_io::after_close();
     }
 }
 
@@ -1535,14 +1534,16 @@ mod tests {
     }
 
     fn free_port() -> u16 {
-        // A port free for both UDP and TCP.
-        loop {
-            let u = UdpSocket::bind("127.0.0.1:0").unwrap();
-            let p = u.local_addr().unwrap().port();
-            if TcpListener::bind(("127.0.0.1", p)).is_ok() {
-                return p;
-            }
+        // Keep listener fixtures away from ordinary clients' default ephemeral
+        // range. Register the temporary reservations with the same exec fence.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        for _ in 0..10000 {
+            let port=(20000+(std::process::id() as usize+NEXT.fetch_add(1,Ordering::Relaxed))%10000) as u16;
+            let address=SocketAddrV4::new(Ipv4Addr::LOCALHOST,port);
+            let Ok(udp)=crate::child_io::udp_bind(address) else {continue};
+            if crate::child_io::creation(||TcpListener::bind(address)).is_ok() {drop(udp);return port;}
         }
+        panic!("no available loopback test listener port");
     }
 
     #[test]

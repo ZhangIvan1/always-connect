@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-swiftc -O -parse-as-library "$ROOT/Sources/App/AppIdentity.swift" "$ROOT/Sources/App/AdminScript.swift" \
+(cd "$ROOT/core" && cargo build --release --quiet)
+swiftc -O -parse-as-library "$ROOT/Sources/Shared/PrivatePipe.swift" "$ROOT/core/target/release/libalwaysconnect_core.a" "$ROOT/Sources/App/AppIdentity.swift" "$ROOT/Sources/App/AdminScript.swift" \
     "$ROOT/Sources/App/PrivilegedBundle.swift" "$ROOT/core/scripts/PrivilegedBundleTest.swift" -o "$WORK/test"
 "$WORK/test" "$WORK/bootstrap.sh"
 bash -n "$WORK/bootstrap.sh"

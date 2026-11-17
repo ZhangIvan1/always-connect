@@ -182,14 +182,9 @@ impl KillSwitch {
         s.watch_generation += 1;
         let generation = s.watch_generation;
         s.watch = Some(generation);
-        let mut fds = [0i32; 2];
-        let piped = unsafe { libc::pipe(fds.as_mut_ptr()) } == 0;
-        let read_end = if piped {
-            use std::os::fd::FromRawFd;
-            s.watch_stop = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) });
-            Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) })
-        } else {
-            None
+        let read_end = match crate::child_io::pipe() {
+            Ok((read,write)) => {s.watch_stop=Some(write);Some(read)},
+            Err(_) => None,
         };
         let me = Arc::clone(self);
         let _ = std::thread::Builder::new().name("ac-killswitch".into()).stack_size(64 * 1024).spawn(move || {

@@ -5,6 +5,8 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
+#[cfg(any(target_os="macos",target_os="ios"))]
+use std::os::fd::IntoRawFd;
 
 pub enum Wake {
     Changed,
@@ -19,7 +21,7 @@ pub struct RouteWatch {
 impl RouteWatch {
     pub fn new() -> Option<RouteWatch> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC) };
+        let fd = crate::child_io::raw_socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC).ok()?.into_raw_fd();
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let fd = -1;
         if fd < 0 {
