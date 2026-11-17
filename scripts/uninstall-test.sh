@@ -49,6 +49,8 @@ setup() {
         "$R/opt/cisco/secureclient/bin/vpn"
     printf '#!/bin/bash\n# AlwaysConnect emergency network reset (DESIGN.md §24.6).\n' \
         > "$H/Desktop/AlwaysConnect 恢复网络.command"
+    cp "$H/Desktop/AlwaysConnect 恢复网络.command" "$H/Desktop/.alwaysconnect-recovery.interrupted"
+    printf 'personal notes\n' > "$H/Desktop/.alwaysconnect-recovery.personal"
     app_bundle "$R/Applications/AlwaysConnect.app" com.alwaysconnect.app
     app_bundle "$R/Applications/Cisco/Cisco Secure Client.app" com.cisco.secureclient.gui
     export ALWAYSCONNECT_UNINSTALL_ROOT="$R" ALWAYSCONNECT_UNINSTALL_HOME="$H"
@@ -66,6 +68,8 @@ system_and_user_files_gone() {
     gone "$H/Library/Saved Application State/com.alwaysconnect.app.savedState"
     gone "$H/Library/Preferences/group.com.alwaysconnect.render.plist"
     gone "$H/Desktop/AlwaysConnect 恢复网络.command"
+    gone "$H/Desktop/.alwaysconnect-recovery.interrupted"
+    kept "$H/Desktop/.alwaysconnect-recovery.personal"
     gone "$R/Applications/AlwaysConnect.app"
     logged "reset-network --keep-unloaded"
     logged "launchctl bootout system/com.alwaysconnect.app.helper"

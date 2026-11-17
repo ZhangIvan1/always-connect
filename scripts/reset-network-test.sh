@@ -7,8 +7,20 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 python3 - "$ROOT/scripts/reset-network.sh" "$WORK/reader.sh" <<'PY'
 from pathlib import Path
-import sys
-s=Path(sys.argv[1]).read_text(); start=s.index('scope_interface_identity() {'); reader=s.index('restore_scoped_routes_from_journal() {'); end=s.index('\n}',reader)+2
+import shlex, sys
+s=Path(sys.argv[1]).read_text()
+# Check before executing any extracted shell: an absolute path bypasses the
+# harness's shell function. Keep newline/command boundaries, quoting and
+# comments so both pfctl and /sbin/pfctl are checked without running either.
+lexer=shlex.shlex(s, posix=True, punctuation_chars=';&|()\n')
+lexer.whitespace=' \t\r'; command=[]
+for token in list(lexer)+['\n']:
+    if token and all(c in ';&|()\n' for c in token):
+        if any(Path(word).name=='pfctl' for word in command) and '-d' in command:
+            raise SystemExit('FAIL recovery may disable shared PF (bare or absolute command)')
+        command=[]
+    else: command.append(token)
+start=s.index('scope_interface_identity() {'); reader=s.index('restore_scoped_routes_from_journal() {'); end=s.index('\n}',reader)+2
 native=s.index('native_route_entry() {'); native_end=s.index('\n}',native)+2
 retire=s.index('direct_route_table() {'); retire_fn=s.index('retire_direct_routes() {'); retire_end=s.index('\n}',retire_fn)+2
 Path(sys.argv[2]).write_text(s[native:native_end]+'\n'+s[retire:retire_end]+'\n'+s[start:end]+'\n')

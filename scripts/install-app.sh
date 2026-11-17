@@ -22,6 +22,11 @@ fi
 rm -rf "$DST"
 ditto "$SRC" "$DST"
 codesign --verify --strict "$DST"
+if [ "$(id -u)" != 0 ] && [ -f "$DST/Contents/Resources/refresh-recovery-shortcut.sh" ]; then
+    /bin/bash "$DST/Contents/Resources/refresh-recovery-shortcut.sh" \
+        "$DST/Contents/Resources/reset-network.sh" "$HOME/Desktop/AlwaysConnect 恢复网络.command" \
+        || echo "桌面恢复脚本未能更新；仍可使用 App 内的「恢复网络」。" >&2
+fi
 echo "installed $DST"
 [ "${1:-}" = "--open" ] && open "$DST"
 exit 0

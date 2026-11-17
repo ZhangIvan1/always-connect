@@ -68,6 +68,7 @@ S=/tmp/ac-vpnc-script.sh; "$HELPER" dump-script > $S; chmod +x $S
   ALWAYSCONNECT_GATEWAY_IP=198.51.100.7 VPNGATEWAY=127.0.0.1 $S connect | grep -q 'gateway=198.51.100.7' || exit 8
   $S pre-init && $S attempt-reconnect && $S bogus-reason || exit 7 ) && pass vpnc-script || fail "vpnc-script rc=$?"
 "$REPO/scripts/reset-network-test.sh" && pass reset-network-plan || fail reset-network-plan
+"$REPO/scripts/recovery-shortcut-test.sh" && pass recovery-shortcut || fail recovery-shortcut
 "$REPO/scripts/gateway-resolution-test.sh" && pass gateway-resolution || fail gateway-resolution
 "$REPO/scripts/private-descriptors-test.sh" && pass private-descriptors || fail private-descriptors
 # 4b vpnc-script route plan (stubbed route/ifconfig/scutil, routes ON)

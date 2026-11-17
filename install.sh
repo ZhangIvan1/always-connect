@@ -33,8 +33,9 @@
 #                   instead of asking the App to quit
 #
 # Needs only what every Mac has (bash, curl, ditto, shasum, codesign,
-# osascript). Writes nothing but the App itself and a scratch directory
-# it removes. ALWAYSCONNECT_RELEASES_API is the App's own releases list
+# osascript). Writes the App and a scratch directory it removes; an existing
+# owned Desktop recovery copy is refreshed from the verified App afterwards.
+# ALWAYSCONNECT_RELEASES_API is the App's own releases list
 # (Info.plist, so a fork updates from the fork) or the harness's;
 # ALWAYSCONNECT_DOWNLOAD_PREFIX and ALWAYSCONNECT_INSTALL_NO_OPEN exist
 # for scripts/install-test.sh only. Downloads are https only, redirects
@@ -385,6 +386,11 @@ quit_running
 # Recheck after the wait, with the signer captured before the old App moves.
 check_app "$NEW"
 replace "$NEW"
+if [ "$(id -u)" != 0 ] && [ -f "$DEST/Contents/Resources/refresh-recovery-shortcut.sh" ]; then
+    /bin/bash "$DEST/Contents/Resources/refresh-recovery-shortcut.sh" \
+        "$DEST/Contents/Resources/reset-network.sh" "$HOME/Desktop/AlwaysConnect 恢复网络.command" \
+        || say "桌面恢复脚本未能更新；仍可使用 App 内的「恢复网络」。"
+fi
 VERSION=$(plist "$DEST" CFBundleShortVersionString)
 say "已安装 AlwaysConnect $VERSION 到 $DEST"
 if [ -n "$FROM" ] && [ -f "$(dirname "$FROM")/.alwaysconnect-stage" ]; then

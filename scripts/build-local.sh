@@ -82,6 +82,7 @@ cp "$SRC"/App/GeoData/*.txt "$APP/Contents/Resources/"
 cp "$SRC/App/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 # Emergency network reset, usable without the App (DESIGN.md §24.6).
 cp "$ROOT/scripts/reset-network.sh" "$APP/Contents/Resources/reset-network.sh"
+cp "$ROOT/scripts/refresh-recovery-shortcut.sh" "$APP/Contents/Resources/refresh-recovery-shortcut.sh"
 # Clean uninstall, from Settings or a terminal (DESIGN.md §31).
 cp "$ROOT/scripts/uninstall.sh" "$APP/Contents/Resources/uninstall.sh"
 # Licences and third-party notices travel with every copy (DESIGN.md §三十四).

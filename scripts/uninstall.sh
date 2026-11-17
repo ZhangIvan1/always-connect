@@ -211,6 +211,14 @@ if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
     if [ -f "$DESK" ] && grep -q "AlwaysConnect emergency network reset" "$DESK" 2>/dev/null; then
         remove "$DESK"
     fi
+    # An interrupted atomic refresh may leave its owned temporary file.
+    # Never remove a same-prefix personal file or follow a symlink.
+    for DESK_PENDING in "$USER_HOME"/Desktop/.alwaysconnect-recovery.*; do
+        if [ -f "$DESK_PENDING" ] && [ ! -L "$DESK_PENDING" ] \
+            && grep -q "AlwaysConnect emergency network reset" "$DESK_PENDING" 2>/dev/null; then
+            remove "$DESK_PENDING"
+        fi
+    done
     if [ $KEEP_SETTINGS = 1 ]; then
         say "keep settings (servers, split list, preferences)"
     else

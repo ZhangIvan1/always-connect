@@ -23,8 +23,13 @@ exit 0
 STUB
 chmod +x "$WORK/bin/codesign"
 export PATH="$WORK/bin:$PATH"
+export AC_SHORTCUT_CALLS="$WORK/shortcut-calls"
 app() {
-    mkdir -p "$1/Contents/MacOS"
+    mkdir -p "$1/Contents/MacOS" "$1/Contents/Resources"
+    cat > "$1/Contents/Resources/refresh-recovery-shortcut.sh" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$1" >> "$AC_SHORTCUT_CALLS"
+STUB
     cat >"$1/Contents/Info.plist" <<PLIST
 <?xml version="1.0"?><plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>com.alwaysconnect.app</string>
@@ -49,6 +54,8 @@ app "$NEW" 1.2.3
 expect fail 拒绝降级 --expected-version 1.2.3
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DEST/Contents/Info.plist")" = 1.3.0 ]
 expect pass 已安装 --expected-version 1.2.3 --allow-downgrade
+[ -s "$AC_SHORTCUT_CALLS" ] || { echo 'FAIL verified install did not refresh the old recovery copy'; exit 1; }
+grep -Fxq "$DEST/Contents/Resources/reset-network.sh" "$AC_SHORTCUT_CALLS"
 expect fail 版本与发布版本不符 --expected-version 99.0.0
 expect fail 缺少期望版本
 app "$NEW" 1.2.3-beta.1
@@ -63,7 +70,9 @@ expect pass 已安装 --expected-version 1.2.3
 app "$NEW" invalid
 expect fail 版本号无效 --expected-version invalid
 app "$NEW" 1.2.4
+shortcut_calls=$(wc -l < "$AC_SHORTCUT_CALLS")
 AC_TAMPER_FINAL=1 AC_FINAL_DEST="$DEST" expect fail 复制后校验不通过 --expected-version 1.2.4
+[ "$(wc -l < "$AC_SHORTCUT_CALLS")" = "$shortcut_calls" ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$DEST/Contents/Info.plist")" = 1.2.3 ]
 echo 'PASS final signer mismatch restores installed App'
 cat >"$WORK/bin/ditto" <<'STUB'

@@ -80,7 +80,9 @@ jobs:
       - name: Gateway resolution XPC wiring (substitutes only)
         run: scripts/gateway-resolution-test.sh
       - name: Emergency recovery route plan (stubbed, no network changes)
-        run: scripts/reset-network-test.sh
+        run: |
+          scripts/reset-network-test.sh
+          scripts/recovery-shortcut-test.sh
       - name: Initialise default PF only on an empty CI runner
         run: |
           RULES=$(sudo -n /sbin/pfctl -s rules)
