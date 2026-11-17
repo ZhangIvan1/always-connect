@@ -103,6 +103,22 @@ mod tests {
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
+    fn lifetime_test_socket() -> UdpSocket {
+        // Keep the port-free assertion out of the default client ephemeral
+        // ranges and the DNS harness's listener range. A concurrent DNS client
+        // must not claim the just-closed port before this test can rebind it.
+        let seed = std::process::id() as usize % 2000;
+        for offset in 0..2000 {
+            let port = (30000 + (seed + offset) % 2000) as u16;
+            match udp_bind(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(socket) => return socket,
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("cannot reserve descriptor-lifetime test socket: {error}"),
+            }
+        }
+        panic!("no available descriptor-lifetime test port");
+    }
+
     #[test]
     fn exec_waits_until_a_registered_creation_finishes() {
         let window = Arc::new(Window::default());
@@ -111,7 +127,7 @@ mod tests {
         let (finish, release) = mpsc::channel();
         let creator = std::thread::spawn(move || {
             creator_window.within(|| {
-                let socket = creation(|| UdpSocket::bind("127.0.0.1:0")).unwrap();
+                let socket = lifetime_test_socket();
                 entered.send(socket.local_addr().unwrap()).unwrap();
                 release.recv().unwrap();
                 socket
@@ -139,7 +155,7 @@ mod tests {
             early.unwrap_or_else(|| child_rx.recv_timeout(Duration::from_secs(2)).unwrap());
         drop(socket);
         after_close();
-        let rebound = UdpSocket::bind(address);
+        let rebound = creation(|| UdpSocket::bind(address));
         child.kill().unwrap();
         child.wait().unwrap();
         worker.join().unwrap();
@@ -149,7 +165,7 @@ mod tests {
         );
         assert!(
             rebound.is_ok(),
-            "closing the parent socket must free its port while the unrelated child lives"
+            "closing the parent socket must free its port while the unrelated child lives: {rebound:?}"
         );
     }
 
