@@ -237,7 +237,9 @@ pub fn run_script(reason: &str, script: &str, support: &Path, no_routes: bool, t
 /// "The local network is still held closed": the gate holds a set, or
 /// the script changed routes and no restore has undone them yet.
 pub fn local_network_held(support: &Path) -> bool {
-    network_guard::shared().is_some_and(|g| g.is_holding()) || route_state_path(support).exists() || support.join("direct-routes").exists()
+    // Direct host-route cleanup does not close the physical default path.
+    // Keep that journal for diagnosis without stranding UI or idle shutdown.
+    network_guard::shared().is_some_and(|g| g.is_holding()) || route_state_path(support).exists()
 }
 
 /// Daemon start (§26.3): a route-state journal from this boot is
@@ -341,6 +343,7 @@ pub struct Info {
     pub split_running: bool,
     pub split_hits: Vec<String>,
     pub split_addresses: usize,
+    pub split_warning: Option<String>,
     pub direct_networks: Vec<String>,
     pub tail: Vec<String>,
 }
@@ -354,6 +357,8 @@ struct Child {
 #[derive(Clone)]
 struct TunnelLease { name: String, index: u32, generation: u64 }
 const TUNNEL_RECONFIRM_ERROR: &str = "VPN 接口已变化，请重新连接；断线保护保持";
+const SPLIT_CAPACITY_ERROR: &str = "分流记录已达到容量上限，本次连接暂时全部走 VPN；请重新连接以恢复按网站分流";
+enum SplitSync { Complete, PendingAdditions, Blocked }
 fn interface_index(name: &str) -> Option<u32> {
     let name = std::ffi::CString::new(name).ok()?;
     let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
@@ -440,6 +445,7 @@ impl Engine {
         let support = PathBuf::from(&config.support_dir);
         let routes = DirectRoutes::new(support.join("direct-routes"), config.boot_session.clone(), config.no_routes);
         let holder = guard.new_own_holder();
+        guard.own_engine_started(&holder);
         let (tx, rx) = mpsc::channel();
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(1);
         let shared = Arc::new(Shared {
@@ -648,6 +654,7 @@ impl Shared {
             last_terminal: c.last_terminal.map(|t| t as i32),
             split_running: c.forwarder.is_some(),
             split_hits: if c.forwarder.is_some() { c.split_hits.clone() } else { Vec::new() },
+            split_warning: c.split_policy.is_saturated().then(||SPLIT_CAPACITY_ERROR.into()),
             split_addresses: if c.forwarder.is_some() { c.split_addresses.len() } else { 0 },
             direct_networks: c.direct_networks(),
             tail: c.tail.clone(),
@@ -729,8 +736,18 @@ impl Shared {
                 Event::DnsAnswer(answer, reply) => {
                     let current = !c.stop_requested && c.forwarder.as_ref().is_some_and(|f| f.is_current(answer.epoch));
                     let committed = if current {
-                        let changed = c.split_policy.observe(answer.name, &answer.addresses, &answer.direct);
-                        let ok = if changed || c.split_needs_sync || c.pf_needs_load { self.sync_split_routes(&mut c) } else { true };
+                        let direct=if answer.direct.is_empty() {Vec::new()} else {
+                            direct_routes::assigned_ipv4().map(|own|answer.direct.iter().copied().filter(|ip|!own.contains(ip)).collect()).unwrap_or_else(||answer.direct.clone())
+                        };
+                        let changed = c.split_policy.observe(answer.name, &answer.addresses, &direct);
+                        let needs_answer_sync=c.split_needs_sync&&!self.dns_observation_ready(&c,&answer.addresses);
+                        if changed || c.pf_needs_load || (c.split_needs_sync && needs_answer_sync) {
+                            self.sync_split_routes(&mut c);
+                        }
+                        if c.split_policy.is_saturated() && c.last_error.as_deref()!=Some(SPLIT_CAPACITY_ERROR) {
+                            c.last_error=Some(SPLIT_CAPACITY_ERROR.into());self.report(&c,SPLIT_CAPACITY_ERROR);
+                        }
+                        let ok=self.dns_observation_ready(&c,&answer.addresses);
                         if let Some(entry) = answer.entry {
                             c.split_hits.retain(|e| *e != entry);
                             c.split_hits.insert(0, entry);
@@ -844,6 +861,7 @@ impl Shared {
     }
 
     fn finish_terminal(&self, c: &mut Core, reason: Terminal, detail: &str) {
+        self.guard.own_engine_finished(&self.holder);
         c.last_terminal = Some(reason);
         c.in_drop_episode = false;
         self.report(c, detail);
@@ -881,32 +899,54 @@ impl Shared {
 
     fn sync_split_routes(&self, c: &mut Core) -> bool {
         c.split_needs_sync = true;
-        let ok = self.try_sync_split_routes(c);
-        if !ok { self.suspend_dynamic_direct(c); }
-        ok
-    }
-
-    fn suspend_dynamic_direct(&self, c: &mut Core) {
-        if !c.config.drop_protection || c.stop_requested { return; }
-        let Some((holder, mut inputs)) = self.guard.held() else { return; };
-        if holder != self.holder || !inputs.direct_table || inputs.block_direct { return; }
-        inputs.block_direct = true;
-        if let Some(error) = self.guard.apply(&self.holder, false, &inputs) {
-            c.pf_error = Some(error.clone()); self.report(c, &error);
+        match self.try_sync_split_routes(c) {
+            SplitSync::Complete=>true,
+            SplitSync::PendingAdditions=>false,
+            SplitSync::Blocked=>{self.suspend_dynamic_direct(c);false}
         }
     }
 
-    fn try_sync_split_routes(&self, c: &mut Core) -> bool {
-        if c.pf_needs_load && !self.apply_base_pf(c) { return false; }
-        if !self.repoint_routes(c) { return false; }
+    /// Confirm this answer, independently of optional work for other names.
+    /// A revoked address must have lost its route and effective PF permission.
+    fn dns_observation_ready(&self,c:&Core,addresses:&[Ipv4Addr])->bool {
+        if c.pf_needs_load {return false;}
+        let routes:HashSet<_>=self.routes.addresses().into_iter().collect();
+        let table:HashSet<_>=self.guard.direct_addresses().into_iter().collect();
+        let active=if c.config.drop_protection {
+            self.guard.held().is_some_and(|(holder,inputs)|holder==self.holder&&inputs.direct_table&&!inputs.block_direct)
+        }else{true};
+        addresses.iter().all(|ip| {
+            let text=ip.to_string();
+            if c.split_policy.allows(ip) {c.split_addresses.contains(&text)&&active}
+            else {!routes.contains(&text)&&(!active||!table.contains(&text))}
+        })
+    }
+
+    fn suspend_dynamic_direct(&self, c: &mut Core) -> bool {
+        if !c.config.drop_protection || c.stop_requested { return true; }
+        let Some((holder, mut inputs)) = self.guard.held() else { return c.last_pf.is_none(); };
+        if holder != self.holder { c.pf_needs_load=true; return false; }
+        if !inputs.direct_table || inputs.block_direct { return true; }
+        inputs.block_direct = true;
+        if let Some(error) = self.guard.apply(&self.holder, false, &inputs) {
+            c.pf_needs_load=true;
+            c.pf_error = Some(error.clone()); self.report(c, &error);
+            return false;
+        }
+        true
+    }
+
+    fn try_sync_split_routes(&self, c: &mut Core) -> SplitSync {
+        if c.pf_needs_load && !self.apply_base_pf(c) { return SplitSync::Blocked; }
+        if !self.repoint_routes(c) { return SplitSync::Blocked; }
         if !self.routes.reconcile_metadata(){
-            let error="路由退休记录尚未持久化；基础保护保持";c.pf_error=Some(error.into());self.report(c,error);return false;
+            let error="路由退休记录尚未持久化；基础保护保持";c.pf_error=Some(error.into());self.report(c,error);return SplitSync::Blocked;
         }
         let mut desired = c.split_policy.direct();
         if !desired.is_empty() {
             let Some(own)=direct_routes::assigned_ipv4() else {
                 let error="本机地址未确认，直连例外未更新；可使用恢复网络";
-                c.pf_error=Some(error.into()); self.report(c,error); return false;
+                c.pf_error=Some(error.into()); self.report(c,error); return SplitSync::Blocked;
             };
             desired.retain(|value|value.parse().is_ok_and(|ip|direct_routes::ordinary_unicast(ip)&&!own.contains(&ip)));
         }
@@ -928,23 +968,41 @@ impl Shared {
         if !firewall_ok || !routes_ok {
             let e = "直连例外清理失败，网络保护状态未确认；可使用恢复网络".to_string();
             c.pf_error = Some(e.clone()); self.report(c, &e);
-            return false;
+            return SplitSync::Blocked;
         }
         let new: Vec<_> = routable.difference(&routed).cloned().collect();
         if !new.is_empty() {
-            let Some(gateway) = &c.physical_gateway else { return false };
-            if !self.routes.add(&new, gateway) {
-                let error="直连路由安装失败，网络保护状态未确认；可使用恢复网络";
-                c.pf_error=Some(error.into()); self.report(c,error); return false;
-            }
+            // DirectRoutes records exact per-address outcomes, so one batch
+            // avoids repeating fsync and rewriting the journal for every IP.
+            if let Some(gateway)=&c.physical_gateway {self.routes.add(&new,gateway);}
         }
-        let fresh: Vec<_> = desired.difference(&actual).cloned().collect();
-        if !self.guard.add_direct(&fresh) { return false; }
-        c.split_addresses = desired;
+        let persisted=self.routes.reconcile_metadata();
+        let installed:HashSet<_>=self.routes.addresses().into_iter().collect();
+        let mut additions_ok=persisted&&new.iter().all(|ip|installed.contains(ip));
+        let mut unconfirmed=HashSet::new();
+        if !persisted {unconfirmed.extend(new);}
+        desired.retain(|ip|!unconfirmed.contains(ip)&&(!routable.contains(ip)||installed.contains(ip)));
+        let fresh:Vec<_>=desired.difference(&actual).cloned().collect();
+        // Table additions are optional too: one failure must not poison
+        // unrelated VPN DNS, nor authorise an unrouted direct address.
+        if !self.guard.add_direct(&fresh) {
+            // A command may mutate the kernel and then report failure. First
+            // disable the table, then rearm through an exact full replacement.
+            if !self.suspend_dynamic_direct(c) {return SplitSync::Blocked;}
+            let known:HashSet<_>=self.guard.direct_addresses().into_iter().collect();
+            desired.retain(|address|known.contains(address));
+            additions_ok=false;
+        }
+        c.split_addresses=desired;
         let rearmed=self.rearm_direct_after_sync(c);
-        c.split_needs_sync=!rearmed;
-        if rearmed { c.pf_error=None; }
-        rearmed
+        c.split_needs_sync=!rearmed||!additions_ok;
+        if !rearmed {return SplitSync::Blocked;}
+        if !additions_ok {
+            let error="部分直连路由安装失败；受影响网站等待重试，其余 DNS 正常，基础保护保持";
+            c.pf_error=Some(error.into());self.report(c,error);return SplitSync::PendingAdditions;
+        }
+        c.pf_error=None;
+        SplitSync::Complete
     }
 
     fn update_forwarder(&self, c: &Core) {
@@ -1080,6 +1138,7 @@ impl Shared {
         c.split_addresses.clear();
         c.tunnel_lease = None;
         c.split_policy = crate::split_policy::SplitPolicy::default();
+        if c.last_error.as_deref()==Some(SPLIT_CAPACITY_ERROR) {c.last_error=None;}
         c.split_needs_sync = false;
     }
 
@@ -2031,7 +2090,7 @@ mod tests {
             engine.shared.handle_hook(&mut c,"connect tun=lo0 gateway=198.51.100.1 phys=en0 physgw=192.168.1.1");
             assert!(engine.shared.guard.is_holding(),"optional failure must not skip base PF");
             assert!(c.last_pf.is_some());
-            assert!(!engine.shared.guard.expected_rules().unwrap().contains("pass out quick to <ac_direct>"));
+            assert!(engine.shared.guard.direct_addresses().is_empty(),"failed optional installs must grant no dynamic address");
             assert!(c.pf_error.as_deref().unwrap().contains("直连路由安装失败"));
             engine.shared.update_drop_protection(&mut c,false);assert!(!engine.shared.guard.is_holding());
             engine.shared.update_drop_protection(&mut c,true);assert!(engine.shared.guard.is_holding());
@@ -2252,6 +2311,121 @@ mod tests {
         assert!(dns_event(&engine,epoch,"vpn.example",false));assert!(guard.is_holding());
         {let mut c=engine.shared.core.lock().unwrap();assert!(!c.pf_needs_load);engine.shared.update_drop_protection(&mut c,false);engine.shared.refresh_network(&mut c);assert!(!guard.is_holding());}
         engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn one_failed_direct_install_does_not_block_unrelated_vpn_answers() {
+        let (engine,support)=split_engine("claude-optional-poison");
+        engine.shared.routes.test_commands(Box::new(|args|if args.contains(&"add"){1}else{0}),
+            crate::network_check::Output{ok:true,text:"Destination Gateway Flags Netif Expire\n203.0.113.9 192.168.9.1 UGHS en0\n".into()});
+        let epoch=engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        assert!(!dns_event(&engine,epoch,"direct.example",true));
+        let mut accepted=0;
+        for n in 0..5 {
+            let (tx,rx)=mpsc::channel();
+            engine.send(Event::DnsAnswer(dns_forwarder::Observation{epoch,name:format!("vpn{n}.example"),entry:None,
+                addresses:vec![Ipv4Addr::new(198,51,100,10+n)],direct:vec![]},tx));
+            if rx.recv_timeout(Duration::from_secs(2)).unwrap(){accepted+=1;}
+        }
+        engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);std::fs::remove_dir_all(support).unwrap();
+        assert_eq!(accepted,5,"optional direct conflict must not poison unrelated VPN DNS");
+    }
+
+    #[test]
+    fn saturated_split_policy_is_reported_to_the_panel() {
+        let (engine,support)=split_engine("claude-capacity-notice");
+        {let mut c=engine.shared.core.lock().unwrap();
+            for n in 0..4097u32 {c.split_policy.observe(format!("{n}.vpn.example"),&[Ipv4Addr::new(198,18,(n>>8) as u8,n as u8)],&[]);}
+        }
+        let epoch=engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        assert!(dns_event(&engine,epoch,"after-limit.example",false));
+        let shown=engine.shared.info.lock().unwrap().last_error.clone();
+        let panel=serde_json::to_value(&*engine.shared.info.lock().unwrap()).unwrap();
+        engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);std::fs::remove_dir_all(support).unwrap();
+        assert!(shown.is_some_and(|s|s.contains("容量")),"safe capacity fallback must be visible");
+        assert!(panel["splitWarning"].as_str().is_some_and(|s|s.contains("容量")),"panel warning must have a dedicated transport field");
+    }
+
+    #[test]
+    fn failed_optional_address_does_not_revoke_working_direct_addresses() {
+        let (engine,support)=split_engine("claude-partial-grants");
+        engine.shared.routes.test_commands(Box::new(|args|if args.contains(&"203.0.113.9")&&args.contains(&"add"){1}else{0}),crate::network_check::Output{ok:true,text:"Destination Gateway Flags Netif Expire\n".into()});
+        let epoch=engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        assert!(!dns_event(&engine,epoch,"bad.direct.example",true));
+        let (tx,rx)=mpsc::channel();engine.send(Event::DnsAnswer(dns_forwarder::Observation{epoch,name:"good.direct.example".into(),entry:Some("direct.example".into()),addresses:vec![Ipv4Addr::new(203,0,113,10)],direct:vec![Ipv4Addr::new(203,0,113,10)]},tx));
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(engine.shared.guard.direct_addresses(),vec!["203.0.113.10"]);
+        assert_eq!(engine.shared.routes.addresses(),vec!["203.0.113.10"]);
+        engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn failed_revocation_blocks_only_the_affected_vpn_answer() {
+        let (engine,support)=split_engine("claude-revocation-isolation");
+        let epoch=engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        assert!(dns_event(&engine,epoch,"direct.example",true));
+        engine.shared.routes.test_commands(Box::new(|_|1),crate::network_check::Output{ok:true,text:"Destination Gateway Flags Netif Expire\n203.0.113.9 192.168.1.1 UGHS en0\n".into()});
+        assert!(!dns_event(&engine,epoch,"shared-vpn.example",false));
+        let (tx,rx)=mpsc::channel();engine.send(Event::DnsAnswer(dns_forwarder::Observation{epoch,name:"unrelated-vpn.example".into(),entry:None,addresses:vec![Ipv4Addr::new(198,51,100,10)],direct:vec![]},tx));
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        engine.shared.routes.test_commands(Box::new(|_|0),crate::network_check::Output{ok:true,text:"Destination Gateway Flags Netif Expire\n".into()});
+        engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn recovery_intents_do_not_claim_that_the_network_is_still_blocked() {
+        let support=std::env::temp_dir().join(format!("ac-held-intent-{}",std::process::id()));
+        std::fs::create_dir_all(&support).unwrap();
+        for row in ["install 203.0.113.9 192.168.1.1","retire 203.0.113.9 192.168.1.1","203.0.113.9 192.168.1.1"] {
+            std::fs::write(support.join("direct-routes"),format!("boot B1\n{row}\n")).unwrap();
+            assert!(!local_network_held(&support),"a cleanup-only host route journal is not a blocking policy");
+            assert!(support.join("direct-routes").exists(),"diagnostic ownership evidence must remain intact");
+        }
+        std::fs::write(route_state_path(&support),"AC_BOOT=B1\n").unwrap();
+        assert!(local_network_held(&support),"the default-route/DNS journal still indicates unrestored network state");
+        std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn installed_route_with_unconfirmed_metadata_is_not_published_as_direct() {
+        let (engine,support)=split_engine("claude-partial-journal");
+        let epoch=engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        direct_routes::set_test_journal_write_budget(&engine.shared.routes,Some(1));
+        let granted=dns_event(&engine,epoch,"direct.example",true);
+        direct_routes::set_test_journal_write_budget(&engine.shared.routes,None);
+        assert!(!granted,"kernel success alone cannot override a failed route transaction");
+        assert!(engine.shared.guard.direct_addresses().is_empty());
+        assert!(dns_event(&engine,epoch,"direct.example",true),"after metadata recovery the same query can become direct");
+        engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn a_partially_applied_pf_add_is_removed_before_unrelated_answers_continue() {
+        use std::os::unix::fs::PermissionsExt;
+        let (support,guard,tool)=recovery_guard("partial-pf-add");
+        std::fs::write(&tool,r#"#!/bin/sh
+D=$(dirname "$0")
+if [ "$1" = -E ];then echo 'Token : 123' >&2;exit 0;fi
+if [ "$3" = -f ];then cat > "$D/rules";exit 0;fi
+if [ "$5" = -T ];then
+ op=$6;shift 6
+ case "$op" in replace|flush) : > "$D/table";;esac
+ case "$op" in add|replace) for ip do echo "$ip" >> "$D/table";done;;esac
+ if [ "$op" = add ] && [ -f "$D/fail-add" ];then exit 1;fi
+fi
+exit 0
+"#).unwrap();std::fs::set_permissions(&tool,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let engine=recovery_engine(&support,guard.clone());
+        let epoch={let mut c=engine.shared.core.lock().unwrap();c.physical_gateway=Some("192.168.1.1".into());
+            c.forwarder=Some(Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST,0),53,Duration::from_millis(50),vec!["direct.example".into()],Upstreams{tunnel:vec![],local:vec![],physical_if:None,tunnel_if:None},None));
+            engine.shared.load_pf(&mut c,Some("lo0".into()),vec!["198.51.100.1".into()],false);c.forwarder.as_ref().unwrap().epoch()};
+        std::fs::write(support.join("fail-add"),"").unwrap();
+        assert!(!dns_event(&engine,epoch,"direct.example",true));
+        assert!(dns_event(&engine,epoch,"vpn.example",false));
+        let table=std::fs::read_to_string(support.join("table")).unwrap();
+        engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);
+        assert!(!table.contains("203.0.113.9"),"a failed add must not leave an untracked kernel permission");
+        std::fs::remove_dir_all(support).unwrap();
     }
 
 }

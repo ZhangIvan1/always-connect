@@ -774,7 +774,7 @@ impl GatewayPermit {
                 Ok(_) => break, Err(actual) => count=actual,
             }
         }
-        Some(Self {deadline: Instant::now()+Duration::from_millis(800)})
+        Some(Self {deadline: Instant::now()+Duration::from_millis(2400)})
     }
     pub(crate) fn active(&self) -> bool { remaining(self.deadline).is_some() }
 }
@@ -792,9 +792,15 @@ pub(crate) fn resolve_gateway_with(permit: &GatewayPermit, host: &str, servers: 
     query[..2].copy_from_slice(&id);
     let servers: Vec<_>=servers.iter().take(2).cloned().collect();
     let Some(binding)=InterfaceBinding::new(physical_if) else {return vec![]};
-    let Some(answer)=exchange_until(&query,&servers,53,Some(&binding),Duration::from_millis(200),permit.deadline) else {return vec![]};
+    let Some(left)=remaining(permit.deadline) else {return vec![]};
+    let slots=(servers.len().max(1)*2) as u32;
+    let Some(answer)=exchange_until(&query,&servers,53,Some(&binding),left/slots,permit.deadline) else {return vec![]};
     answer_addresses(&answer,&query).unwrap_or_default().iter().map(ToString::to_string).collect()
 }
+
+/// Only a fresh, explicit unheld reply permits system bootstrap. Unknown
+/// service state remains fail closed; this applies to the gateway name only.
+pub fn gateway_system_bootstrap(held:Option<bool>)->bool {held==Some(false)}
 
 pub(crate) fn dhcp_dns(bytes: &[u8]) -> Vec<String> {
     if bytes.len()%4 != 0 {return vec![];}
@@ -1946,6 +1952,24 @@ mod tests {
         forwarder.stop();
         assert!(UdpSocket::bind(("127.0.0.1", port)).is_ok());
         assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn gateway_bootstrap_accepts_an_ordinary_slow_physical_resolver() {
+        let _serial=GATEWAY_TEST_LOCK.lock().unwrap();
+        let server=UdpSocket::bind("127.0.0.1:0").unwrap();let address=server.local_addr().unwrap().to_string();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let responder=std::thread::spawn(move || {let mut bytes=[0;512];let (n,peer)=server.recv_from(&mut bytes).unwrap();
+            std::thread::sleep(Duration::from_millis(350));let mut response=bytes[..n].to_vec();response[2..4].copy_from_slice(&[0x81,0x80]);response[6..8].copy_from_slice(&[0,1]);response.extend([0xc0,12,0,1,0,1,0,0,0,60,0,4,198,51,100,9]);let _=server.send_to(&response,peer);});
+        let result=resolve_gateway("gateway.example",&[address],loopback_interface());responder.join().unwrap();
+        assert_eq!(result,vec!["198.51.100.9"],"normal mobile RTT must fit within the bootstrap budget");
+    }
+
+    #[test]
+    fn system_gateway_bootstrap_requires_a_fresh_unheld_verdict() {
+        assert!(gateway_system_bootstrap(Some(false)));
+        assert!(!gateway_system_bootstrap(Some(true)));
+        assert!(!gateway_system_bootstrap(None));
     }
 
 }

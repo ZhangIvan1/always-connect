@@ -417,6 +417,11 @@ impl DirectRoutes {
 }
 
 #[cfg(test)]
+pub(crate) fn set_test_journal_write_budget(routes:&DirectRoutes,budget:Option<usize>) {
+    *routes.writes_left.lock().unwrap()=budget;
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

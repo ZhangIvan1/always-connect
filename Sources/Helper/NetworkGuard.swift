@@ -97,6 +97,11 @@ final class NetworkGuard {
         return (held.holder, held.inputs)
     }
 
+    var gatewayBootstrapContext: Inputs? {
+        guard let json = Self.take(ac_gateway_context()) else { return nil }
+        return try? JSONDecoder().decode(Inputs.self, from: Data(json.utf8))
+    }
+
     func supersedeOwnHolders() { ac_guard_supersede_own_holders() }
 
     func updateHeldAllowNetworks(_ networks: [String]) {
@@ -192,6 +197,7 @@ func ac_guard_apply(_ holder: UnsafePointer<CChar>, _ connected: Bool, _ inputs:
 @_silgen_name("ac_guard_release") func ac_guard_release(_ holder: UnsafePointer<CChar>?, _ reason: UnsafePointer<CChar>)
 @_silgen_name("ac_guard_is_holding") func ac_guard_is_holding() -> Bool
 @_silgen_name("ac_guard_held") func ac_guard_held() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("ac_gateway_context") func ac_gateway_context() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_guard_holder") func ac_guard_holder() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_guard_supersede_own_holders") func ac_guard_supersede_own_holders()
 @_silgen_name("ac_guard_update_held_allow_networks") func ac_guard_update_held_allow_networks(_ n: UnsafePointer<CChar>)

@@ -17,26 +17,44 @@ struct Claims {
 pub struct SplitPolicy {
     names: HashMap<String, Claims>,
     saturated: bool,
+    permitted: HashSet<Ipv4Addr>,
+    associations: usize,
 }
 impl SplitPolicy {
+    /// True only when effective dynamic permissions change. A VPN-only
+    /// observation still records its veto, without forcing route reconciliation.
     pub fn observe(&mut self, name: String, addresses: &[Ipv4Addr], direct: &[Ipv4Addr]) -> bool {
         if self.saturated { return false; }
         let observation: Vec<_> = addresses.iter().map(|ip| (*ip, direct.contains(ip) && crate::direct_routes::ordinary_unicast(*ip))).collect();
         if self.names.get(&name).is_some_and(|c| c.current == observation) { return false; }
         let claims = self.names.entry(name).or_default();
+        let old_size=claims.current.len()+claims.vpn.len();
+        let affected:HashSet<_>=claims.current.iter().chain(observation.iter()).filter(|(_,allowed)|*allowed).map(|(ip,_)|*ip).collect();
         claims.vpn.extend(addresses.iter().filter(|ip| !direct.contains(ip)).copied());
-        claims.current = observation;
-        self.enforce_limit();
-        true
-    }
-    fn enforce_limit(&mut self) {
-        // Never evict a VPN owner to make room for a new bypass.
-        if self.names.len() > 4096
-            || self.names.values().map(|c| c.current.len() + c.vpn.len()).sum::<usize>() > MAX_ASSOCIATIONS {
-            self.names.clear();
-            self.saturated = true;
+        claims.current=observation;
+        self.associations=self.associations-old_size+claims.current.len()+claims.vpn.len();
+        let mut changed=false;
+        for ip in addresses.iter().filter(|ip|!direct.contains(ip)) {changed|=self.permitted.remove(ip);}
+        if self.enforce_limit() {return true;}
+        if self.saturated {return changed;}
+        for ip in affected {
+            let allowed=self.names.values().any(|c|c.current.iter().any(|(address,direct)|*address==ip&&*direct))
+                && !self.names.values().any(|c|c.vpn.contains(&ip));
+            changed|=if allowed {self.permitted.insert(ip)}else{self.permitted.remove(&ip)};
         }
+        changed
     }
+    fn enforce_limit(&mut self)->bool {
+        // Never evict a VPN owner to make room for a new bypass.
+        if self.names.len()>4096 || self.associations>MAX_ASSOCIATIONS {
+            let changed=!self.permitted.is_empty();
+            self.names.clear();self.permitted.clear();self.associations=0;self.saturated=true;
+            return changed;
+        }
+        false
+    }
+    pub fn is_saturated(&self)->bool {self.saturated}
+    pub fn allows(&self,ip:&Ipv4Addr)->bool {self.permitted.contains(ip)}
     pub fn revalidate(&mut self, rules: &SplitRules) {
         for (name, claims) in &mut self.names {
             let domain_direct = rules.matches(name).is_some();
@@ -48,19 +66,15 @@ impl SplitPolicy {
                 *direct &= keep;
             }
         }
+        self.associations=self.names.values().map(|c|c.current.len()+c.vpn.len()).sum();
         self.enforce_limit();
+        if !self.saturated {
+            let veto:HashSet<_>=self.names.values().flat_map(|c|c.vpn.iter().copied()).collect();
+            self.permitted=self.names.values().flat_map(|c|c.current.iter()).filter(|(ip,direct)|*direct&&!veto.contains(ip)).map(|(ip,_)|*ip).collect();
+        }
     }
     pub fn direct(&self) -> HashSet<String> {
-        let mut wanted = HashSet::new();
-        let mut vpn = HashSet::new();
-        for claims in self.names.values() {
-            for (ip, direct) in &claims.current {
-                if *direct { wanted.insert(ip.to_string()); }
-            }
-            vpn.extend(claims.vpn.iter().map(ToString::to_string));
-        }
-        wanted.retain(|ip| !vpn.contains(ip));
-        wanted
+        self.permitted.iter().map(ToString::to_string).collect()
     }
 }
 
@@ -143,4 +157,14 @@ mod tests {
         assert!(p.direct().is_empty());
         assert!(p.names.is_empty());
     }
+    #[test]
+    fn vpn_only_observations_change_policy_only_when_they_revoke_a_direct_address() {
+        let mut policy=SplitPolicy::default();
+        assert!(!policy.observe("vpn.example".into(),&[ip(1)],&[]),"recording a veto alone does not change routing");
+        assert!(policy.observe("direct.example".into(),&[ip(2)],&[ip(2)]));
+        assert!(!policy.observe("unrelated.example".into(),&[ip(3)],&[]));
+        assert!(policy.observe("shared.example".into(),&[ip(2)],&[]),"a shared IP must revoke an actual bypass");
+        assert!(policy.direct().is_empty());
+    }
+
 }

@@ -422,9 +422,9 @@ struct SessionHarness {
             check(NetworkGuard.shared.apply(holder: holder, connected: false, inputs: moved) == nil, "reloaded")
             let log = pfLog()
             let lastLoad = log.lastIndex { $0.contains(" -f ") } ?? -1
-            let replace = log.lastIndex { $0 == "-a com.apple/300.AlwaysConnect -t ac_direct -T replace 2001:db8::5" } ?? -1
-            check(replace > 0 && replace < lastLoad && log[replace - 1].contains(" -f "),
-                  "base loaded before complete table replacement, then bypasses enabled")
+            let replacements = log.indices.filter { log[$0] == "-a com.apple/300.AlwaysConnect -t ac_direct -T replace 2001:db8::5" }
+            check(replacements.contains { $0 < lastLoad } && replacements.contains { $0 > lastLoad },
+                  "complete table reconciled before and after the full rule reload")
             let saved = (try? String(contentsOf: guardFile, encoding: .utf8)) ?? ""
             check(saved.contains("2001:db8::5") && saved.contains("10.0.0.1"), "table and DNS servers in guard.json")
             NetworkGuard.shared.release(holder: nil, reason: NetworkGuard.Reason.user)

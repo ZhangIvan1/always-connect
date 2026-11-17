@@ -116,6 +116,9 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// many addresses went out the local network, and whether an
     /// own-connection engine exists at all.
     func getSplitActivity(withReply reply: @escaping ([String], Int, Bool) -> Void)
+    /// Additive structured split status, including visible capacity warnings.
+    /// The client asks only an exactly matching service, with a 3-second limit.
+    func getSplitStatus(withReply reply: @escaping (String) -> Void)
     /// Live connections (DESIGN.md §28.7): JSON [ConnectionRow].
     func getConnections(withReply reply: @escaping (String) -> Void)
     /// 断线保护 for the own connection (DESIGN.md §26.19): false = the

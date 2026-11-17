@@ -575,6 +575,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         }
     }
 
+    func getSplitStatus(withReply reply: @escaping (String) -> Void) {
+        queue.async { reply(self.engine?.splitStatusJSON() ?? "{}") }
+    }
+
     func getConnections(withReply reply: @escaping (String) -> Void) {
         queue.async {
             let engine = self.engine
@@ -684,9 +688,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         guard let lease = GatewayLookupLease() else { reply([]); return }
         DispatchQueue.global(qos: .utility).async {
             withExtendedLifetime(lease) {
+                let context = NetworkGuard.shared.gatewayBootstrapContext
                 guard ac_gateway_active(lease.handle),
-                      let network = PhysicalNetwork.current(preferring: "") else { reply([]); return }
-                let servers = LocalDNS.servers(for: network.interface)
+                      let network = PhysicalNetwork.current(preferring: context?.physicalIf ?? "") else { reply([]); return }
+                let servers = context?.localDNSServers ?? LocalDNS.servers(for: network.interface)
                 let csv = NetworkGuard.take(ac_resolve_gateway(lease.handle, host, servers.joined(separator: ","), network.interface)) ?? ""
                 reply(csv.split(separator: ",").map(String.init))
             }

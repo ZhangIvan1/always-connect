@@ -209,6 +209,7 @@ impl Pfctl {
 struct State {
     record: Option<Record>,
     own_generation: u64,
+    active_own: Option<String>,
     owner_present: bool,
     /// Grace clock: Some(generation) while one runs.
     grace: Option<u64>,
@@ -243,6 +244,7 @@ impl Guard {
             state: Mutex::new(State {
                 record: None,
                 own_generation: 0,
+                active_own: None,
                 owner_present: false,
                 grace: None,
                 grace_generation: 0,
@@ -287,6 +289,10 @@ impl Guard {
         if Self::is_stale(&s, holder) {
             return None;
         }
+        self.apply_locked(&mut s,holder,connected,inputs)
+    }
+
+    fn apply_locked(self:&Arc<Self>,s:&mut State,holder:&str,connected:bool,inputs:&Inputs)->Option<String> {
         let Some(anchor)=text(connected,inputs) else {return Some("pf 兜底未生效：规则生成被拒".into())};
         if inputs.direct_table && !inputs.block_direct {
             let mut base=inputs.clone();base.block_direct=true;
@@ -294,14 +300,27 @@ impl Guard {
             if !staged {
                 let Some(base_text)=text(connected,&base) else {return Some("基础保护规则被拒".into())};
                 if s.pf.load(&base_text).is_err(){return Some("基础断线保护未能装载".into());}
-                self.record_applied(&mut s,holder,connected,&base);
+                self.record_applied(s,holder,connected,&base);
             }
             let all:Vec<_>=s.direct.iter().cloned().collect();
             let op=if all.is_empty(){"flush"}else{"replace"};
             if s.pf.table(op,&all).is_err(){return Some("基础保护保持，直连表尚未就绪".into());}
         }
         if s.pf.load(&anchor).is_err(){return Some("pf 兜底未生效，断线时无法封网".into());}
-        self.record_applied(&mut s,holder,connected,inputs);
+        self.record_applied(s,holder,connected,inputs);
+        // A persist declaration normally retains its table. Re-establish the
+        // exact contents after load too, so either kernel behaviour is safe.
+        if inputs.direct_table && !inputs.block_direct {
+            let all:Vec<_>=s.direct.iter().cloned().collect();
+            let op=if all.is_empty(){"flush"}else{"replace"};
+            if s.pf.table(op,&all).is_err() {
+                let mut base=inputs.clone();base.block_direct=true;
+                if let Some(rules)=text(connected,&base) {
+                    if s.pf.load(&rules).is_ok() {self.record_applied(s,holder,connected,&base);}
+                }
+                return Some("直连表重载未确认；已尝试保留基础保护".into());
+            }
+        }
         None
     }
 
@@ -348,44 +367,44 @@ impl Guard {
         self.state.lock().unwrap().own_generation += 1;
     }
 
+    pub fn own_engine_started(&self,holder:&str) {
+        let mut s=self.state.lock().unwrap();
+        if !Self::is_stale(&s,holder) {s.active_own=Some(holder.into());}
+    }
+    pub fn own_engine_finished(&self,holder:&str) {
+        let mut s=self.state.lock().unwrap();
+        if s.active_own.as_deref()==Some(holder) {s.active_own=None;}
+    }
+    pub fn bootstrap_context(&self)->Option<Inputs> {
+        let s=self.state.lock().unwrap();let current=s.record.as_ref()?;
+        (s.active_own.as_deref()==Some(current.holder.as_str())&&!Self::is_stale(&s,&current.holder))
+            .then(||current.inputs.clone())
+    }
+
     /// The App's networks changed while a non-Cisco set is held.
-    pub fn update_held_allow_networks(&self, networks: &[String]) {
+    pub fn update_held_allow_networks(self:&Arc<Self>, networks: &[String]) {
         let mut s = self.state.lock().unwrap();
         let Some(mut current) = s.record.clone() else { return };
         if current.holder == CISCO_HOLDER || current.inputs.allow_networks == networks {
             return;
         }
         current.inputs.allow_networks = networks.to_vec();
-        let Some(anchor) = text(current.connected, &current.inputs) else { return };
-        if s.pf.load(&anchor).is_err() {
-            return;
-        }
-        current.token = s.pf.token.clone();
-        let table = current.inputs.direct_table;
-        s.record = Some(current);
-        if table {
-            Self::reload_direct(&s);
-        }
-        self.persist(&s);
+        let _=self.apply_locked(&mut s,&current.holder,current.connected,&current.inputs);
     }
 
     /// The gateway resolver runs before a replacement engine exists. Refresh
     /// only its root DNS whitelist from current physical system facts; never
     /// relax the blocking policy or change Cisco's configuration.
-    pub fn refresh_bootstrap_dns(&self, physical: &str, servers: &[String]) -> bool {
+    pub fn refresh_bootstrap_dns(self:&Arc<Self>, physical: &str, servers: &[String]) -> bool {
         let mut s = self.state.lock().unwrap();
         let Some(mut current) = s.record.clone() else { return true };
         if current.holder == CISCO_HOLDER || !(current.inputs.strict_dns || current.inputs.direct_table) { return true; }
+        if s.active_own.as_deref()==Some(current.holder.as_str())&&!Self::is_stale(&s,&current.holder) {
+            return current.inputs.physical_if==physical&&current.inputs.local_dns_servers==servers;
+        }
         if current.inputs.physical_if == physical && current.inputs.local_dns_servers == servers { return true; }
         current.inputs.physical_if = physical.into(); current.inputs.local_dns_servers = servers.to_vec();
-        let Some(anchor) = text(current.connected, &current.inputs) else { return false };
-        if s.pf.load(&anchor).is_err() { return false; }
-        current.token = s.pf.token.clone();
-        let table = current.inputs.direct_table;
-        s.record = Some(current);
-        if table { Self::reload_direct(&s); }
-        self.persist(&s);
-        true
+        self.apply_locked(&mut s,&current.holder,current.connected,&current.inputs).is_none()
     }
 
     /// Addresses that may leave outside the tunnel. When this returns
@@ -695,4 +714,53 @@ mod tests {
         assert_eq!(Pfctl::parse_token("No ALTQ support in kernel\nToken : 10093\n").as_deref(), Some("10093"));
         assert!(is_ip("2001:db8::5") && is_ip("203.0.113.1") && !is_ip("not-an-ip"));
     }
+    #[test]
+    fn full_apply_restores_direct_table_even_when_reload_clears_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir=std::env::temp_dir().join(format!("ac-table-reload-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();let tool=dir.join("pfctl-stub");
+        std::fs::write(&tool,r#"#!/bin/sh
+D=$(dirname "$0")
+if [ "$1" = -E ];then echo 'Token : 123' >&2;exit 0;fi
+if [ "$3" = -f ];then cat > "$D/rules"; : > "$D/table";exit 0;fi
+if [ "$5" = -T ];then
+  op=$6;shift 6
+  case "$op" in
+    replace|flush)
+      if [ -f "$D/fail-final" ] && /usr/bin/grep -q 'pass out quick to <ac_direct>' "$D/rules";then exit 1;fi
+      : > "$D/table";;
+  esac
+  case "$op" in add|replace) for ip do echo "$ip" >> "$D/table";done;;esac
+fi
+exit 0
+"#).unwrap();
+        std::fs::set_permissions(&tool,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guard=Arc::new(Guard::new(Settings{support_dir:dir.clone(),boot:Some("B1".into()),grace:Duration::from_secs(120),pfctl:Some(tool.to_string_lossy().into())}));
+        guard.owner_attached();let holder=guard.new_own_holder();
+        let inputs=Inputs{tunnel_if:"utun5".into(),gateway_ips:vec!["198.51.100.1".into()],physical_if:"en0".into(),direct_table:true,strict_dns:true,..Inputs::default()};
+        assert!(guard.add_direct(&["203.0.113.9".into()]));
+        assert!(guard.apply(&holder,false,&inputs).is_none());
+        assert_eq!(std::fs::read_to_string(dir.join("table")).unwrap(),"203.0.113.9\n","final rule reload must not leave an empty table");
+        std::fs::write(dir.join("fail-final"),"").unwrap();
+        assert!(guard.apply(&holder,false,&inputs).is_some());
+        assert!(guard.held().unwrap().1.block_direct,"failure after activation must return to the conservative base");
+        assert!(!std::fs::read_to_string(dir.join("rules")).unwrap().contains("pass out quick to <ac_direct>"));
+        guard.release(None,reason::USER);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gateway_bootstrap_does_not_replace_an_active_engines_physical_dns() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir=std::env::temp_dir().join(format!("ac-active-bootstrap-{}",std::process::id()));std::fs::create_dir_all(&dir).unwrap();
+        let tool=dir.join("pfctl-stub");std::fs::write(&tool,"#!/bin/sh\nif [ \"$1\" = -E ];then echo 'Token : 123' >&2;fi\ncat >/dev/null\nexit 0\n").unwrap();std::fs::set_permissions(&tool,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guard=Arc::new(Guard::new(Settings{support_dir:dir.clone(),boot:Some("B1".into()),grace:Duration::from_secs(120),pfctl:Some(tool.to_string_lossy().into())}));guard.owner_attached();
+        let engine=crate::oc_engine::Engine::new(crate::oc_engine::Config{no_routes:true,test_active:true,support_dir:dir.to_string_lossy().into(),script_path:"/usr/bin/true".into(),..Default::default()},crate::oc_engine::Hooks{state:Box::new(|_,_|{}),terminal:Box::new(|_|{}),physical_network:Box::new(|_|None),local_dns:Box::new(|_|vec![]),system_roots:Box::new(||None),stopped:Box::new(||{})},guard.clone());
+        let holder=engine.holder();let inputs=Inputs{tunnel_if:"utun5".into(),physical_if:"en7".into(),gateway_ips:vec!["198.51.100.1".into()],local_dns_servers:vec!["192.168.7.1".into()],strict_dns:true,..Default::default()};
+        assert!(guard.apply(&holder,false,&inputs).is_none());
+        let changed=guard.refresh_bootstrap_dns("en0",&["192.168.1.1".into()]);let held=guard.held().unwrap().1;
+        engine.stop(false,false);drop(engine);guard.release(None,reason::USER);
+        assert!(!changed,"a resolver call cannot override the active engine's physical path");assert_eq!(held.physical_if,"en7");assert_eq!(held.local_dns_servers,vec!["192.168.7.1"]);
+        // The actor's asynchronous stop may still finish its private journals.
+    }
+
 }

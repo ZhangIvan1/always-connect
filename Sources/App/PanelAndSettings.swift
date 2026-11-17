@@ -155,6 +155,12 @@ struct PanelView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+            if let warning = manager.splitWarning, manager.state == .connected {
+                Text(warning)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if !manager.helperAvailable {
                 // "Helper" is our word, not the user's: say what it is
                 // for (UI-DESIGN.md §四).

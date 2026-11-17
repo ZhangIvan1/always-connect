@@ -229,6 +229,8 @@ final class CLIOrchestrator {
         return (info.splitHits, info.splitAddresses)
     }
 
+    func splitStatusJSON() -> String { NetworkGuard.take(ac_oc_info(handle)) ?? "{}" }
+
     /// The connections page for this session (§28.7); `fallbackGateways`
     /// when the session has none (a Cisco session).
     func connectionsJSON(fallbackGateways: [String]) -> String {

@@ -833,22 +833,41 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// What the split did in this session (§26.12), refreshed by the
     /// open panel: list entries looked up and addresses sent direct.
     @Published private(set) var splitActivity: (entries: [String], addresses: Int)?
+    @Published private(set) var splitWarning: String?
 
     func refreshSplitActivity() {
-        guard !usesCisco, state == .connected else { splitActivity = nil; return }
+        guard !usesCisco, state == .connected else { splitActivity = nil; splitWarning = nil; return }
         // An older background service does not know this method, and a
         // call to an unknown method drops the whole XPC connection: polled
         // every 3 s, the panel flickered between 后台服务未运行 and 有新版本
         // (2026-11-05). Ask only a service built from this App.
-        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; return }
+        guard !HelperInstaller.installedHelperOutdated else { splitActivity = nil; splitWarning = nil; return }
         ensureConnection { proxy in
             var finished = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finished = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                if !finished { finished = true; self.splitWarning = nil }
+            }
+            if HelperInstaller.installedHelperMatchesBundle {
+                proxy.getSplitStatus { text in
+                    DispatchQueue.main.async {
+                        guard !finished else { return }; finished = true
+                        struct Status: Decodable {
+                            var splitHits: [String]; var splitAddresses: Int
+                            var splitRunning: Bool; var splitWarning: String?
+                        }
+                        let status = try? JSONDecoder().decode(Status.self, from: Data(text.utf8))
+                        self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
+                        self.splitWarning = status?.splitWarning
+                    }
+                }
+                return
+            }
             proxy.getSplitActivity { entries, addresses, running in
                 DispatchQueue.main.async {
                     guard !finished else { return }
                     finished = true
                     self.splitActivity = running ? (entries, addresses) : nil
+                    self.splitWarning = nil
                 }
             }
         }
@@ -975,6 +994,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         let profile = ProfileStore.loadProfile()
         guard hasCredentials, let username = ProfileStore.loadUsername() else { return false }
+        splitWarning = nil
         protection.startSession(usesCisco: usesCisco)
         if let cisco {
             // The engine reads the password itself, once, when it logs in.
@@ -1017,18 +1037,31 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         return true
     }
 
-    /// Never ask a method an older service does not implement. Empty results
-    /// use the existing gateway memory; they never request system DNS fallback.
-    private func resolveGatewayIPv4(_ host: String, completion: @escaping ([String]) -> Void) {
-        guard HelperInstaller.installedHelperMatchesBundle else { completion([]); return }
+    /// nil permits system bootstrap only after a fresh unheld reply; empty
+    /// results keep the gateway-memory-only path under protection/unknown state.
+    private func resolveGatewayIPv4(_ host: String, completion: @escaping ([String]?) -> Void) {
+        if let raw = ac_gateway_literal(host) {
+            let address = String(cString: raw)
+            ac_string_free(raw)
+            completion([address])
+            return
+        }
+        let finish: ([String]) -> Void = { [weak self] addresses in
+            guard addresses.isEmpty else { completion(addresses); return }
+            guard let self else { completion([]); return }
+            self.fetchNetworkHeld { held in
+                completion(ac_gateway_system_bootstrap(held.map { $0 ? 1 : 0 } ?? -1) ? nil : [])
+            }
+        }
+        guard HelperInstaller.installedHelperMatchesBundle else { finish([]); return }
         ensureConnection { proxy in
             var finished = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                if !finished { finished = true; completion([]) }
+                if !finished { finished = true; finish([]) }
             }
             proxy.resolveGatewayIPv4(host) { addresses in
                 DispatchQueue.main.async {
-                    if !finished { finished = true; completion(addresses) }
+                    if !finished { finished = true; finish(addresses) }
                 }
             }
         }
@@ -1337,6 +1370,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         state = parsed
         self.detail = detail
+        if parsed != .connected { splitWarning = nil }
         if parsed != old, !usesCisco {
             // Next to the relay's login trace (§30.9): what the App showed
             // and when, readable without administrator rights.
@@ -1736,6 +1770,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         if let lastError { json["lastError"] = lastError }
         if let autoStopNotice { json["autoStopNotice"] = autoStopNotice }
         if let pfWarning { json["pfWarning"] = pfWarning }
+        if let splitWarning { json["splitWarning"] = splitWarning }
         if let connectedSince { json["connectedSince"] = connectedSince.timeIntervalSince1970 }
         let data = (try? JSONSerialization.data(withJSONObject: json)) ?? Data("{}".utf8)
         return String(decoding: data, as: UTF8.self)
@@ -1755,6 +1790,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         ownConnection = json["ownConnection"] as? Bool ?? ownConnection
         splitSwitchPending = json["splitSwitchPending"] as? Bool ?? false
         helperUpdatePending = json["helperUpdatePending"] as? Bool ?? false
+        splitWarning = json["splitWarning"] as? String
         lastError = json["lastError"] as? String
         autoStopNotice = json["autoStopNotice"] as? String
         pfWarning = json["pfWarning"] as? String
@@ -1849,3 +1885,8 @@ enum GatewayMemory {
         UserDefaults.standard.set(all, forKey: key)
     }
 }
+
+@_silgen_name("ac_gateway_system_bootstrap")
+private func ac_gateway_system_bootstrap(_ held: Int32) -> Bool
+@_silgen_name("ac_gateway_literal")
+private func ac_gateway_literal(_ host: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?

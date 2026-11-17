@@ -1794,6 +1794,22 @@ pub extern "C" fn ac_oc_network_check(engine: *const crate::oc_engine::Engine) -
 
 
 #[no_mangle]
+pub extern "C" fn ac_gateway_literal(host:*const c_char)->*mut c_char {
+    c_str(host).and_then(|host|host.parse::<Ipv4Addr>().ok()).map(|ip|owned(ip.to_string())).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_gateway_system_bootstrap(held:i32)->bool {
+    crate::dns_forwarder::gateway_system_bootstrap(match held {0=>Some(false),1=>Some(true),_=>None})
+}
+
+#[no_mangle]
+pub extern "C" fn ac_gateway_context() -> *mut c_char {
+    crate::network_guard::shared().and_then(|guard|guard.bootstrap_context())
+        .and_then(|context|serde_json::to_string(&context).ok()).map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
 pub extern "C" fn ac_resolve_gateway(permit: *const crate::dns_forwarder::GatewayPermit, host: *const c_char, servers: *const c_char, interface: *const c_char) -> *mut c_char {
     let Some(permit)=(unsafe {permit.as_ref()}) else {return CString::new("").unwrap().into_raw()};
     if !permit.active() {return CString::new("").unwrap().into_raw();}
