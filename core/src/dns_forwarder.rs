@@ -686,7 +686,9 @@ fn udp_exchange_until(query: &[u8], server: &str, port: u16, interface: Option<&
     s.connect(&SockAddr::from(addr)).ok()?;
     s.set_write_timeout(Some(remaining(deadline)?)).ok()?;
     if s.send(query).ok()? != query.len() { return None; }
-    let mut buffer=vec![std::mem::MaybeUninit::<u8>::uninit();65535];
+    // Keep the full datagram capacity without allocating 64 KiB for every
+    // small answer. Only recv's initialised prefix is copied into the result.
+    let mut buffer=[std::mem::MaybeUninit::<u8>::uninit();65535];
     loop {
         s.set_read_timeout(Some(remaining(deadline)?)).ok()?;
         let n=s.recv(&mut buffer).ok()?; if n==0 { return None; }
@@ -694,10 +696,7 @@ fn udp_exchange_until(query: &[u8], server: &str, port: u16, interface: Option<&
         // Bytes outside that prefix are never inspected or sent to a client.
         let received=unsafe {std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(),n)};
         if same_id(received,query) {
-            let buffer=std::mem::ManuallyDrop::new(buffer);
-            // MaybeUninit<u8> has the same allocation layout as u8. Transfer
-            // ownership once, with length n restricted to the initialised prefix.
-            return Some(unsafe {Vec::from_raw_parts(buffer.as_ptr().cast::<u8>() as *mut u8,n,buffer.capacity())});
+            return Some(received.to_vec());
         }
     }
 }
@@ -1813,6 +1812,44 @@ mod tests {
         let rebound=UdpSocket::bind(("127.0.0.1",port));
         release.send(()).unwrap();
         assert!(rebound.is_ok(),"stop retained the UDP listener through an outstanding policy acknowledgement: {:?}",rebound.err());
+    }
+
+    #[test]
+    fn worker_forwards_large_udp_answers_without_truncation() {
+        let message = query("large.example", 16, 7);
+        let mut answer = message.clone();
+        answer[2..4].copy_from_slice(&[0x81, 0x80]);
+        answer[6..8].copy_from_slice(&[0, 1]);
+        let mut text = Vec::new();
+        // Stay below Darwin's default UDP send limit; still exceed the old
+        // 4096-byte listener buffer while exercising the 128 KiB worker stack.
+        for _ in 0..32 { text.push(255); text.extend([b'x'; 255]); }
+        answer.extend([0xc0, 12, 0, 16, 0, 1, 0, 0, 0, 60]);
+        answer.extend((text.len() as u16).to_be_bytes()); answer.extend(text);
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let address = server.local_addr().unwrap().to_string();
+        let expected = answer.clone();
+        let upstream = std::thread::spawn(move || {
+            let mut bytes = [0; 512];
+            let (n, peer) = server.recv_from(&mut bytes).unwrap();
+            assert_eq!(&bytes[..n], message.as_slice());
+            server.send_to(&answer, peer).unwrap();
+        });
+        let port = free_port();
+        let forwarder = Forwarder::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_secs(1), vec!["large.example".into()],
+            Upstreams { tunnel: vec![], local: vec![address], physical_if: None, tunnel_if: None }, None,
+        );
+        forwarder.start().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        client.send_to(&query("large.example", 16, 7), ("127.0.0.1", port)).unwrap();
+        let mut bytes = vec![0; 65535];
+        let (n, _) = client.recv_from(&mut bytes).unwrap();
+        assert!(n > 8192);
+        assert_eq!(&bytes[..n], expected.as_slice());
+        forwarder.stop(); upstream.join().unwrap();
     }
 
     #[test]
