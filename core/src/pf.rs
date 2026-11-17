@@ -210,6 +210,18 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
         // and deletes addresses without reloading the rules.
         out.push_str(&format!("table <{DIRECT_TABLE}> persist\n"));
     }
+    if input.strict_dns || input.direct_table {
+        // DNS authorization precedes every broad interface permission.
+        // Normal applications use the local forwarder; only its root sockets
+        // may ask upstream servers. Interface membership alone is insufficient.
+        out.push_str("pass out quick on lo0 inet proto { udp tcp } to 127.0.0.0/8 port 53 no state\n");
+        out.push_str("pass out quick on lo0 inet6 proto { udp tcp } to ::1 port 53 no state\n");
+        out.push_str(&format!("pass out quick on {} proto {{ udp tcp }} to any port 53 user root no state\n", input.tunnel_if));
+        for ip in &dns_servers {
+            out.push_str(&format!("pass out quick on {phys} proto {{ udp tcp }} to {ip} port 53 user root no state\n"));
+        }
+        out.push_str("block drop out quick proto { udp tcp } to any port 53\n");
+    }
     // Tunnel and loopback passes are `no state` like the gateway pass
     // (§26.8): with pf's implicit `flags S/SA keep state` only a SYN
     // matches, so every connection opened before the anchor loaded —
@@ -218,22 +230,12 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
     // split set ends in a block, so connecting cut the tunnel's own
     // carrier and the Mac went offline (measured 2026-11-05).
     out.push_str(&format!("pass out quick on {} all no state\n", input.tunnel_if));
-    // Every tunnel interface passes (§25.7): what enters a utun leaves
-    // the Mac only through a physical interface, which stays blocked
-    // except for the gateways, so this cannot leak; and a VPN client
-    // that re-establishes on a new utun number is not cut off before
-    // it has reported the new interface.
+    // Legacy compatibility for reconnecting and parallel tunnel interfaces.
+    // Diagnostics report this broader permission; it does not prove exclusive
+    // company-VPN egress. Strict DNS has already met its separate barrier.
     let tuns: Vec<String> = (0..64).map(|n| format!("utun{n}")).collect();
     out.push_str(&format!("pass out quick on {{ {} }} all no state\n", tuns.join(" ")));
     out.push_str("pass out quick on lo0 all no state\n");
-    if input.strict_dns || input.direct_table {
-        for ip in &dns_servers {
-            out.push_str(&format!("pass out quick proto {{ udp tcp }} to {ip} port 53 user root no state\n"));
-        }
-        // Before gateway/LAN/direct exceptions: those may include DNS IPs.
-        // mDNSResponder (not root) cannot fall back to the physical DNS.
-        out.push_str("block drop out quick proto { udp tcp } to any port 53\n");
-    }
     out.push_str("pass out quick inet proto udp from any port 68 to any port 67\n");
     // Passes and the final block apply to EVERY interface (DESIGN.md
     // §25.3): a drop that moves the default route to another interface
@@ -288,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn system_dns_fallback_is_blocked_before_lan_even_when_forwarder_is_unavailable() {
+    fn strict_dns_cannot_skip_the_barrier_through_a_tunnel_or_loopback_pass() {
         for table in [false, true] {
             let mut input = secure_input(); input.strict_dns = true; input.direct_table = table;
             input.dns_servers = vec!["192.168.1.1".into()];
@@ -298,8 +300,19 @@ mod tests {
             let lan = text.find("pass out quick to 192.168.0.0/16").unwrap();
             assert!(root < deny && deny < lan);
             assert!(!text.contains("to 192.168.1.1 port 53 no state"));
-            assert!(text.find("on lo0 all").unwrap() < deny);
-            assert!(text.find("on utun5 all").unwrap() < deny);
+            assert!(deny < text.find("on utun5 all").unwrap(),
+                "a non-root DNS request must meet the DNS barrier before a tunnel permission");
+            assert!(deny < text.find("on lo0 all").unwrap(),
+                "loopback DNS requires a destination-specific exception, not a general bypass");
+            for allowed in [
+                "on lo0 inet proto { udp tcp } to 127.0.0.0/8 port 53 no state",
+                "on lo0 inet6 proto { udp tcp } to ::1 port 53 no state",
+                "on utun5 proto { udp tcp } to any port 53 user root no state",
+                "on en0 proto { udp tcp } to 192.168.1.1 port 53 user root no state",
+            ] {
+                assert!(text.find(allowed).is_some_and(|at|at<deny),
+                    "local clients and the root forwarder must retain their explicit DNS paths: {allowed}");
+            }
         }
     }
 
@@ -444,13 +457,13 @@ pass out quick on en0 all\n";
         };
         let text = generate(&input).unwrap();
         let table = text.find("table <ac_direct> persist\n").expect("table declared");
-        let first_rule = text.find("pass out quick on utun5 all").unwrap();
+        let first_rule = text.find("pass out quick ").unwrap();
         assert!(table < first_rule, "tables come before rules");
         assert_eq!(
-            text.matches("pass out quick proto { udp tcp } to 192.168.1.1 port 53 user root no state\n").count(),
+            text.matches("pass out quick on en0 proto { udp tcp } to 192.168.1.1 port 53 user root no state\n").count(),
             1
         );
-        assert!(text.contains("pass out quick proto { udp tcp } to fd00::1 port 53 user root no state\n"));
+        assert!(text.contains("pass out quick on en0 proto { udp tcp } to fd00::1 port 53 user root no state\n"));
         let direct = text.find("pass out quick to <ac_direct> no state\n").expect("direct pass");
         assert!(direct < text.find("block drop out quick all").unwrap());
         assert!(!text.contains("pass out quick proto { udp tcp } to any port 53"), "no blanket DNS pass in split mode");
