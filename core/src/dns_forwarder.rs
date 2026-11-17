@@ -807,6 +807,22 @@ pub(crate) fn dhcp_dns(bytes: &[u8]) -> Vec<String> {
     bytes.chunks_exact(4).map(|b| Ipv4Addr::new(b[0],b[1],b[2],b[3]).to_string()).collect()
 }
 
+/// Compatibility probe used only for the local port-conflict notice.
+pub fn loopback_dns_busy(port:u16,timeout:Duration)->bool {
+    if port==0||timeout.is_zero(){return false;}
+    let deadline=Instant::now()+timeout.min(Duration::from_millis(500));
+    (||->Option<()> {
+        let socket=crate::child_io::socket(Domain::IPV4,Type::DGRAM,Some(Protocol::UDP)).ok()?;
+        socket.connect(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST,port))).ok()?;
+        socket.set_write_timeout(Some(remaining(deadline)?)).ok()?;
+        let query=[0x41,0x43,1,0,0,1,0,0,0,0,0,0,9,b'l',b'o',b'c',b'a',b'l',b'h',b'o',b's',b't',0,0,1,0,1];
+        if socket.send(&query).ok()?!=query.len(){return None;}
+        socket.set_read_timeout(Some(remaining(deadline)?)).ok()?;
+        let mut bytes=[std::mem::MaybeUninit::<u8>::uninit();512];
+        (socket.recv(&mut bytes).ok()?>0).then_some(())
+    })().is_some()
+}
+
 // MARK: - The forwarder
 
 #[derive(Clone, Debug)]
@@ -1971,6 +1987,21 @@ mod tests {
         assert!(gateway_system_bootstrap(Some(false)));
         assert!(!gateway_system_bootstrap(Some(true)));
         assert!(!gateway_system_bootstrap(None));
+    }
+
+    #[test]
+    fn local_dns_conflict_probe_uses_its_private_socket_and_short_budget() {
+        let server=crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST,0)).unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(300))).unwrap();let port=server.local_addr().unwrap().port();
+        let (tx,rx)=mpsc::channel();
+        let worker=std::thread::spawn(move||{let mut bytes=[0;512];if let Ok((n,peer))=server.recv_from(&mut bytes){tx.send(bytes[..n].to_vec()).unwrap();server.send_to(b"busy",peer).unwrap();}});
+        let busy=loopback_dns_busy(port,Duration::from_millis(200));worker.join().unwrap();
+        assert!(busy,"a local responder must still be classified as port busy");
+        assert_eq!(rx.recv().unwrap(),vec![0x41,0x43,1,0,0,1,0,0,0,0,0,0,9,b'l',b'o',b'c',b'a',b'l',b'h',b'o',b's',b't',0,0,1,0,1]);
+        let silent=crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST,0)).unwrap();let start=Instant::now();
+        assert!(!loopback_dns_busy(silent.local_addr().unwrap().port(),Duration::from_millis(40)));
+        assert!(start.elapsed()<Duration::from_secs(1));
+        assert!(!loopback_dns_busy(0,Duration::from_millis(40)));
     }
 
 }

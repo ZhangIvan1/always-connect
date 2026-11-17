@@ -1864,3 +1864,9 @@ pub extern "C" fn ac_private_fd_duplicate(fd:i32)->i32 {
     use std::os::fd::IntoRawFd;
     crate::child_io::duplicate(fd).map(IntoRawFd::into_raw_fd).unwrap_or(-1)
 }
+
+/// Loopback-only compatibility notice probe, never a VPN DNS fallback.
+#[no_mangle]
+pub extern "C" fn ac_loopback_dns_busy(port:u16,timeout_milliseconds:u32)->bool {
+    crate::dns_forwarder::loopback_dns_busy(port,std::time::Duration::from_millis(timeout_milliseconds.min(500) as u64))
+}

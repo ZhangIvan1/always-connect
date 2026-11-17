@@ -134,27 +134,9 @@ enum NetworkNeighbors {
     /// with a short wait. (A test bind cannot tell: a normal user may
     /// not bind port 53 at all, EACCES.)
     private static func port53Busy() -> Bool {
-        let fd = socket(AF_INET, SOCK_DGRAM, 0)
-        guard fd >= 0 else { return false }
-        defer { close(fd) }
-        var tv = timeval(tv_sec: 0, tv_usec: 500_000)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(53).bigEndian
-        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
-        let connected = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard connected == 0 else { return false }
-        // "localhost. IN A", id 0x4143.
-        let query: [UInt8] = [0x41, 0x43, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                              9] + Array("localhost".utf8) + [0, 0x00, 0x01, 0x00, 0x01]
-        guard send(fd, query, query.count, 0) == query.count else { return false }
-        var buffer = [UInt8](repeating: 0, count: 512)
-        return recv(fd, &buffer, buffer.count, 0) > 0
+        ac_loopback_dns_busy(53, 500)
     }
 }
+
+@_silgen_name("ac_loopback_dns_busy")
+private func ac_loopback_dns_busy(_ port: UInt16, _ timeoutMilliseconds: UInt32) -> Bool
