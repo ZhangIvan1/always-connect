@@ -53,6 +53,8 @@ pub struct Inputs {
     /// Port 53 passes to these only (plan v2, §25.8).
     #[serde(rename = "localDNSServers", default)]
     pub local_dns_servers: Vec<String>,
+    #[serde(rename = "tunnelDNSServers", default)]
+    pub tunnel_dns_servers: Vec<String>,
     /// Declare and pass `<ac_direct>`.
     #[serde(default)]
     pub direct_table: bool,
@@ -113,6 +115,7 @@ pub fn text(connected: bool, i: &Inputs) -> Option<String> {
         allow_direct_egress: connected,
         allow_dns: i.allow_dns,
         dns_servers: clean(&i.local_dns_servers),
+        tunnel_dns_servers: clean(&i.tunnel_dns_servers),
         direct_table: i.direct_table,
         strict_dns: i.strict_dns,
         block_direct: i.block_direct,
@@ -673,7 +676,7 @@ mod tests {
         let guard = Arc::new(Guard::new(Settings { support_dir: dir.clone(), boot: Some("B1".into()),
             grace: Duration::from_secs(120), pfctl: Some(tool.to_string_lossy().into()) }));
         let inputs = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["198.51.100.1".into()],
-            physical_if: "en0".into(), allow_networks: vec![], allow_dns: false, local_dns_servers: vec![], direct_table: true, strict_dns: false, block_direct: false };
+            physical_if: "en0".into(), allow_networks: vec![], allow_dns: false, local_dns_servers: vec![], tunnel_dns_servers:vec![], direct_table: true, strict_dns: false, block_direct: false };
         let holder = guard.new_own_holder();
         assert!(guard.apply(&holder, false, &inputs).is_none());
         assert!(guard.add_direct(&["203.0.113.9".into()]));
@@ -699,7 +702,7 @@ mod tests {
         std::fs::set_permissions(&tool,std::fs::Permissions::from_mode(0o700)).unwrap();
         let settings=||Settings{support_dir:dir.clone(),boot:Some("B1".into()),grace:Duration::from_secs(120),pfctl:Some(tool.to_string_lossy().into())};
         let guard=Arc::new(Guard::new(settings()));guard.owner_attached();let holder=guard.new_own_holder();
-        let inputs=Inputs{tunnel_if:"utun5".into(),gateway_ips:vec!["198.51.100.1".into()],physical_if:"en0".into(),allow_networks:vec![],allow_dns:false,local_dns_servers:vec![],direct_table:true,strict_dns:true,block_direct:false};
+        let inputs=Inputs{tunnel_if:"utun5".into(),gateway_ips:vec!["198.51.100.1".into()],physical_if:"en0".into(),allow_networks:vec![],allow_dns:false,local_dns_servers:vec![],tunnel_dns_servers:vec![],direct_table:true,strict_dns:true,block_direct:false};
         assert!(guard.apply(&holder,false,&inputs).is_none());assert!(guard.add_direct(&["203.0.113.9".into()]));
         let recovered=Arc::new(Guard::new(settings()));recovered.adopt_at_start();recovered.owner_attached();
         assert!(recovered.is_holding());assert!(recovered.held().unwrap().1.block_direct);

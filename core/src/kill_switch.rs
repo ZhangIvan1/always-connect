@@ -156,6 +156,7 @@ impl KillSwitch {
             allow_networks: s.allow_networks.clone(),
             allow_dns: true,
             local_dns_servers: Vec::new(),
+            tunnel_dns_servers: Vec::new(),
             direct_table: false,
             strict_dns: false,
             block_direct: false,

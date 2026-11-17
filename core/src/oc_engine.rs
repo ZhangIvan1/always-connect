@@ -1722,8 +1722,9 @@ impl Shared {
         let Some((tun,gateway_ips))=c.last_pf.clone() else {return false;};
         c.pf_needs_load=true;
         let split=c.forwarder.is_some();
-        let connected=c.last_allow_direct_egress&&!split;
-        let inputs=Inputs {tunnel_if:tun,gateway_ips,physical_if:c.config.physical_if.clone(),allow_networks:c.direct_networks(),allow_dns:false,local_dns_servers:c.local_dns.clone(),direct_table:split,strict_dns:c.config.relay.is_some()||split,block_direct:split};
+        let own_dns=c.config.direct_domains.is_some()||c.config.relay.is_some()||split;
+        let connected=c.last_allow_direct_egress&&!own_dns;
+        let inputs=Inputs {tunnel_if:tun,gateway_ips,physical_if:c.config.physical_if.clone(),allow_networks:c.direct_networks(),allow_dns:false,local_dns_servers:c.local_dns.clone(),tunnel_dns_servers:c.tunnel_dns.clone(),direct_table:split,strict_dns:own_dns,block_direct:split};
         // The base guard is mandatory. Optional routing, journaling and table
         // failures may disable bypasses, never the physical blocking policy.
         if let Some(error)=self.guard.apply(&self.holder,connected,&inputs) {c.pf_error=Some(error.clone());self.report(c,&error);return false;}
@@ -2279,6 +2280,24 @@ mod tests {
         Engine::new(Config {no_routes:true,test_active:true,support_dir:support.to_string_lossy().into(),boot_session:"B1".into(),script_path:"/usr/bin/true".into(),physical_if:"en0".into(),drop_protection:true,direct_domains:Some(vec![]),..Config::default()},Hooks {
             state:Box::new(|_,_|{}),terminal:Box::new(|_|{}),physical_network:Box::new(|_|Some(("192.168.1.1".into(),"en0".into()))),local_dns:Box::new(|_|vec![]),system_roots:Box::new(||None),stopped:Box::new(||{}),
         },guard)
+    }
+    #[test]
+    fn failed_split_forwarder_keeps_physical_blocking_and_gateway_dns_fallback() {
+        let (support,guard,_)=recovery_guard("forwarder-fallback");
+        let engine=recovery_engine(&support,guard.clone());
+        let rules={
+            let mut c=engine.shared.core.lock().unwrap();
+            c.forwarder=None;
+            c.tunnel_dns=vec!["10.1.1.1".into()];
+            engine.shared.load_pf(&mut c,Some("utun5".into()),vec!["198.51.100.1".into()],true);
+            guard.expected_rules().unwrap()
+        };
+        assert!(rules.ends_with("block drop out quick all\n"),
+            "a failed optional forwarder must not open unlisted physical TCP/UDP");
+        assert!(rules.contains("on utun5 proto { udp tcp } to 10.1.1.1 port 53 no state"),
+            "the system resolver must retain the current gateway DNS path");
+        engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);
+        std::fs::remove_dir_all(support).unwrap();
     }
     #[test]
     fn live_takeover_with_empty_list_keeps_old_exceptions_disabled() {

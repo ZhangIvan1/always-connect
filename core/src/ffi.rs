@@ -411,6 +411,7 @@ pub extern "C" fn ac_pf_generate(
         allow_direct_egress: flags & 1 != 0,
         allow_dns: flags & 2 != 0,
         dns_servers: split_csv(&dns_servers_csv),
+        tunnel_dns_servers: Vec::new(),
         direct_table: flags & 4 != 0,
         strict_dns: flags & 8 != 0,
         block_direct: flags & 16 != 0,

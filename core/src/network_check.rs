@@ -253,7 +253,7 @@ pub(crate) fn read_command(path: &str, args: &[String], limit: Duration) -> Outp
 mod tests {
     use super::*;
     fn expected() -> Expected {
-        let rules = crate::pf::generate(&crate::pf::PfInput { tunnel_if:"utun5".into(), physical_if:"en0".into(), gateway_ips:vec!["203.0.113.1".into()], allow_networks:vec!["192.168.0.0/16".into()], allow_direct_egress:false, allow_dns:false, dns_servers:vec!["192.168.1.1".into()],direct_table:true,strict_dns:false,block_direct:false }).unwrap();
+        let rules = crate::pf::generate(&crate::pf::PfInput { tunnel_if:"utun5".into(), physical_if:"en0".into(), gateway_ips:vec!["203.0.113.1".into()], allow_networks:vec!["192.168.0.0/16".into()], allow_direct_egress:false, allow_dns:false, dns_servers:vec!["192.168.1.1".into()],tunnel_dns_servers:vec!["10.1.1.1".into()],direct_table:true,strict_dns:false,block_direct:false }).unwrap();
         Expected { tunnel:Some("utun5".into()),dns_interface:Some("utun5".into()),physical:"en0".into(),gateway:Some("192.168.1.1".into()),vpn_gateways:vec!["203.0.113.1".into()],dns:vec!["10.1.1.1".into()],split:true,protection:true,rules:Some(rules),direct:vec!["198.51.100.9".into()],routes:vec!["198.51.100.9".into()],error:None,epoch:1 }
     }
     fn fixture(e:&Expected, path:&str,args:&[String]) -> Output {

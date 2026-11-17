@@ -18,6 +18,7 @@ final class NetworkGuard {
         var allowDNS: Bool
         /// Plan v2 (§25.8): port 53 passes to these only.
         var localDNSServers: [String] = []
+        var tunnelDNSServers: [String] = []
         /// Plan v2 (§25.8): declare and pass `<ac_direct>`.
         var directTable: Bool = false
         var strictDNS: Bool = false
@@ -169,10 +170,10 @@ extension JSONDecoder {
 
 extension NetworkGuard.Inputs {
     private enum CodingKeys: String, CodingKey {
-        case tunnelIf, gatewayIps, physicalIf, allowNetworks, allowDNS, localDNSServers, directTable, strictDNS, blockDirect
+        case tunnelIf, gatewayIps, physicalIf, allowNetworks, allowDNS, localDNSServers, tunnelDNSServers, directTable, strictDNS, blockDirect
     }
 
-    /// Records written before plan v2 lack the last two keys (synthesized
+    /// Older records omit optional DNS and table fields (synthesized
     /// Codable would throw, AGENTS.md).
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -182,6 +183,7 @@ extension NetworkGuard.Inputs {
         allowNetworks = try c.decode([String].self, forKey: .allowNetworks)
         allowDNS = try c.decode(Bool.self, forKey: .allowDNS)
         localDNSServers = try c.decodeIfPresent([String].self, forKey: .localDNSServers) ?? []
+        tunnelDNSServers = try c.decodeIfPresent([String].self, forKey: .tunnelDNSServers) ?? []
         directTable = try c.decodeIfPresent(Bool.self, forKey: .directTable) ?? false
         strictDNS = try c.decodeIfPresent(Bool.self, forKey: .strictDNS) ?? false
         blockDirect = try c.decodeIfPresent(Bool.self, forKey: .blockDirect) ?? false

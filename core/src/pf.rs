@@ -80,6 +80,8 @@ pub struct PfInput {
     /// 53 passes to these only — the DNS forwarder asks them for the
     /// listed domains. Narrower than `allow_dns`.
     pub dns_servers: Vec<String>,
+    /// Gateway-supplied DNS for system resolution when no forwarder is running.
+    pub tunnel_dns_servers: Vec<String>,
     /// Plan v2 (§25.8): declare the `<ac_direct>` table in the anchor and
     /// pass outbound to it; the background service fills it with the
     /// addresses of the domains that skip the VPN.
@@ -188,6 +190,11 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
             dns_servers.push(ip.as_str());
         }
     }
+    let mut tunnel_dns_servers: Vec<&str> = Vec::new();
+    for ip in &input.tunnel_dns_servers {
+        if !valid_ip(ip) { return Err(PfError::BadIp(ip.clone())); }
+        if !tunnel_dns_servers.contains(&ip.as_str()) { tunnel_dns_servers.push(ip.as_str()); }
+    }
     let mut networks: Vec<&str> = Vec::new();
     for n in &input.allow_networks {
         if !valid_cidr(n) {
@@ -216,7 +223,10 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
         // may ask upstream servers. Interface membership alone is insufficient.
         out.push_str("pass out quick on lo0 inet proto { udp tcp } to 127.0.0.0/8 port 53 no state\n");
         out.push_str("pass out quick on lo0 inet6 proto { udp tcp } to ::1 port 53 no state\n");
-        out.push_str(&format!("pass out quick on {} proto {{ udp tcp }} to any port 53 user root no state\n", input.tunnel_if));
+        let sender = if input.direct_table { " user root" } else { "" };
+        for ip in &tunnel_dns_servers {
+            out.push_str(&format!("pass out quick on {} proto {{ udp tcp }} to {ip} port 53{sender} no state\n", input.tunnel_if));
+        }
         for ip in &dns_servers {
             out.push_str(&format!("pass out quick on {phys} proto {{ udp tcp }} to {ip} port 53 user root no state\n"));
         }
@@ -294,6 +304,7 @@ mod tests {
         for table in [false, true] {
             let mut input = secure_input(); input.strict_dns = true; input.direct_table = table;
             input.dns_servers = vec!["192.168.1.1".into()];
+            input.tunnel_dns_servers = vec!["10.1.1.1".into()];
             let text = generate(&input).unwrap();
             let root = text.find("to 192.168.1.1 port 53 user root no state").unwrap();
             let deny = text.find("block drop out quick proto { udp tcp } to any port 53").unwrap();
@@ -307,13 +318,37 @@ mod tests {
             for allowed in [
                 "on lo0 inet proto { udp tcp } to 127.0.0.0/8 port 53 no state",
                 "on lo0 inet6 proto { udp tcp } to ::1 port 53 no state",
-                "on utun5 proto { udp tcp } to any port 53 user root no state",
                 "on en0 proto { udp tcp } to 192.168.1.1 port 53 user root no state",
             ] {
                 assert!(text.find(allowed).is_some_and(|at|at<deny),
                     "local clients and the root forwarder must retain their explicit DNS paths: {allowed}");
             }
+            let upstream=if table {"on utun5 proto { udp tcp } to 10.1.1.1 port 53 user root no state"}
+                else {"on utun5 proto { udp tcp } to 10.1.1.1 port 53 no state"};
+            assert!(text.find(upstream).is_some_and(|at|at<deny));
         }
+    }
+
+    #[test]
+    fn unavailable_forwarder_retains_system_dns_only_to_known_tunnel_servers() {
+        let input:crate::network_guard::Inputs=serde_json::from_value(serde_json::json!({
+            "tunnelIf":"utun5","physicalIf":"en0","gatewayIps":["203.0.113.1"],
+            "allowNetworks":["192.168.0.0/16"],"allowDNS":false,
+            "localDNSServers":["192.168.1.1"],"tunnelDNSServers":["10.1.1.1"],
+            "strictDNS":true,"directTable":false,"blockDirect":false
+        })).unwrap();
+        let text=crate::network_guard::text(false,&input).unwrap();
+        let denied=text.find("block drop out quick proto { udp tcp } to any port 53").unwrap();
+        let system=text.find("pass out quick on utun5 proto { udp tcp } to 10.1.1.1 port 53 no state")
+            .expect("system resolver needs a non-root path to the confirmed company DNS when no forwarder exists");
+        assert!(system<denied);
+        assert!(!text.contains("pass out quick on en0 proto { udp tcp } to 10.1.1.1"));
+        assert!(!text.contains("pass out quick on utun5 proto { udp tcp } to any port 53 no state"));
+        let mut forwarded=input;forwarded.direct_table=true;
+        let text=crate::network_guard::text(false,&forwarded).unwrap();
+        assert!(!text.contains("to 10.1.1.1 port 53 no state"),"a running forwarder keeps upstream DNS exclusive to root");
+        assert!(text.contains("to 10.1.1.1 port 53 user root no state"));
+        assert!(!text.contains("to any port 53 user root"),"upstream permission must stay within the gateway-supplied DNS set");
     }
 
     #[test]
@@ -350,6 +385,7 @@ mod tests {
             allow_direct_egress: false,
             allow_dns: false,
             dns_servers: vec![],
+            tunnel_dns_servers: vec![],
             direct_table: false,
             strict_dns: false,
             block_direct: false,
