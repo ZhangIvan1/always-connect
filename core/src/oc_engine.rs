@@ -36,7 +36,7 @@ use crate::network_guard::{self, Guard, Inputs, CISCO_HOLDER};
 use crate::session::{AuthOutcome, DriverAction, SessionDriver};
 use crate::state_machine::SessionStatus;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap,HashSet};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::AsRawFd;
@@ -359,6 +359,7 @@ struct TunnelLease { name: String, index: u32, generation: u64 }
 const TUNNEL_RECONFIRM_ERROR: &str = "VPN 接口已变化，请重新连接；断线保护保持";
 const SPLIT_CAPACITY_ERROR: &str = "分流记录已达到容量上限，本次连接暂时全部走 VPN；请重新连接以恢复按网站分流";
 enum SplitSync { Complete, PendingAdditions, Blocked }
+struct DirectRetry { until:Instant, delay:Duration }
 fn interface_index(name: &str) -> Option<u32> {
     let name = std::ffi::CString::new(name).ok()?;
     let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
@@ -411,6 +412,8 @@ struct Core {
     tunnel_lease: Option<TunnelLease>,
     split_policy: crate::split_policy::SplitPolicy,
     split_needs_sync: bool,
+    direct_retries: HashMap<Ipv4Addr,DirectRetry>,
+    direct_retry_warning: Option<String>,
     tunnel_retrying: bool,
     gateway_lan_excludes: Vec<String>,
     watching: bool,
@@ -492,6 +495,8 @@ impl Engine {
                 tunnel_lease: None,
                 split_policy: crate::split_policy::SplitPolicy::default(),
                 split_needs_sync: false,
+                direct_retries: HashMap::new(),
+                direct_retry_warning: None,
                 tunnel_retrying: false,
                 gateway_lan_excludes: Vec::new(),
                 watching: false,
@@ -618,6 +623,27 @@ impl Drop for Engine {
 }
 
 impl Core {
+    fn direct_retry_ready(&self,ip:&Ipv4Addr,now:Instant)->bool {
+        self.direct_retries.get(ip).is_none_or(|retry|now>=retry.until)
+    }
+    fn reset_direct_retries(&mut self) {
+        self.direct_retries=HashMap::new();self.direct_retry_warning=None;
+    }
+    fn record_direct_retries(&mut self,intended:&HashSet<String>,attempted:&HashSet<Ipv4Addr>,now:Instant) {
+        let pending:HashSet<Ipv4Addr>=intended.difference(&self.split_addresses).filter_map(|ip|ip.parse().ok()).collect();
+        self.direct_retries.retain(|ip,_|pending.contains(ip));
+        if pending.is_empty() {self.reset_direct_retries();return;}
+        for ip in &pending {
+            self.direct_retries.entry(*ip).and_modify(|retry| {
+                if attempted.contains(ip) {
+                    retry.delay=retry.delay.saturating_mul(2).min(Duration::from_secs(30));
+                    retry.until=now+retry.delay;
+                }
+            }).or_insert(DirectRetry{until:now+Duration::from_secs(1),delay:Duration::from_secs(1)});
+        }
+        let name=pending.iter().min().and_then(|ip|self.split_policy.direct_name(ip)).unwrap_or("部分网站");
+        self.direct_retry_warning=Some(format!("直连网站「{name}」暂时不可达，已限制重试频率；其他域名不受影响。可移出直连名单或重新连接后重试。"));
+    }
     fn direct_networks(&self) -> Vec<String> {
         let mut out = self.config.allow_networks.clone();
         for n in &self.gateway_lan_excludes {
@@ -654,7 +680,7 @@ impl Shared {
             last_terminal: c.last_terminal.map(|t| t as i32),
             split_running: c.forwarder.is_some(),
             split_hits: if c.forwarder.is_some() { c.split_hits.clone() } else { Vec::new() },
-            split_warning: c.split_policy.is_saturated().then(||SPLIT_CAPACITY_ERROR.into()),
+            split_warning: if c.split_policy.is_saturated() {Some(SPLIT_CAPACITY_ERROR.into())}else{c.direct_retry_warning.clone()},
             split_addresses: if c.forwarder.is_some() { c.split_addresses.len() } else { 0 },
             direct_networks: c.direct_networks(),
             tail: c.tail.clone(),
@@ -716,6 +742,7 @@ impl Shared {
                     if c.watching && !c.stop_requested { self.refresh_network(&mut c); }
                 }
                 Event::DirectDomains(d) => {
+                    c.reset_direct_retries();
                     if let Some(f) = &c.forwarder {
                         f.set_rules(&d);
                     }
@@ -725,6 +752,7 @@ impl Shared {
                 }
                 Event::DropProtection(on) => self.update_drop_protection(&mut c, on),
                 Event::AllowNetworks(n) => {
+                    c.reset_direct_retries();
                     c.config.allow_networks = n.iter().map(|x| x.trim().to_string()).filter(|x| crate::kill_switch::is_cidr(x)).collect();
                     self.sync_split_routes(&mut c);
                     self.route_networks_direct(&mut c);
@@ -741,7 +769,9 @@ impl Shared {
                         };
                         let changed = c.split_policy.observe(answer.name, &answer.addresses, &direct);
                         let needs_answer_sync=c.split_needs_sync&&!self.dns_observation_ready(&c,&answer.addresses);
-                        if changed || c.pf_needs_load || (c.split_needs_sync && needs_answer_sync) {
+                        let now=Instant::now();
+                        let retry_ready=answer.addresses.iter().any(|ip|!c.split_policy.allows(ip)||c.direct_retry_ready(ip,now));
+                        if changed || c.pf_needs_load || (needs_answer_sync && retry_ready) {
                             self.sync_split_routes(&mut c);
                         }
                         if c.split_policy.is_saturated() && c.last_error.as_deref()!=Some(SPLIT_CAPACITY_ERROR) {
@@ -910,15 +940,11 @@ impl Shared {
     /// A revoked address must have lost its route and effective PF permission.
     fn dns_observation_ready(&self,c:&Core,addresses:&[Ipv4Addr])->bool {
         if c.pf_needs_load {return false;}
-        let routes:HashSet<_>=self.routes.addresses().into_iter().collect();
-        let table:HashSet<_>=self.guard.direct_addresses().into_iter().collect();
-        let active=if c.config.drop_protection {
-            self.guard.held().is_some_and(|(holder,inputs)|holder==self.holder&&inputs.direct_table&&!inputs.block_direct)
-        }else{true};
+        let active=!c.config.drop_protection||self.guard.dynamic_direct_enabled(&self.holder);
         addresses.iter().all(|ip| {
             let text=ip.to_string();
             if c.split_policy.allows(ip) {c.split_addresses.contains(&text)&&active}
-            else {!routes.contains(&text)&&(!active||!table.contains(&text))}
+            else {!self.routes.contains_address(&text)&&(!active||!self.guard.direct_contains(&text))}
         })
     }
 
@@ -950,6 +976,9 @@ impl Shared {
             };
             desired.retain(|value|value.parse().is_ok_and(|ip|direct_routes::ordinary_unicast(ip)&&!own.contains(&ip)));
         }
+        let intended=desired.clone();
+        let now=Instant::now();
+        let attempting:HashSet<Ipv4Addr>=intended.iter().filter_map(|ip|ip.parse().ok()).filter(|ip|c.direct_retry_ready(ip,now)).collect();
         let actual: HashSet<_> = self.guard.direct_addresses().into_iter().collect();
         let gone: Vec<_> = actual.difference(&desired).cloned().collect();
         // Close the firewall exception before removing its route; never grant
@@ -970,7 +999,7 @@ impl Shared {
             c.pf_error = Some(e.clone()); self.report(c, &e);
             return SplitSync::Blocked;
         }
-        let new: Vec<_> = routable.difference(&routed).cloned().collect();
+        let new: Vec<_> = routable.difference(&routed).filter(|ip|ip.parse().is_ok_and(|ip|attempting.contains(&ip))).cloned().collect();
         if !new.is_empty() {
             // DirectRoutes records exact per-address outcomes, so one batch
             // avoids repeating fsync and rewriting the journal for every IP.
@@ -981,7 +1010,7 @@ impl Shared {
         let mut additions_ok=persisted&&new.iter().all(|ip|installed.contains(ip));
         let mut unconfirmed=HashSet::new();
         if !persisted {unconfirmed.extend(new);}
-        desired.retain(|ip|!unconfirmed.contains(ip)&&(!routable.contains(ip)||installed.contains(ip)));
+        desired.retain(|ip|!unconfirmed.contains(ip)&&(!routable.contains(ip)||installed.contains(ip))&&ip.parse().is_ok_and(|ip|attempting.contains(&ip)));
         let fresh:Vec<_>=desired.difference(&actual).cloned().collect();
         // Table additions are optional too: one failure must not poison
         // unrelated VPN DNS, nor authorise an unrouted direct address.
@@ -994,9 +1023,11 @@ impl Shared {
             additions_ok=false;
         }
         c.split_addresses=desired;
+        additions_ok&=intended.is_subset(&c.split_addresses);
         let rearmed=self.rearm_direct_after_sync(c);
         c.split_needs_sync=!rearmed||!additions_ok;
         if !rearmed {return SplitSync::Blocked;}
+        c.record_direct_retries(&intended,&attempting,now);
         if !additions_ok {
             let error="部分直连路由安装失败；受影响网站等待重试，其余 DNS 正常，基础保护保持";
             c.pf_error=Some(error.into());self.report(c,error);return SplitSync::PendingAdditions;
@@ -1138,6 +1169,7 @@ impl Shared {
         c.split_addresses.clear();
         c.tunnel_lease = None;
         c.split_policy = crate::split_policy::SplitPolicy::default();
+        c.reset_direct_retries();
         if c.last_error.as_deref()==Some(SPLIT_CAPACITY_ERROR) {c.last_error=None;}
         c.split_needs_sync = false;
     }
@@ -1816,6 +1848,7 @@ impl Shared {
 
     /// The physical network changed under a live session (§28.1).
     fn follow_network(&self, c: &mut Core, gateway: &str, interface: &str, move_gateway_route: bool) {
+        c.reset_direct_retries();
         network_guard::log(&format!("network changed: now via {interface}"));
         c.physical_gateway = Some(gateway.to_string());
         c.config.physical_if = interface.to_string();
@@ -2393,6 +2426,7 @@ mod tests {
         direct_routes::set_test_journal_write_budget(&engine.shared.routes,Some(1));
         let granted=dns_event(&engine,epoch,"direct.example",true);
         direct_routes::set_test_journal_write_budget(&engine.shared.routes,None);
+        {let mut c=engine.shared.core.lock().unwrap();for retry in c.direct_retries.values_mut(){retry.until=Instant::now()-Duration::from_secs(1);}}
         assert!(!granted,"kernel success alone cannot override a failed route transaction");
         assert!(engine.shared.guard.direct_addresses().is_empty());
         assert!(dns_event(&engine,epoch,"direct.example",true),"after metadata recovery the same query can become direct");
@@ -2426,6 +2460,40 @@ exit 0
         engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);
         assert!(!table.contains("203.0.113.9"),"a failed add must not leave an untracked kernel permission");
         std::fs::remove_dir_all(support).unwrap();
+    }
+
+    #[test]
+    fn repeated_direct_conflicts_are_rate_limited_and_show_the_affected_name() {
+        let (engine,support)=split_engine("review2-retry-rate");
+        let attempts=Arc::new(std::sync::atomic::AtomicUsize::new(0));let count=attempts.clone();
+        let conflict=Arc::new(AtomicBool::new(true));let blocked=conflict.clone();
+        engine.shared.routes.test_commands(Box::new(move |args| {
+            if args.contains(&"add")&&args.contains(&"203.0.113.9") {count.fetch_add(1,Ordering::SeqCst);if blocked.load(Ordering::SeqCst){1}else{0}}else{0}
+        }),crate::network_check::Output{ok:true,text:"Destination Gateway Flags Netif Expire\n203.0.113.9 192.168.9.1 UGHS en0\n".into()});
+        let epoch=engine.shared.core.lock().unwrap().forwarder.as_ref().unwrap().epoch();
+        assert!(!dns_event(&engine,epoch,"direct.example",true));
+        {let mut c=engine.shared.core.lock().unwrap();for retry in c.direct_retries.values_mut(){retry.until=Instant::now()+Duration::from_secs(60);}}
+        for _ in 0..4 {assert!(!dns_event(&engine,epoch,"direct.example",true));}
+        assert_eq!(attempts.load(Ordering::SeqCst),1,"client retries within a backoff window must not execute more route commands");
+        assert!(engine.info().split_warning.is_some_and(|s|s.contains("direct.example")),"the panel must name the affected website");
+        // A new, unrelated direct IP may proceed while the old one cools down.
+        let (tx,rx)=mpsc::channel();engine.send(Event::DnsAnswer(dns_forwarder::Observation{epoch,name:"good.direct.example".into(),entry:Some("direct.example".into()),addresses:vec![Ipv4Addr::new(203,0,113,10)],direct:vec![Ipv4Addr::new(203,0,113,10)]},tx));
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());assert_eq!(attempts.load(Ordering::SeqCst),1);
+        // Advance the retry clock without wall-clock sleeps, checking that
+        // repeated failures remain bounded rather than growing without limit.
+        for _ in 0..8 {
+            {let mut c=engine.shared.core.lock().unwrap();for retry in c.direct_retries.values_mut(){retry.until=Instant::now()-Duration::from_secs(1);}}
+            assert!(!dns_event(&engine,epoch,"direct.example",true));
+            let c=engine.shared.core.lock().unwrap();assert!(c.direct_retries.values().all(|retry|retry.until<=Instant::now()+Duration::from_secs(60)));
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst),9);
+        conflict.store(false,Ordering::SeqCst);
+        {let mut c=engine.shared.core.lock().unwrap();for retry in c.direct_retries.values_mut(){retry.until=Instant::now()-Duration::from_secs(1);}}
+        assert!(dns_event(&engine,epoch,"direct.example",true));
+        assert!(!dns_event(&engine,0,"publication-barrier.example",false));
+        assert!(engine.info().split_warning.is_none());
+        assert_eq!(engine.shared.core.lock().unwrap().direct_retries.capacity(),0,"recovered retry state must release its allocation");
+        engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);std::fs::remove_dir_all(support).unwrap();
     }
 
 }

@@ -55,6 +55,10 @@ impl SplitPolicy {
     }
     pub fn is_saturated(&self)->bool {self.saturated}
     pub fn allows(&self,ip:&Ipv4Addr)->bool {self.permitted.contains(ip)}
+    pub fn direct_name(&self,ip:&Ipv4Addr)->Option<&str> {
+        self.names.iter().filter(|(_,claims)|claims.current.iter().any(|(address,direct)|address==ip&&*direct))
+            .map(|(name,_)|name.as_str()).min()
+    }
     pub fn revalidate(&mut self, rules: &SplitRules) {
         for (name, claims) in &mut self.names {
             let domain_direct = rules.matches(name).is_some();

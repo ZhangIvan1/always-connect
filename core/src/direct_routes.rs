@@ -399,6 +399,7 @@ impl DirectRoutes {
         self.flush(&mut state)&&ok
     }
     pub fn addresses(&self)->Vec<String>{self.state.lock().unwrap().active.keys().cloned().collect()}
+    pub fn contains_address(&self,address:&str)->bool {self.state.lock().unwrap().active.contains_key(address)}
     pub fn managed_addresses(&self)->Vec<String>{let state=self.state.lock().unwrap();state.active.keys().chain(state.retired.iter()).cloned().collect()}
     pub fn remove_all(&self)->bool {
         // Live memory knows which mutations completed even if the final

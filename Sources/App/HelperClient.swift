@@ -853,11 +853,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         guard !finished else { return }; finished = true
                         struct Status: Decodable {
                             var splitHits: [String]; var splitAddresses: Int
-                            var splitRunning: Bool; var splitWarning: String?
+                            var splitRunning: Bool; var splitWarning: String?; var pfError: String?
                         }
                         let status = try? JSONDecoder().decode(Status.self, from: Data(text.utf8))
                         self.splitActivity = status?.splitRunning == true ? (status!.splitHits, status!.splitAddresses) : nil
                         self.splitWarning = status?.splitWarning
+                        if let status { self.pfWarning = status.pfError }
                     }
                 }
                 return

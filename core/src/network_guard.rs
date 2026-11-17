@@ -465,6 +465,11 @@ impl Guard {
         self.state.lock().unwrap().direct.iter().cloned().collect()
     }
 
+    pub fn direct_contains(&self,address:&str)->bool {self.state.lock().unwrap().direct.contains(address)}
+    pub fn dynamic_direct_enabled(&self,holder:&str)->bool {
+        self.state.lock().unwrap().record.as_ref().is_some_and(|r|r.holder==holder&&r.inputs.direct_table&&!r.inputs.block_direct)
+    }
+
     fn reload_direct(s: &State) {
         if s.direct.is_empty() {
             return;
