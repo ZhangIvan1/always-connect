@@ -895,10 +895,14 @@ impl Inner {
     /// The answer to send back, or None when there is none to give (the
     /// client then retries or moves on to the next server).
     pub fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
+        self.resolve_in_session(query, None)
+    }
+
+    fn resolve_in_session(&self, query: &[u8], session: Option<&std::sync::atomic::AtomicBool>) -> Option<Vec<u8>> {
         let q = question(query)?;
         let (epoch, rules, up, physical_binding, tunnel_binding) = {
             let settings = self.settings.read().unwrap();
-            if !settings.enabled { return None; }
+            if !settings.enabled || session.is_some_and(|live| !live.load(Ordering::Acquire)) { return None; }
             (settings.epoch, settings.rules.clone(), settings.upstreams.clone(), settings.physical_binding.clone(), settings.tunnel_binding.clone())
         };
         let entry = rules.matches(&q.name);
@@ -1011,6 +1015,27 @@ struct Listening {
     /// Writing a byte here ends the listening thread.
     wake: std::os::fd::OwnedFd,
     thread: JoinHandle<()>,
+    replies: Arc<Replies>,
+}
+
+/// Workers own this gate, never a copy of the listener's descriptor. Closing
+/// it only waits for a nonblocking UDP send, not DNS or an engine callback.
+struct Replies {
+    active: std::sync::atomic::AtomicBool,
+    udp: Mutex<Option<UdpSocket>>,
+}
+
+impl Replies {
+    fn close(&self) {
+        self.active.store(false, Ordering::Release);
+        self.udp.lock().unwrap().take();
+    }
+
+    fn send(&self, answer: &[u8], peer: std::net::SocketAddr) {
+        if let Some(socket) = self.udp.lock().unwrap().as_ref() {
+            let _ = socket.send_to(answer, peer);
+        }
+    }
 }
 
 pub struct Forwarder {
@@ -1112,23 +1137,28 @@ impl Forwarder {
     /// Listens on UDP and TCP; Err when the port is taken.
     pub fn start(&self) -> io::Result<()> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-        self.stop();
+        let mut listening = self.listening.lock().unwrap();
+        self.stop_locked(&mut listening);
         let udp: UdpSocket = listener(Type::DGRAM, self.listen)?.into();
         let tcp: TcpListener = listener(Type::STREAM, self.listen)?.into();
         udp.set_nonblocking(true)?;
         tcp.set_nonblocking(true)?;
-        self.inner.settings.write().unwrap().enabled = true;
         let mut fds = [0i32; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(io::Error::last_os_error());
         }
         let (read_end, write_end) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         let inner = Arc::clone(&self.inner);
+        let replies = Arc::new(Replies {
+            active: std::sync::atomic::AtomicBool::new(true),
+            udp: Mutex::new(Some(udp.try_clone()?)),
+        });
+        let send_gate = Arc::clone(&replies);
         // One thread waits on both sockets and the stop pipe; a wake-up
         // drains every datagram and connection that is ready.
         let thread = std::thread::Builder::new().name("ac-dns".into()).stack_size(WORKER_STACK).spawn(move || {
             let mut buffer = [0u8; 4096];
-            loop {
+            while send_gate.active.load(Ordering::Acquire) {
                 let mut polled = [
                     libc::pollfd { fd: udp.as_raw_fd(), events: libc::POLLIN, revents: 0 },
                     libc::pollfd { fd: tcp.as_raw_fd(), events: libc::POLLIN, revents: 0 },
@@ -1143,42 +1173,54 @@ impl Forwarder {
                 if polled[2].revents != 0 {
                     return; // stop: the sockets close as this thread ends
                 }
-                while let Ok((n, from)) = udp.recv_from(&mut buffer) {
+                while send_gate.active.load(Ordering::Acquire) {
+                    let Ok((n, from)) = udp.recv_from(&mut buffer) else { break };
                     if n == 0 {
                         continue;
                     }
                     let query = buffer[..n].to_vec();
-                    let Ok(reply) = udp.try_clone() else { continue };
+                    let reply = Arc::clone(&send_gate);
                     inner.spawn(move |inner| {
-                        if let Some(answer) = inner.resolve(&query) {
-                            let _ = reply.send_to(&answer, from);
+                        if let Some(answer) = inner.resolve_in_session(&query, Some(&reply.active)) {
+                            reply.send(&answer, from);
                         }
                     });
                 }
-                while let Ok((mut client, _)) = tcp.accept() {
+                while send_gate.active.load(Ordering::Acquire) {
+                    let Ok((mut client, _)) = tcp.accept() else { break };
                     #[cfg(any(target_os = "macos", target_os = "ios"))]
                     let _ = socket2::SockRef::from(&client).set_nosigpipe(true);
                     let _ = client.set_nonblocking(false);
                     let _ = client.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = client.set_write_timeout(Some(Duration::from_secs(5)));
+                    let session = Arc::clone(&send_gate);
                     inner.spawn(move |inner| {
                         if let Some(query) = read_framed_until(&mut client, Instant::now()+Duration::from_secs(5)) {
-                            if let Some(answer) = inner.resolve(&query) {
-                                let _ = write_framed_until(&mut client, &answer, Instant::now()+Duration::from_secs(5));
+                            if let Some(answer) = inner.resolve_in_session(&query, Some(&session.active)) {
+                                if session.active.load(Ordering::Acquire) {
+                                    let _ = write_framed_until(&mut client, &answer, Instant::now()+Duration::from_secs(5));
+                                }
                             }
                         }
                     });
                 }
             }
         })?;
-        *self.listening.lock().unwrap() = Some(Listening { wake: write_end, thread });
+        self.inner.settings.write().unwrap().enabled = true;
+        *listening = Some(Listening { wake: write_end, thread, replies });
         Ok(())
     }
 
     /// Stops listening and frees the port before returning. Queries
-    /// already being answered finish on their own.
+    /// already resolving may finish, but cannot send via the closed listener
+    /// or enter a later listener session. Never waits for engine callbacks.
     pub fn stop(&self) {
+        self.stop_locked(&mut self.listening.lock().unwrap());
+    }
+
+    fn stop_locked(&self, listening: &mut Option<Listening>) {
         use std::os::fd::AsRawFd;
+        if let Some(listening) = listening.as_ref() { listening.replies.close(); }
         {
             let mut settings = self.inner.settings.write().unwrap();
             settings.epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
@@ -1186,7 +1228,7 @@ impl Forwarder {
         }
         *self.inner.acknowledged.lock().unwrap() = HashMap::new();
         *self.inner.names.lock().unwrap() = HashMap::new();
-        let Some(listening) = self.listening.lock().unwrap().take() else { return };
+        let Some(listening) = listening.take() else { return };
         unsafe { libc::write(listening.wake.as_raw_fd(), [1u8].as_ptr() as *const libc::c_void, 1) };
         let _ = listening.thread.join();
     }
@@ -1757,4 +1799,116 @@ mod tests {
         assert!(rx.try_recv().is_err(), "a removed rule routes nothing");
         fwd.stop();
     }
+    #[test]
+    fn stopped_forwarder_releases_listener_while_answer_ack_is_pending() {
+        let (upstream,_)=fake_udp([203,0,113,9],false);
+        let (entered,ready)=mpsc::channel();let (release,wait)=mpsc::channel();let wait=Mutex::new(wait);
+        let hook:AnswerHook=Box::new(move |_|{entered.send(()).unwrap();wait.lock().unwrap().recv_timeout(Duration::from_secs(3)).unwrap();true});
+        let port=free_port();
+        let forwarder=Forwarder::with_answer_hook(SocketAddrV4::new(Ipv4Addr::LOCALHOST,port),53,Duration::from_millis(500),vec!["direct.example".into()],Upstreams{tunnel:vec![],local:vec![format!("127.0.0.1:{upstream}")],physical_if:None,tunnel_if:None},None,Some(hook));
+        forwarder.start().unwrap();
+        let client=UdpSocket::bind("127.0.0.1:0").unwrap();client.send_to(&query("direct.example",TYPE_A,1),("127.0.0.1",port)).unwrap();
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        forwarder.stop();
+        let rebound=UdpSocket::bind(("127.0.0.1",port));
+        release.send(()).unwrap();
+        assert!(rebound.is_ok(),"stop retained the UDP listener through an outstanding policy acknowledgement: {:?}",rebound.err());
+    }
+
+    #[test]
+    fn restart_works_before_old_dns_ack_finishes_and_discards_its_answer() {
+        let (upstream, _) = fake_udp([203, 0, 113, 9], false);
+        let (entered, ready) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let wait = Mutex::new(wait);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let hook: AnswerHook = Box::new(move |_| {
+            if first.swap(false, Ordering::AcqRel) {
+                entered.send(()).unwrap();
+                wait.lock().unwrap().recv_timeout(Duration::from_secs(3)).unwrap();
+                finished.send(()).unwrap();
+            }
+            true
+        });
+        let port = free_port();
+        let forwarder = Forwarder::with_answer_hook(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_millis(200),
+            vec!["direct.example".into()],
+            Upstreams { tunnel: vec![], local: vec![format!("127.0.0.1:{upstream}")], physical_if: None, tunnel_if: None },
+            None, Some(hook),
+        );
+        forwarder.start().unwrap();
+        let old = UdpSocket::bind("127.0.0.1:0").unwrap();
+        old.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        old.send_to(&query("direct.example", TYPE_A, 1), ("127.0.0.1", port)).unwrap();
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let old_session = forwarder.listening.lock().unwrap().as_ref().unwrap().replies.clone();
+        let began = Instant::now();
+        forwarder.stop();
+        assert!(began.elapsed() < Duration::from_secs(1), "stop must not wait for an engine acknowledgement");
+        forwarder.start().unwrap();
+        let new_answer = ask(&query("new.direct.example", TYPE_A, 2), port).unwrap();
+        assert_eq!(ipv4_answers(&new_answer), vec![Ipv4Addr::new(203, 0, 113, 9)]);
+        // Even a job not yet started when stop ran cannot enter the new
+        // session or query its upstream using old work.
+        assert!(forwarder.inner.resolve_in_session(&query("direct.example", TYPE_A, 3), Some(&old_session.active)).is_none());
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(old.recv_from(&mut [0; 512]).is_err(), "old listener must never publish through its successor");
+        forwarder.stop();
+        assert!(UdpSocket::bind(("127.0.0.1", port)).is_ok());
+    }
+
+    #[test]
+    fn old_tcp_client_cannot_query_the_restarted_forwarder() {
+        let (upstream, queries) = fake_udp([203, 0, 113, 9], false);
+        let port = free_port();
+        let forwarder = Forwarder::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_millis(200),
+            vec!["direct.example".into()],
+            Upstreams { tunnel: vec![], local: vec![format!("127.0.0.1:{upstream}")], physical_if: None, tunnel_if: None }, None,
+        );
+        forwarder.start().unwrap();
+        let mut old = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        old.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while forwarder.inner.inflight.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "TCP client was not accepted");
+            std::thread::yield_now();
+        }
+        forwarder.stop();
+        forwarder.start().unwrap();
+        write_framed(&mut old, &query("direct.example", TYPE_A, 1)).unwrap();
+        assert!(read_framed(&mut old).is_none());
+        assert_eq!(queries.load(Ordering::Acquire), 0, "old TCP client must not use the new session's upstream");
+        assert!(ask(&query("direct.example", TYPE_A, 2), port).is_some());
+        assert_eq!(queries.load(Ordering::Acquire), 1);
+        forwarder.stop();
+    }
+
+    #[test]
+    fn concurrent_start_stop_and_failed_start_leave_no_listener() {
+        let port = free_port();
+        let forwarder = Arc::new(Forwarder::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), 53, Duration::from_millis(50), vec![],
+            Upstreams { tunnel: vec![], local: vec![], physical_if: None, tunnel_if: None }, None,
+        ));
+        let users: Vec<_> = (0..4).map(|_| {
+            let forwarder = forwarder.clone();
+            std::thread::spawn(move || for _ in 0..10 { forwarder.start().unwrap(); forwarder.stop(); })
+        }).collect();
+        for user in users { user.join().unwrap(); }
+        forwarder.stop();
+        let occupied = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        assert!(forwarder.start().is_err());
+        assert!(!forwarder.inner.settings.read().unwrap().enabled);
+        assert!(forwarder.listening.lock().unwrap().is_none());
+        drop(occupied);
+        forwarder.start().unwrap();
+        forwarder.stop();
+        assert!(UdpSocket::bind(("127.0.0.1", port)).is_ok());
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
+    }
+
 }
