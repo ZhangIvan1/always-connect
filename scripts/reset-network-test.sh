@@ -21,6 +21,7 @@ for address in 10.0.0.1 172.16.0.1 192.168.1.2 203.0.113.9 10.20.0.0/16; do
   if native_route_entry "$address" 1 '203.0.113.8'; then echo 'ordinary private/unicast entry rejected'; exit 1; fi
 done
 native_route_entry '203.0.113.9' 0 ''
+native_route_entry '203.0.113.8/32' 1 $'127.0.0.1\n203.0.113.8\n10.8.0.2'
 
 run() { printf '%s\n' "$*" >> "$WORK/calls"; }
 scope_interface_identity() { [ "${TEST_UNKNOWN:-}" != 1 ] || return 2; printf '%s\n' "${TEST_IDENTITY:-107 10.8.0.2}"; }
@@ -99,5 +100,17 @@ if retire_direct_routes "$WORK/direct" boot-1 1 '';then echo 'interrupted deleti
 direct_route_table() { printf 'Destination Gateway Flags Netif Expire\n'; }
 retire_direct_routes "$WORK/direct" boot-1 1 ''
 [ ! -e "$WORK/direct" ]
+# A failed system validator must keep its delete authority pending.
+native_definition=$(declare -f native_route_entry)
+printf '#!/bin/bash\nexit 2\n' > "$WORK/failed-awk"
+chmod +x "$WORK/failed-awk"
+failed_awk_command="\"$WORK/failed-awk\""
+eval "${native_definition/\/usr\/bin\/awk/$failed_awk_command}"
+direct_route_table() { printf 'Destination Gateway Flags Netif Expire\n203.0.113.9 192.168.1.1 UGHS en0\n'; }
+: > "$WORK/direct-calls"
+printf 'boot boot-1\n203.0.113.9 192.168.1.1\n' > "$WORK/direct"
+if retire_direct_routes "$WORK/direct" boot-1 1 ''; then echo 'failed native validator authorized deletion'; exit 1; fi
+[ ! -s "$WORK/direct-calls" ] && grep -q '203.0.113.9' "$WORK/direct"
+eval "$native_definition"
 bash -n "$ROOT/scripts/reset-network.sh"
 echo 'PASS emergency scoped-route recovery, boot/interface ownership and invalid journal rejection (stubbed)'

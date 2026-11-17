@@ -50,7 +50,9 @@ run() {
 # Read only our private journal; never source it or interpolate commands.
 # Return success for entries that must retain native/system routing.
 native_route_entry() {
-    /usr/bin/awk -v entry="$1" -v known="$2" -v own="$3" 'BEGIN {
+    local addresses="${3//$'\n'/ }"
+    addresses="${addresses//$'\r'/ }"
+    /usr/bin/awk -v entry="$1" -v known="$2" -v own="$addresses" 'BEGIN {
       if(known!=1) exit 0
       parts=split(entry,p,"/"); count=split(p[1],o,".")
       if(count!=4 || parts>2) exit 0
@@ -116,7 +118,9 @@ retire_direct_routes() {
         line="$ip $gw";[ "$kind" = active ] || line="$kind $line"
         if [ "$known" != 1 ];then pending="$pending$line
 ";continue;fi
-        if native_route_entry "$ip" "$known" "$own";then retired=$((retired+1));continue;fi
+        if native_route_entry "$ip" "$known" "$own";then retired=$((retired+1));continue;else native_status=$?;fi
+        if [ "$native_status" != 1 ];then pending="$pending$line
+";continue;fi
         if direct_route_owner "$ip" "$gw";then owner=0;else owner=$?;fi
         if [ "$owner" = 1 ];then retired=$((retired+1));continue;fi
         if [ "$kind" != active ] || [ "$owner" = 2 ];then pending="$pending$line
