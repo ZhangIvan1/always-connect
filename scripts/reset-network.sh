@@ -18,7 +18,7 @@
 #     they keep a dead tunnel "primary" and DNS pointed into it. A live
 #     utun's entries (another VPN's) are kept. Then flush the DNS cache
 #   5 pf: empty our anchor, release our pf enable reference
-#   6 verify; only if the web still fails, disable pf as a last resort
+#   6 verify; a failed web probe never authorizes disabling shared pf
 #
 # Usage:
 #   sudo scripts/reset-network.sh            (or double-click the Desktop copy)
@@ -326,13 +326,6 @@ if webok; then
     echo "== 网络已恢复：默认路由 $(route -n get default 2>/dev/null | awk '/interface:/{print $2}')，网页可以打开。"
     exit 0
 fi
-say "web still failing: disable pf as a last resort"
-pfctl -d >/dev/null 2>&1 || true
-sleep 2
-if webok; then
-    echo "== 网络已恢复（关闭了系统防火墙 pf；重启电脑后会恢复原状）。"
-    exit 0
-fi
-echo "== 我们的设置已全部清掉，但网页仍打不开：请检查 Wi-Fi/网线，或重启电脑。"
+echo "== AlwaysConnect 的恢复操作已执行，但尚未确认网络可用；保留系统及其他 VPN 的过滤规则。"
 echo "   当前默认路由：$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
 exit 1
