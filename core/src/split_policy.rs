@@ -13,6 +13,13 @@ struct Claims {
     // change can release that name's veto, never another name's veto.
     vpn: HashSet<Ipv4Addr>,
 }
+impl Claims {
+    /// Distinct addresses this name holds. A VPN answer's address sits in both
+    /// `current` and `vpn`; counting it twice halved the budget (§61.3).
+    fn size(&self) -> usize {
+        self.vpn.len() + self.current.iter().filter(|(ip, _)| !self.vpn.contains(ip)).count()
+    }
+}
 #[derive(Default)]
 pub struct SplitPolicy {
     names: HashMap<String, Claims>,
@@ -35,11 +42,11 @@ impl SplitPolicy {
         // entries still retire their grants and keep historical VPN vetoes.
         let empty_name=observation.is_empty().then(||name.clone());
         let claims = self.names.entry(name).or_default();
-        let old_size=claims.current.len()+claims.vpn.len();
+        let old_size=claims.size();
         let affected:HashSet<_>=claims.current.iter().chain(observation.iter()).filter(|(_,allowed)|*allowed).map(|(ip,_)|*ip).collect();
         claims.vpn.extend(addresses.iter().filter(|ip| !direct.contains(ip)).copied());
         claims.current=observation;
-        self.associations=self.associations-old_size+claims.current.len()+claims.vpn.len();
+        self.associations=self.associations-old_size+claims.size();
         if claims.current.is_empty() && claims.vpn.is_empty() {
             if let Some(name)=empty_name {self.names.remove(&name);}
         }
@@ -81,7 +88,7 @@ impl SplitPolicy {
             }
         }
         self.names.retain(|_,claims|!claims.current.is_empty()||!claims.vpn.is_empty());
-        self.associations=self.names.values().map(|c|c.current.len()+c.vpn.len()).sum();
+        self.associations=self.names.values().map(Claims::size).sum();
         self.enforce_limit();
         if !self.saturated {
             let veto:HashSet<_>=self.names.values().flat_map(|c|c.vpn.iter().copied()).collect();
@@ -105,6 +112,22 @@ mod tests {
         assert_eq!(policy.direct(),HashSet::from([ip(9).to_string()]));
     }
 
+    #[test]
+    fn vpn_answers_count_each_address_once_against_the_budget() {
+        let mut p = SplitPolicy::default();
+        p.observe("direct.example".into(), &[Ipv4Addr::new(198,51,100,1)], &[Ipv4Addr::new(198,51,100,1)]);
+        // 4000 ordinary VPN names with two addresses each: 8000 distinct
+        // addresses, below the 8192 budget once each is counted once.
+        for n in 0..4000u32 {
+            let ips: Vec<_> = (0..2).map(|k| Ipv4Addr::from(0x0a00_0000 + n * 4 + k)).collect();
+            p.observe(format!("vpn{n}.example"), &ips, &[]);
+        }
+        assert!(!p.is_saturated(), "a VPN address must not be charged twice");
+        assert!(p.direct().contains("198.51.100.1"));
+        // Rotation still grows history, and the bound still holds.
+        for n in 0..200u32 { p.observe("rotating.example".into(), &[Ipv4Addr::from(0x0b00_0000 + n)], &[]); }
+        assert!(p.is_saturated() && p.direct().is_empty());
+    }
     #[test]
     fn removing_and_editing_rules_revokes_old_grants() {
         let mut p = SplitPolicy::default();
@@ -178,8 +201,14 @@ mod tests {
         let mut p = SplitPolicy::default();
         for n in 0..4096 { p.observe(format!("{n}.example"), &[ip(1), ip(2)], &[ip(1), ip(2)]); }
         assert!(!p.saturated);
+        let before = p.associations;
         p.revalidate(&SplitRules::new::<&str>(&[]));
-        assert!(p.saturated && p.names.is_empty());
+        // A revoked grant becomes that name's VPN veto: the same address, so
+        // the distinct count (and the memory bound it implies) cannot grow.
+        assert_eq!(p.associations, before);
+        assert!(p.direct().is_empty() && !p.saturated);
+        p.observe("one-more.example".into(), &[ip(3)], &[]);
+        assert!(p.saturated && p.names.is_empty(), "the bound still applies after revalidation");
     }
     #[test]
     fn saturation_revokes_instead_of_forgetting_vpn_conflicts() {
