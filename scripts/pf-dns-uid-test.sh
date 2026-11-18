@@ -48,7 +48,9 @@ PORT=$(head -1 "$WORK/port")
 [ -n "$PORT" ]
 # Use the production generator, isolating only its physical DNS barrier. The
 # loopback pass is intentionally omitted to exercise UID matching on localhost.
-"$HELPER" generate-pf --phys en0 --tun utun5 --gateway 203.0.113.1 --dns 127.0.0.1 --direct-table \
+# Both probes target loopback, so the isolated root permission must match
+# that same interface. Using en0 here tests an interface mismatch, not UID.
+"$HELPER" generate-pf --phys lo0 --tun utun5 --gateway 203.0.113.1 --dns 127.0.0.1 --direct-table \
   | awk '/port 53 user root no state$/ || /^block drop out quick proto .* to any port 53$/ { print }' \
   | sed -e "s/port 53/port $PORT/g" -e 's/to any port/to 127.0.0.1 port/g' > "$WORK/rules"
 grep -q 'user root' "$WORK/rules"
