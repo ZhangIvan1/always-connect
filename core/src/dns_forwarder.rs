@@ -51,6 +51,12 @@ const WORKER_STACK: usize = 128 * 1024;
 const WORKER_IDLE: Duration = Duration::from_secs(30);
 /// Recently answered addresses kept for the connections page (§28.7).
 const NAME_CACHE_LIMIT: usize = 4096;
+/// Root DNS on the physical network leaves only from this source-port range
+/// (§61.1). The PF exception names the same range, so another root process or
+/// a system extension re-sending an ordinary user's query cannot match it.
+/// Below the macOS ephemeral range: only explicit binders use these ports.
+pub const PHYSICAL_DNS_SOURCE_PORTS: (u16, u16) = (46600, 46855);
+static NEXT_SOURCE_PORT: AtomicUsize = AtomicUsize::new(0);
 
 // MARK: - Wire format (RFC 1035), just enough for the forwarder
 
@@ -560,8 +566,26 @@ fn upstream_socket(ty: Type, interface: Option<&InterfaceBinding>) -> Option<Soc
     let _ = s.set_nosigpipe(true);
     if let Some(name) = interface {
         name.bind(&s)?;
+        if name.pinned_source { bind_physical_source(&s)?; }
     }
     Some(s)
+}
+
+/// Exclusive bind within the PF-named range; no SO_REUSEADDR, so a port still
+/// held (including TCP TIME_WAIT) moves on. Exhaustion fails closed.
+fn bind_physical_source(socket: &Socket) -> Option<()> {
+    let (low, high) = PHYSICAL_DNS_SOURCE_PORTS;
+    let size = usize::from(high - low) + 1;
+    let start = NEXT_SOURCE_PORT.fetch_add(1, Ordering::Relaxed);
+    for offset in 0..size {
+        let port = low + ((start + offset) % size) as u16;
+        match socket.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))) {
+            Ok(()) => return Some(()),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => continue,
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Resolve the interface once per configuration generation. Repeating
@@ -573,19 +597,25 @@ struct InterfaceBinding {
     index: std::num::NonZeroU32,
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     name: String,
+    /// Physical DNS: also bind a source port from PHYSICAL_DNS_SOURCE_PORTS.
+    pinned_source: bool,
 }
 impl InterfaceBinding {
     fn new(name: &str) -> Option<Self> {
         let c = std::ffi::CString::new(name).ok()?;
         let index = std::num::NonZeroU32::new(unsafe { libc::if_nametoindex(c.as_ptr()) })?;
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        { Some(Self { index }) }
+        { Some(Self { index, pinned_source: false }) }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        { let _ = index; Some(Self { name: name.into() }) }
+        { let _ = index; Some(Self { name: name.into(), pinned_source: false }) }
+    }
+    /// The physical interface, for root DNS covered by the PF source-port exception.
+    fn physical(name: &str) -> Option<Self> {
+        Self::new(name).map(|binding| Self { pinned_source: true, ..binding })
     }
     fn pinned(name: &str, index: u32) -> Option<Self> {
         #[cfg(any(target_os="macos",target_os="ios"))]
-        { let _=name; Some(Self {index:std::num::NonZeroU32::new(index)?}) }
+        { let _=name; Some(Self {index:std::num::NonZeroU32::new(index)?,pinned_source:false}) }
         #[cfg(not(any(target_os="macos",target_os="ios")))]
         { let c=std::ffi::CString::new(name).ok()?; if unsafe{libc::if_nametoindex(c.as_ptr())}!=index{return None;} Self::new(name) }
     }
@@ -791,7 +821,7 @@ pub(crate) fn resolve_gateway_with(permit: &GatewayPermit, host: &str, servers: 
     if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut id)).is_err() {return vec![];}
     query[..2].copy_from_slice(&id);
     let servers: Vec<_>=servers.iter().take(2).cloned().collect();
-    let Some(binding)=InterfaceBinding::new(physical_if) else {return vec![]};
+    let Some(binding)=InterfaceBinding::physical(physical_if) else {return vec![]};
     let Some(left)=remaining(permit.deadline) else {return vec![]};
     let slots=(servers.len().max(1)*2) as u32;
     let Some(answer)=exchange_until(&query,&servers,53,Some(&binding),left/slots,permit.deadline) else {return vec![]};
@@ -1086,7 +1116,7 @@ impl Forwarder {
 
     pub fn with_answer_hook(listen: SocketAddrV4, upstream_port: u16, timeout: Duration,
         direct: Vec<String>, upstreams: Upstreams, on_direct: Option<DirectHook>, on_answer: Option<AnswerHook>) -> Self {
-        let physical_binding = upstreams.physical_if.as_deref().and_then(InterfaceBinding::new);
+        let physical_binding = upstreams.physical_if.as_deref().and_then(InterfaceBinding::physical);
         let tunnel_binding = upstreams.tunnel_if.as_deref().and_then(InterfaceBinding::new);
         Forwarder {
             inner: Arc::new(Inner {
@@ -1127,7 +1157,7 @@ impl Forwarder {
     fn update_upstreams(&self, upstreams: Upstreams, pinned: Option<u32>, require_pin: bool) {
         let mut settings=self.inner.settings.write().unwrap();
         self.inner.acknowledged.lock().unwrap().clear();
-        settings.physical_binding=upstreams.physical_if.as_deref().and_then(InterfaceBinding::new);
+        settings.physical_binding=upstreams.physical_if.as_deref().and_then(InterfaceBinding::physical);
         settings.tunnel_binding=upstreams.tunnel_if.as_deref().and_then(|name| {
             if require_pin {pinned.and_then(|index|InterfaceBinding::pinned(name,index))}
             else {InterfaceBinding::new(name)}
@@ -1721,6 +1751,42 @@ mod tests {
         u.join().unwrap(); t.join().unwrap();
         assert_eq!(dhcp_dns(&[192,168,1,1,192,168,1,2]),vec!["192.168.1.1","192.168.1.2"]);
         assert!(dhcp_dns(&[1,2,3]).is_empty());
+    }
+
+    #[test]
+    fn physical_dns_leaves_only_from_the_pf_source_ports() {
+        // UDP and the TCP fallback both use the PF-named source range on the
+        // physical binding; tunnel DNS keeps ordinary ephemeral ports.
+        let (low, high) = PHYSICAL_DNS_SOURCE_PORTS;
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let tcp = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let peers = Arc::new(Mutex::new(Vec::<u16>::new()));
+        let seen = Arc::clone(&peers);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = server.recv_from(&mut buf) {
+                seen.lock().unwrap().push(from.port());
+                let _ = server.send_to(&answer(&buf[..n], [198, 51, 100, 7], true), from);
+            }
+        });
+        let tcp_peers = Arc::clone(&peers);
+        std::thread::spawn(move || {
+            for mut client in tcp.incoming().flatten() {
+                tcp_peers.lock().unwrap().push(client.peer_addr().unwrap().port());
+                if let Some(q) = read_framed(&mut client) { let _ = write_framed(&mut client, &answer(&q, [198, 51, 100, 7], false)); }
+            }
+        });
+        let q = query("direct.example", TYPE_A, 9);
+        let physical = InterfaceBinding::physical(loopback_interface()).unwrap();
+        let reply = exchange_bound(&q, &[format!("127.0.0.1:{port}")], 53, Some(&physical), Duration::from_secs(1)).unwrap();
+        assert!(!is_truncated(&reply), "the truncated UDP answer must be retried over TCP");
+        let pinned = std::mem::take(&mut *peers.lock().unwrap());
+        assert_eq!(pinned.len(), 2, "one UDP and one TCP exchange");
+        assert!(pinned.iter().all(|p| (low..=high).contains(p)), "physical DNS left from {pinned:?}");
+        let tunnel = InterfaceBinding::new(loopback_interface()).unwrap();
+        exchange_bound(&q, &[format!("127.0.0.1:{port}")], 53, Some(&tunnel), Duration::from_secs(1)).unwrap();
+        assert!(peers.lock().unwrap().iter().all(|p| !(low..=high).contains(p)), "tunnel DNS does not need the physical exception");
     }
 
     #[test]

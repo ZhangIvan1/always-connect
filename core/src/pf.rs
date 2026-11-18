@@ -227,8 +227,12 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
         for ip in &tunnel_dns_servers {
             out.push_str(&format!("pass out quick on {} proto {{ udp tcp }} to {ip} port 53{sender} no state\n", input.tunnel_if));
         }
+        // Root alone is not enough: a system extension running as root can
+        // re-send an ordinary user's query. Only the forwarder's source ports
+        // (dns_forwarder::PHYSICAL_DNS_SOURCE_PORTS) match (§61.1).
+        let (low, high) = crate::dns_forwarder::PHYSICAL_DNS_SOURCE_PORTS;
         for ip in &dns_servers {
-            out.push_str(&format!("pass out quick on {phys} proto {{ udp tcp }} to {ip} port 53 user root no state\n"));
+            out.push_str(&format!("pass out quick on {phys} proto {{ udp tcp }} from any port {low}:{high} to {ip} port 53 user root no state\n"));
         }
         out.push_str("block drop out quick proto { udp tcp } to any port 53\n");
     }
@@ -288,6 +292,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn physical_dns_exception_requires_the_forwarder_source_ports() {
+        // A root system extension re-sending a user's query uses its own
+        // ports; root identity alone must not open the physical DNS path.
+        let mut input = secure_input(); input.strict_dns = true; input.direct_table = true;
+        input.dns_servers = vec!["192.168.1.1".into()];
+        let text = generate(&input).unwrap();
+        let (low, high) = crate::dns_forwarder::PHYSICAL_DNS_SOURCE_PORTS;
+        let physical: Vec<_> = text.lines().filter(|l| l.contains(" on en0 ") && l.contains("port 53")).collect();
+        assert_eq!(physical, vec![format!("pass out quick on en0 proto {{ udp tcp }} from any port {low}:{high} to 192.168.1.1 port 53 user root no state").as_str()]);
+        assert!(high < 49152 && low > 1023, "outside privileged and macOS ephemeral ports");
+    }
+
+    #[test]
     fn ipv6_cannot_use_the_dhcp_exception_and_lan_discovery_is_retained() {
         let text = generate(&secure_input()).unwrap();
         assert!(text.contains("pass out quick inet proto udp from any port 68 to any port 67"));
@@ -318,7 +335,7 @@ mod tests {
             for allowed in [
                 "on lo0 inet proto { udp tcp } to 127.0.0.0/8 port 53 no state",
                 "on lo0 inet6 proto { udp tcp } to ::1 port 53 no state",
-                "on en0 proto { udp tcp } to 192.168.1.1 port 53 user root no state",
+                "on en0 proto { udp tcp } from any port 46600:46855 to 192.168.1.1 port 53 user root no state",
             ] {
                 assert!(text.find(allowed).is_some_and(|at|at<deny),
                     "local clients and the root forwarder must retain their explicit DNS paths: {allowed}");
@@ -496,10 +513,10 @@ pass out quick on en0 all\n";
         let first_rule = text.find("pass out quick ").unwrap();
         assert!(table < first_rule, "tables come before rules");
         assert_eq!(
-            text.matches("pass out quick on en0 proto { udp tcp } to 192.168.1.1 port 53 user root no state\n").count(),
+            text.matches("pass out quick on en0 proto { udp tcp } from any port 46600:46855 to 192.168.1.1 port 53 user root no state\n").count(),
             1
         );
-        assert!(text.contains("pass out quick on en0 proto { udp tcp } to fd00::1 port 53 user root no state\n"));
+        assert!(text.contains("pass out quick on en0 proto { udp tcp } from any port 46600:46855 to fd00::1 port 53 user root no state\n"));
         let direct = text.find("pass out quick to <ac_direct> no state\n").expect("direct pass");
         assert!(direct < text.find("block drop out quick all").unwrap());
         assert!(!text.contains("pass out quick proto { udp tcp } to any port 53"), "no blanket DNS pass in split mode");
