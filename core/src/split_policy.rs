@@ -26,13 +26,23 @@ impl SplitPolicy {
     pub fn observe(&mut self, name: String, addresses: &[Ipv4Addr], direct: &[Ipv4Addr]) -> bool {
         if self.saturated { return false; }
         let observation: Vec<_> = addresses.iter().map(|ip| (*ip, direct.contains(ip) && crate::direct_routes::ordinary_unicast(*ip))).collect();
-        if self.names.get(&name).is_some_and(|c| c.current == observation) { return false; }
+        match self.names.get(&name) {
+            Some(claims) if claims.current==observation => return false,
+            None if observation.is_empty() => return false,
+            _=>{},
+        }
+        // An address-free answer has no new ownership to retain. Existing
+        // entries still retire their grants and keep historical VPN vetoes.
+        let empty_name=observation.is_empty().then(||name.clone());
         let claims = self.names.entry(name).or_default();
         let old_size=claims.current.len()+claims.vpn.len();
         let affected:HashSet<_>=claims.current.iter().chain(observation.iter()).filter(|(_,allowed)|*allowed).map(|(ip,_)|*ip).collect();
         claims.vpn.extend(addresses.iter().filter(|ip| !direct.contains(ip)).copied());
         claims.current=observation;
         self.associations=self.associations-old_size+claims.current.len()+claims.vpn.len();
+        if claims.current.is_empty() && claims.vpn.is_empty() {
+            if let Some(name)=empty_name {self.names.remove(&name);}
+        }
         let mut changed=false;
         for ip in addresses.iter().filter(|ip|!direct.contains(ip)) {changed|=self.permitted.remove(ip);}
         if self.enforce_limit() {return true;}
@@ -70,6 +80,7 @@ impl SplitPolicy {
                 *direct &= keep;
             }
         }
+        self.names.retain(|_,claims|!claims.current.is_empty()||!claims.vpn.is_empty());
         self.associations=self.names.values().map(|c|c.current.len()+c.vpn.len()).sum();
         self.enforce_limit();
         if !self.saturated {
@@ -142,10 +153,28 @@ mod tests {
         assert!(p.direct().is_empty(), "another VPN name still vetoes the shared address");
     }
     #[test]
-    fn empty_dns_answers_are_bounded_and_rule_revocation_cannot_expand_without_limit() {
+    fn empty_dns_answers_do_not_consume_address_ownership_capacity() {
         let mut empty = SplitPolicy::default();
+        empty.observe("active.example".into(), &[ip(9)], &[ip(9)]);
         for n in 0..4097 { empty.observe(format!("{n}.example"), &[], &[]); }
-        assert!(empty.saturated && empty.names.is_empty());
+        assert!(!empty.saturated, "address-free answers must not force unrelated direct traffic back into VPN");
+        assert_eq!(empty.names.len(),1);
+        assert!(empty.allows(&ip(9)));
+    }
+    #[test]
+    fn empty_refresh_retires_unused_claims_but_retains_historical_vpn_vetoes() {
+        let mut p=SplitPolicy::default();
+        p.observe("direct.example".into(),&[ip(1)],&[ip(1)]);
+        assert!(p.observe("direct.example".into(),&[],&[]));
+        assert!(p.names.is_empty());assert!(p.direct().is_empty());
+        p.observe("vpn.example".into(),&[ip(2)],&[]);
+        p.observe("vpn.example".into(),&[],&[]);
+        p.observe("other-direct.example".into(),&[ip(2)],&[ip(2)]);
+        assert!(!p.allows(&ip(2)),"empty refresh must not forget an earlier VPN conflict");
+        assert!(p.names.contains_key("vpn.example"));
+    }
+    #[test]
+    fn rule_revocation_cannot_expand_associations_without_limit() {
         let mut p = SplitPolicy::default();
         for n in 0..4096 { p.observe(format!("{n}.example"), &[ip(1), ip(2)], &[ip(1), ip(2)]); }
         assert!(!p.saturated);
