@@ -44,6 +44,39 @@ fn expand_sets(text: &str) -> Vec<String> {
     let Some(b) = text[a..].find('}').map(|b| b + a) else { return vec![text.into()] };
     text[a + 1..b].split_whitespace().flat_map(|v| expand_sets(&format!("{}{}{}", &text[..a], v.trim_end_matches(','), &text[b + 1..]))).collect()
 }
+fn address_range(text:&str)->Option<(u128,u128)> {
+    let (address,prefix)=text.split_once('/').map(|(a,p)|(a,Some(p))).unwrap_or((text,None));
+    let ip=address.parse::<std::net::IpAddr>().ok()?;
+    let (value,bits)=match ip {std::net::IpAddr::V4(ip)=>(u32::from(ip) as u128,32),std::net::IpAddr::V6(ip)=>(u128::from(ip),128)};
+    let prefix=if let Some(p)=prefix {p.parse::<u32>().ok()?} else {bits};
+    if prefix>bits {return None;}
+    let host=bits-prefix;let mask=if host==128 {u128::MAX} else {(1u128<<host)-1};
+    Some((value&!mask,value|mask))
+}
+/// The optimizer also removes covered prefixes and may combine adjacent
+/// addresses. Compare their exact union, keeping every other rule field.
+fn normalized_passes(passes:&mut Vec<String>)->Vec<String> {
+    let mut groups=std::collections::BTreeMap::<String,Vec<(u128,u128)>>::new();let mut out=Vec::new();
+    for rule in passes.drain(..) {
+        let mut words:Vec<_>=rule.split_whitespace().collect();
+        let target=words.iter().position(|w|*w=="to").map(|i|i+1);
+        if let Some(at)=target.filter(|i|*i<words.len()) {
+            if let Some(range)=address_range(words[at]) {
+                words[at]="<address-union>";groups.entry(words.join(" ")).or_default().push(range);continue;
+            }
+        }
+        out.push(rule);
+    }
+    for (key,mut ranges) in groups {
+        ranges.sort_unstable();let mut merged:Vec<(u128,u128)>=Vec::new();
+        for (lo,hi) in ranges {
+            if let Some(last)=merged.last_mut().filter(|last|lo<=last.1.saturating_add(1)) {last.1=last.1.max(hi);}
+            else {merged.push((lo,hi));}
+        }
+        for (lo,hi) in merged {out.push(format!("{key} [{lo}-{hi}]"));}
+    }
+    out.sort();out.dedup();out
+}
 /// Accept pfctl's normal formatting, not arbitrary extra rules. The generated
 /// quick blocks keep their ordering barriers; pass expansion within a barrier is immaterial.
 fn canonical_rules(text: &str) -> Vec<String> {
@@ -81,15 +114,52 @@ fn canonical_rules(text: &str) -> Vec<String> {
     // barrier may be reordered by pfctl's set expansion.
     let mut ordered = Vec::new(); let mut passes = Vec::new();
     for rule in out {
-        if rule.contains(" block ") { passes.sort(); passes.dedup(); ordered.append(&mut passes); ordered.push(rule); }
+        if rule.contains(" block ") { ordered.extend(normalized_passes(&mut passes)); ordered.push(rule); }
         else { passes.push(rule); }
     }
-    passes.sort(); passes.dedup(); ordered.append(&mut passes); ordered
+    ordered.extend(normalized_passes(&mut passes)); ordered
 }
 fn rules_match(actual: &str, expected: &str) -> bool {
     let lines: Vec<_> = actual.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     lines.last().is_some_and(|l| l.starts_with("block drop out quick") && (l.contains(" all") || l.contains("from any to any")))
         && canonical_rules(actual) == canonical_rules(expected)
+}
+/// PF may fold literal destinations into automatic tables. Read their actual
+/// members in our anchor; the table name alone is never evidence of a match.
+fn expand_loaded_tables(text:&str, get:&mut impl FnMut(&str,&[&str])->Output)->Option<String> {
+    let mut names=BTreeSet::new();
+    for line in text.lines() {
+        let words:Vec<_>=line.split_whitespace().collect();
+        let mut count=0;
+        for (at,word) in words.iter().enumerate() {
+            if !word.starts_with("<__automatic_") {continue;}
+            count+=1;
+            let name=word.strip_prefix('<')?.strip_suffix('>')?;
+            if count>1 || at==0 || words[at-1]!="to" || name.len()>96
+                || !name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_') {return None;}
+            names.insert(name.to_owned());
+        }
+    }
+    if names.len()>8 {return None;}
+    let mut expanded=text.to_owned();let mut budget=8192usize;
+    for name in names {
+        let loaded=get("/sbin/pfctl",&["-a",crate::pf::ANCHOR,"-t",&name,"-T","show"]);
+        if !loaded.ok {return None;}
+        let members:Vec<_>=loaded.text.split_whitespace().collect();
+        if members.is_empty() || members.len()>4096 {return None;}
+        for member in &members {
+            let (address,prefix)=member.split_once('/').map(|(a,p)|(a,Some(p))).unwrap_or((member,None));
+            let address=address.parse::<std::net::IpAddr>().ok()?;
+            if let Some(prefix)=prefix {
+                let max=if address.is_ipv4(){32}else{128};
+                if prefix.parse::<u32>().ok()?>max {return None;}
+            }
+        }
+        let token=format!("<{name}>");
+        budget=budget.checked_sub(expanded.matches(&token).count().checked_mul(members.len())?)?;
+        expanded=expanded.replace(&token,&format!("{{ {} }}",members.join(" ")));
+    }
+    Some(expanded)
 }
 fn destination(value: &str) -> Option<(u32, u32)> {
     let (ip, bits) = value.split_once('/').map(|(a,b)| (a, b.parse().ok())).unwrap_or((value, None));
@@ -197,7 +267,8 @@ pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Ou
     let info = get("/sbin/pfctl", &["-s", "info"]);
     let enabled=info.ok&&info.text.contains("Status: Enabled");
     let reachable=if expected.protection {anchor_chain(&mut get)} else {false};
-    let configured=pf.ok&&expected.rules.as_ref().is_some_and(|r|rules_match(&pf.text,r));
+    let actual_rules=if pf.ok {expand_loaded_tables(&pf.text,&mut get)} else {None};
+    let configured=actual_rules.as_ref().zip(expected.rules.as_ref()).is_some_and(|(a,e)|rules_match(a,e));
     let effective=enabled&&reachable&&configured;
     if expected.protection {
         result.push(item("实际防火墙配置与当前策略一致", effective && expected.error.is_none(), "完整核对实际规则；多放行、旧网卡、旧 DNS 和系统操作失败都不能通过"));
@@ -212,7 +283,8 @@ pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Ou
             let words: Vec<_> = line.split_whitespace().collect();
             words.windows(2).any(|w| w[0] == "on" && w[1].starts_with("utun") && w[1] != tunnel)
         });
-        result.push(item("仅当前 VPN 隧道可作为出口", pf.ok && !other_tunnel, "规则仍允许其他 VPN 隧道，请避免同时启用其他隧道"));
+        let mut compatibility=item("其他 VPN 隧道兼容", pf.ok && !other_tunnel, "保留其他隧道的兼容放行；本项目不接管其他 VPN，不承诺整机唯一出口");
+        compatibility.informational=true;result.push(compatibility);
         if expected.split {
             let table = get("/sbin/pfctl", &["-a", crate::pf::ANCHOR, "-t", crate::pf::DIRECT_TABLE, "-T", "show"]);
             let actual: BTreeSet<_> = table.text.split_whitespace().map(str::to_owned).collect();
@@ -312,8 +384,8 @@ mod tests {
     #[test]
     fn loaded_config_not_cached_intent_determines_the_verdict() {
         let e=expected(); let good=run_with(&e,|p,a|fixture(&e,p,a));
-        assert!(good.iter().filter(|i|i.item!="仅当前 VPN 隧道可作为出口").all(|i|i.passed));
-        assert!(!good.iter().find(|i|i.item=="仅当前 VPN 隧道可作为出口").unwrap().passed);
+        assert!(good.iter().filter(|i|!i.informational).all(|i|i.passed));
+        assert!(!good.iter().find(|i|i.item=="其他 VPN 隧道兼容").unwrap().passed);
         for corruption in ["route","dns","rules","table","gateway","info","netstat"] {
             let rows=run_with(&e,|p,a|{
                 let mut out=fixture(&e,p,a);
@@ -325,8 +397,29 @@ mod tests {
                     || (corruption=="netstat"&&p.ends_with("netstat")) {out.text="stale or unavailable".into();}
                 out
             });
-            assert!(rows.iter().filter(|i|i.item!="仅当前 VPN 隧道可作为出口").any(|i|!i.passed),"{corruption}");
+            assert!(rows.iter().filter(|i|!i.informational).any(|i|!i.passed),"{corruption}");
         }
+    }
+    #[test]
+    fn optimized_address_tables_require_the_actual_members_and_keep_dns_barriers() {
+        let mut e=expected();
+        let source=e.rules.as_ref().unwrap().replace("pass out quick to 192.168.0.0/16 no state",
+            "pass out quick to 192.168.0.0/16 no state\npass out quick to 192.168.1.0/24 no state");
+        e.rules=Some(source.clone());
+        let optimized=source.replace("pass out quick to 203.0.113.1 no state\n", "")
+            .replace("pass out quick to 192.168.1.0/24 no state\n", "")
+            .replace("pass out quick to 192.168.0.0/16 no state", "pass out quick to <__automatic_a1b2_0> no state");
+        let run=|ok:bool,members:&str|run_with(&e,|p,a| {
+            if a==["-a",crate::pf::ANCHOR,"-s","rules"] {Output{ok:true,text:optimized.clone()}}
+            else if a==["-a",crate::pf::ANCHOR,"-t","__automatic_a1b2_0","-T","show"] {Output{ok,text:members.into()}}
+            else {fixture(&e,p,a)}
+        });
+        assert!(run(true,"203.0.113.1\n192.168.0.0/16").iter().find(|r|r.item=="实际防火墙配置与当前策略一致").unwrap().passed);
+        for (ok,members) in [(false,""),(true,"203.0.113.1"),(true,"203.0.113.1\n192.168.0.0/16\n198.51.100.1"),(true,"0.0.0.0/0"),(true,"<nested>")] {
+            assert!(!run(ok,members).iter().find(|r|r.item=="实际防火墙配置与当前策略一致").unwrap().passed);
+        }
+        let compatibility=run(true,"203.0.113.1\n192.168.0.0/16").into_iter().find(|r|r.item=="其他 VPN 隧道兼容").unwrap();
+        assert!(compatibility.informational, "compatibility outside our scope must not require disabling other clients");
     }
     #[test]
     fn kernel_parser_output_matches_implicit_flags_and_deduplicated_passes() {
