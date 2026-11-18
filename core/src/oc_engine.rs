@@ -1966,6 +1966,140 @@ mod tests {
         drop(engine);
         std::fs::remove_dir_all(support).unwrap();
     }
+
+    #[test]
+    fn socket_late_answers_cannot_restore_revoked_routes_or_cross_dns_sessions() {
+        use std::net::{TcpListener, TcpStream};
+
+        fn reply(query: &[u8], last: u8) -> Vec<u8> {
+            let mut answer = query.to_vec();
+            answer[2..12].copy_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+            answer.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, last]);
+            answer
+        }
+        fn request(tcp: bool, query: &[u8]) -> Option<Vec<u8>> {
+            let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 15353);
+            if tcp {
+                let socket = crate::child_io::socket(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP)).ok()?;
+                socket.connect_timeout(&socket2::SockAddr::from(address), Duration::from_secs(1)).ok()?;
+                let mut peer: TcpStream = socket.into();
+                peer.set_read_timeout(Some(Duration::from_millis(400))).ok()?;
+                peer.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
+                dns_forwarder::write_framed(&mut peer, query).ok()?;
+                dns_forwarder::read_framed(&mut peer)
+            } else {
+                let peer = crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).ok()?;
+                peer.set_read_timeout(Some(Duration::from_millis(400))).ok()?;
+                peer.send_to(query, address).ok()?;
+                let mut bytes = [0; 512];
+                let n = peer.recv(&mut bytes).ok()?;
+                Some(bytes[..n].to_vec())
+            }
+        }
+        // The production engine listener uses this test-only high port. No
+        // real resolver, routing command or PF command is used by this test.
+        let reservation = crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 15353)).unwrap();
+        let tcp_reservation = crate::child_io::creation(|| TcpListener::bind((Ipv4Addr::LOCALHOST, 15353))).unwrap();
+        drop((reservation, tcp_reservation));
+        for client_tcp in [false, true] {
+            for upstream_tcp in [false, true] {
+                for change in ["rules", "upstreams", "listener"] {
+                    let udp = crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+                    udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                    let server = udp.local_addr().unwrap();
+                    let tcp = crate::child_io::creation(|| TcpListener::bind(server)).unwrap();
+                    tcp.set_nonblocking(true).unwrap();
+                    let (seen_tx, seen_rx) = mpsc::channel();
+                    let (release_tx, release_rx) = mpsc::channel();
+                    let upstream = std::thread::spawn(move || {
+                        for round in 0..3 {
+                            let mut bytes = [0; 512];
+                            let (n, from) = udp.recv_from(&mut bytes).unwrap();
+                            let mut query = bytes[..n].to_vec();
+                            let mut stream = if upstream_tcp {
+                                let mut truncated = query.clone();
+                                truncated[2..12].copy_from_slice(&[0x83, 0x80, 0, 1, 0, 0, 0, 0, 0, 0]);
+                                udp.send_to(&truncated, from).unwrap();
+                                let deadline = Instant::now() + Duration::from_secs(2);
+                                let mut peer = loop {
+                                    match crate::child_io::accept(&tcp) {
+                                        Ok((peer, _)) => break peer,
+                                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                            assert!(Instant::now() < deadline, "TCP fallback did not arrive");
+                                            std::thread::sleep(Duration::from_millis(5));
+                                        }
+                                        Err(error) => panic!("TCP fallback: {error}"),
+                                    }
+                                };
+                                peer.set_nonblocking(false).unwrap();
+                                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                                peer.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                                query = dns_forwarder::read_framed(&mut peer).unwrap();
+                                Some(peer)
+                            } else { None };
+                            if round == 1 {
+                                seen_tx.send(()).unwrap();
+                                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                            }
+                            let answer = reply(&query, [9, 19, 29][round]);
+                            if let Some(peer) = &mut stream {
+                                dns_forwarder::write_framed(peer, &answer).unwrap();
+                            } else {
+                                udp.send_to(&answer, from).unwrap();
+                            }
+                        }
+                    });
+                    let (engine, support) = split_engine(&format!("wire-{client_tcp}-{upstream_tcp}-{change}"));
+                    let upstreams = || Upstreams {
+                        tunnel: vec![server.to_string()], local: vec![server.to_string()],
+                        physical_if: None,
+                        tunnel_if: Some(if cfg!(target_os = "macos") { "lo0" } else { "lo" }.into()),
+                    };
+                    {
+                        let mut c = engine.shared.core.lock().unwrap();
+                        c.config.direct_domains = Some(vec!["full:direct.example".into()]);
+                        engine.shared.start_forwarder(&mut c);
+                        c.forwarder.as_ref().unwrap().set_upstreams(upstreams());
+                    }
+                    let query = crate::on_demand::dns_query("direct.example").unwrap();
+                    assert_eq!(dns_forwarder::ipv4_answers(&request(client_tcp, &query).unwrap()),
+                        vec![Ipv4Addr::new(203, 0, 113, 9)]);
+                    assert_eq!(engine.shared.routes.addresses(), vec!["203.0.113.9"]);
+                    assert_eq!(engine.shared.guard.direct_addresses(), vec!["203.0.113.9"]);
+                    let pending_query = query.clone();
+                    let pending = std::thread::spawn(move || request(client_tcp, &pending_query));
+                    seen_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    if change == "rules" {
+                        engine.update_direct_domains(vec![]);
+                        assert!(!dns_event(&engine, 0, "barrier.example", false));
+                    } else {
+                        let c = engine.shared.core.lock().unwrap();
+                        let forwarder = c.forwarder.as_ref().unwrap();
+                        if change == "upstreams" { forwarder.set_upstreams(upstreams()); }
+                        else { forwarder.stop(); forwarder.start().unwrap(); }
+                    }
+                    release_tx.send(()).unwrap();
+                    let late = pending.join().unwrap();
+                    let stale_route = engine.shared.routes.addresses().contains(&"203.0.113.19".into());
+                    let stale_permit = engine.shared.guard.direct_addresses().contains(&"203.0.113.19".into());
+                    let journal = std::fs::read_to_string(support.join("direct-routes")).unwrap();
+                    let withdrawn = !engine.shared.routes.addresses().contains(&"203.0.113.9".into());
+                    let fresh = request(client_tcp, &query);
+                    upstream.join().unwrap();
+                    engine.stop(false, false);
+                    assert!(!dns_event(&engine, 0, "barrier.example", false));
+                    drop(engine);
+                    std::fs::remove_dir_all(support).unwrap();
+                    assert!(late.is_none(), "old DNS answer reached {client_tcp}/{upstream_tcp}/{change} client");
+                    assert!(!stale_route && !stale_permit && !journal.contains("203.0.113.19"),
+                        "late answer recreated a route, PF permission or journal entry");
+                    assert!(change != "rules" || withdrawn, "rule removal did not retire the original route");
+                    assert_eq!(dns_forwarder::ipv4_answers(&fresh.unwrap()), vec![Ipv4Addr::new(203, 0, 113, 29)],
+                        "a fresh query must still work after the transition");
+                }
+            }
+        }
+    }
     #[test]
     fn vpn_observation_revokes_shared_ip_before_ack_and_protection_rearm() {
         let (engine, support) = split_engine("shared");
