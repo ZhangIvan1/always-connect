@@ -3533,7 +3533,7 @@ tick 记录观测到的 Connected→Reconnecting→Disconnected 等变化及上�
 
 ### 60.6 rebase 后取消窗口与必要保护重试（外部贡献，2026-11-18；待维护者审阅）
 
-保护重试和恢复可用会话是两种动作。`Core::recovery_suspended()` 包括离线 paused，以及网络恢复后仍等待已取消子进程退出的 resume_after_exit。Output、隧道复认、动态例外 rearm、转发器绑定与 DNS 应答提交都按同一边界判断；恢复网络不使收到 TERM 的旧进程重新有效。Cancel 立即退休 tunnel_if 并更新转发器，撤销旧绑定和应答 epoch；保留 DNS 监听，不重启转发器。队列 Respawn 必须等旧 Exited 事件消费意图，不能只看进程已回收的 alive 标记。
+保护重试和恢复可用会话是两种动作。`Core::recovery_suspended()` 包括离线 paused，以及网络恢复后仍等待已取消子进程退出的 resume_after_exit。Output、隧道复认、动态例外 rearm、转发器绑定与 DNS 应答提交都按同一边界判断；恢复网络不使收到 TERM 的旧进程重新有效。Cancel 立即退休 tunnel_if 并更新转发器，撤销旧绑定和应答 epoch；保留 DNS 监听，不重启转发器。Resume 与队列 Respawn 都必须等旧 Exited 事件消费意图，不能只看进程已回收的 alive 标记；即使输出仍在队列里，也属于已取消的旧代次。
 
 原路由 watcher 与既有 60 秒 fallback 的 Availability + NetWatch 组合在暂停中继续执行，不新增轮询。NetWatch/NetworkChanged 的 refresh_network 先重试 pending 的基础 PF，即使物理事实为空或未变；connected/允许直连的请求在取消窗口强制收紧。必需的 PF 装载、动态表撤销、过时路由删除和台账收敛继续；新路由/动态表新增、repoint 与 rearm 暂缓，保留 split_needs_sync 等重试意图。规则删改的撤销不依赖可用网关，避免把撤权排在可选安装之后。显式关闭断线保护、手动断开与退出仍按原授权路径处理。
 

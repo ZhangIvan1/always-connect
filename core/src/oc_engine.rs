@@ -867,7 +867,9 @@ impl Shared {
                 }
                 crate::offline::Action::Resume => {
                     if !c.stop_requested && !c.finished {
-                        if c.child_alive() {
+                        // Reaped is not yet retired: buffered output/Exited may
+                        // still be queued for this cancelled generation.
+                        if c.child.is_some() {
                             c.resume_after_exit = true;
                         } else {
                             self.spawn_next(c);

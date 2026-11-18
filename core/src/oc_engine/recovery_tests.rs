@@ -631,3 +631,42 @@ fn queued_respawn_waits_for_exit_event_after_process_is_reaped() {
         "queued respawn must wait for the old Exited event to consume its intent"
     );
 }
+
+#[test]
+fn restoration_after_reaping_still_fences_output_until_exited_is_consumed() {
+    let f = Fixture::new();
+    let generation = {
+        let mut c = f.engine.shared.core.lock().unwrap();
+        c.network.start();
+        c.network.observe(false);
+        c.network.deadline(1, false);
+        c.child = Some(Child {
+            pid: i32::MAX,
+            generation: c.generation,
+            alive: Arc::new(AtomicBool::new(false)),
+        });
+        c.generation
+    };
+    // The waiter has reaped the process, but its Exited message has not been
+    // consumed yet. Production Resume must preserve the cancelled intent.
+    f.network(true, None);
+    f.engine.shared.send(Event::Output {
+        generation,
+        stdout: true,
+        bytes: b"AC_HOOK connect tun=utun99 gateway=198.51.100.7\n".to_vec(),
+    });
+    f.engine.shared.send(Event::Respawn);
+    f.barrier();
+    let (waiting, hooked, attempts) = {
+        let mut c = f.engine.shared.core.lock().unwrap();
+        let result = (c.resume_after_exit, c.hook_fired, c.attempts);
+        c.child = None;
+        c.finished = true;
+        result
+    };
+    drop(f);
+    assert!(
+        waiting && !hooked && attempts == 0,
+        "restoration before Exited must fence even a reaped child's buffered output"
+    );
+}
