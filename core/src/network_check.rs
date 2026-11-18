@@ -283,7 +283,12 @@ pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Ou
             let words: Vec<_> = line.split_whitespace().collect();
             words.windows(2).any(|w| w[0] == "on" && w[1].starts_with("utun") && w[1] != tunnel)
         });
-        let mut compatibility=item("其他 VPN 隧道兼容", pf.ok && !other_tunnel, "保留其他隧道的兼容放行；本项目不接管其他 VPN，不承诺整机唯一出口");
+        // The DNS barrier precedes the tunnel passes: other tunnels keep their
+        // ordinary traffic, not their port-53 DNS (§61.2). Say so.
+        let dns_barrier=expected.rules.as_deref().is_some_and(|r|r.contains("block drop out quick proto { udp tcp } to any port 53"));
+        let detail=if dns_barrier {"其他隧道的普通流量保留兼容放行，但它们的 DNS（53 端口）被按网站分流的 DNS 保护拦截；本项目不接管其他 VPN，不承诺整机唯一出口"}
+            else {"保留其他隧道的兼容放行；本项目不接管其他 VPN，不承诺整机唯一出口"};
+        let mut compatibility=item("其他 VPN 隧道兼容", pf.ok && !other_tunnel, detail);
         compatibility.informational=true;result.push(compatibility);
         if expected.split {
             let table = get("/sbin/pfctl", &["-a", crate::pf::ANCHOR, "-t", crate::pf::DIRECT_TABLE, "-T", "show"]);
@@ -420,6 +425,10 @@ mod tests {
         }
         let compatibility=run(true,"203.0.113.1\n192.168.0.0/16").into_iter().find(|r|r.item=="其他 VPN 隧道兼容").unwrap();
         assert!(compatibility.informational, "compatibility outside our scope must not require disabling other clients");
+        let e=expected();
+        let strict=e.rules.as_deref().unwrap().contains("to any port 53");
+        let row=run_with(&e,|p,a|fixture(&e,p,a)).into_iter().find(|r|r.item=="其他 VPN 隧道兼容").unwrap();
+        assert_eq!(row.detail.contains("DNS（53 端口）被"),strict,"the compatibility note must not hide the DNS barrier");
     }
     #[test]
     fn kernel_parser_output_matches_implicit_flags_and_deduplicated_passes() {
