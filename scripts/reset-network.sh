@@ -337,8 +337,14 @@ fi
 [ $DRY = 1 ] && { echo "== dry-run done, nothing changed"; exit 0; }
 sleep 2
 if webok; then
-    echo "== 网络已恢复：默认路由 $(route -n get default 2>/dev/null | awk '/interface:/{print $2}')，网页可以打开。"
-    exit 0
+    # Success also needs our anchor confirmed clear: a working page alone
+    # does not prove our rules are gone (they may bite after a network change).
+    if [ "${ANCHOR_CONFIRMED:-0}" = 1 ]; then
+        echo "== 网络已恢复：默认路由 $(route -n get default 2>/dev/null | awk '/interface:/{print $2}')，网页可以打开。"
+        exit 0
+    fi
+    echo "== 网页可以打开，但没能确认 AlwaysConnect 的防火墙规则已清除：之后若断网，请重启电脑（本程序开机时不会封网）。"
+    exit 1
 fi
 # Shared PF stays on (§55.7); give the user a next step instead.
 if [ "${ANCHOR_CONFIRMED:-0}" = 1 ]; then

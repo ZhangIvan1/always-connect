@@ -185,10 +185,21 @@ for confirmed in 1 0; do
   grep -q '重启电脑' "$WORK/verify-output" || { echo 'FAIL no next step after a failed probe'; exit 1; }
 done
 grep -q '没能确认' "$WORK/verify-output" || { echo 'FAIL unconfirmed anchor not reported'; exit 1; }
+# A working page with leftover or unreadable anchor rules is not a recovery
+# (leftover and read failure both leave ANCHOR_CONFIRMED=0).
+for anchor_state in unset 0; do
+  if [ "$anchor_state" = unset ]; then
+    if bash "$WORK/verify-harness.sh" "$WORK" 0 0 > "$WORK/verify-output"; then echo 'FAIL success without anchor confirmation'; exit 1; fi
+  elif ANCHOR_CONFIRMED=0 bash "$WORK/verify-harness.sh" "$WORK" 0 0 > "$WORK/verify-output"; then
+    echo 'FAIL working page hid leftover anchor rules'; exit 1
+  fi
+  grep -q '没能确认' "$WORK/verify-output" && grep -q '重启电脑' "$WORK/verify-output" || { echo 'FAIL unconfirmed anchor not explained'; exit 1; }
+  ! grep -q '网络已恢复' "$WORK/verify-output" || { echo 'FAIL claimed recovery with an unconfirmed anchor'; exit 1; }
+done
 
 for probe_status in 0 1; do
   : > "$WORK/pf-calls"
-  if bash "$WORK/verify-harness.sh" "$WORK" 0 "$probe_status" > "$WORK/verify-output"; then
+  if ANCHOR_CONFIRMED=1 bash "$WORK/verify-harness.sh" "$WORK" 0 "$probe_status" > "$WORK/verify-output"; then
     verify_status=0
   else
     verify_status=$?
