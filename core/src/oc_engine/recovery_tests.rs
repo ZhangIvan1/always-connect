@@ -20,6 +20,9 @@ fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_physical_facts(false)
+    }
+    fn with_physical_facts(stable: bool) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "ac-flaps-{}-{}",
             std::process::id(),
@@ -83,7 +86,9 @@ fi
             Hooks {
                 state: Box::new(|_, _| {}),
                 terminal: Box::new(|_| {}),
-                physical_network: Box::new(|_| None),
+                physical_network: Box::new(move |_| {
+                    stable.then(|| ("192.168.1.1".into(), "en0".into()))
+                }),
                 network_available: Box::new(move || network.load(Ordering::SeqCst)),
                 local_dns: Box::new(|_| vec![]),
                 system_roots: Box::new(|| None),
@@ -287,5 +292,342 @@ fn paused_engine_does_not_reconfirm_a_stopping_childs_interface() {
     assert!(
         restored,
         "restoration still permits upstream exact-interface reconfirmation"
+    );
+}
+
+// F12: use the same Availability + NetWatch queue pair as the route watcher.
+fn mandatory_retry_via_watcher(stable_facts: bool) {
+    let f = Fixture::with_physical_facts(stable_facts);
+    let shared = &f.engine.shared;
+    let inputs = Inputs {
+        tunnel_if: "utun99".into(),
+        gateway_ips: vec!["198.51.100.7".into()],
+        physical_if: "en0".into(),
+        ..Inputs::default()
+    };
+    assert!(shared.guard.apply(&shared.holder, true, &inputs).is_none());
+    std::fs::write(
+        f.dir.join("pfctl"),
+        r#"#!/bin/sh
+root=$(dirname "$0")
+cat >/dev/null
+if [ -f "$root/fail" ]; then exit 1; fi
+echo 'Token : 123' >&2
+"#,
+    )
+    .unwrap();
+    {
+        let mut c = shared.core.lock().unwrap();
+        c.network.start();
+        c.watching = true;
+        c.physical_gateway = stable_facts.then(|| "192.168.1.1".into());
+        c.last_pf = Some((inputs.tunnel_if.clone(), inputs.gateway_ips.clone()));
+        c.last_allow_direct_egress = true;
+    }
+    std::fs::write(f.dir.join("fail"), "").unwrap();
+    f.network(false, Some(1));
+    let initial_pending = shared.core.lock().unwrap().pf_needs_load;
+    std::fs::remove_file(f.dir.join("fail")).unwrap();
+    f.network(false, None);
+    shared.send(Event::Fire {
+        timer: Timer::NetWatch,
+        token: u64::MAX,
+    });
+    f.barrier();
+    let (pending, paused, attempts) = {
+        let mut c = shared.core.lock().unwrap();
+        let result = (c.pf_needs_load, c.network.paused, c.attempts);
+        c.finished = true;
+        result
+    };
+    let record: network_guard::Record =
+        serde_json::from_slice(&std::fs::read(f.dir.join("guard.json")).unwrap()).unwrap();
+    drop(f);
+    assert!(initial_pending && paused);
+    assert_eq!(
+        attempts, 0,
+        "mandatory retry must not respawn while offline"
+    );
+    assert!(!pending && !record.connected,
+        "offline watcher must retry mandatory blocking even with unchanged or absent physical facts");
+}
+#[test]
+fn offline_watcher_retries_failed_blocking_load() {
+    mandatory_retry_via_watcher(true);
+}
+#[test]
+fn offline_watcher_retries_blocking_without_physical_facts() {
+    mandatory_retry_via_watcher(false);
+}
+
+#[test]
+fn restored_watcher_never_reconfirms_a_live_cancelled_child() {
+    let f = Fixture::with_physical_facts(true);
+    let name = if cfg!(target_os = "macos") {
+        "lo0"
+    } else {
+        "lo"
+    };
+    std::fs::write(
+        f.dir.join("openconnect"),
+        format!(
+            r#"#!/bin/sh
+root=$(dirname "$0")
+read -r credential
+trap '' TERM
+printf 'AC_HOOK connect tun={} gateway=198.51.100.7 dns=10.8.0.1\n'
+touch "$root/ready"
+while [ ! -f "$root/exit" ]; do sleep 0.01; done
+"#,
+            name
+        ),
+    )
+    .unwrap();
+    f.engine.start();
+    assert!(wait_until(|| f
+        .engine
+        .shared
+        .core
+        .lock()
+        .unwrap()
+        .hook_fired));
+    let epoch = {
+        let mut c = f.engine.shared.core.lock().unwrap();
+        c.watching = true;
+        c.physical_gateway = None;
+        c.forwarder = Some(Forwarder::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            53,
+            Duration::from_millis(50),
+            vec![],
+            Upstreams {
+                tunnel: c.tunnel_dns.clone(),
+                local: vec![],
+                physical_if: None,
+                tunnel_if: c.tunnel_if.clone(),
+            },
+            None,
+        ));
+        f.engine.shared.update_forwarder(&c);
+        assert_eq!(
+            c.forwarder
+                .as_ref()
+                .unwrap()
+                .bound_tunnel_interface()
+                .as_deref(),
+            Some(name)
+        );
+        c.forwarder.as_ref().unwrap().epoch()
+    };
+    f.network(false, Some(1));
+    let (retired_on_cancel, stale_epoch) = {
+        let c = f.engine.shared.core.lock().unwrap();
+        let forwarder = c.forwarder.as_ref().unwrap();
+        (
+            forwarder.bound_tunnel_interface().is_none(),
+            !forwarder.is_current(epoch),
+        )
+    };
+    // Exercise upstream refresh too, rather than directly mutating the lease.
+    f.engine.send(Event::NetworkChanged);
+    f.barrier();
+    assert!(f.engine.shared.core.lock().unwrap().tunnel_if.is_none());
+    f.network(true, None);
+    f.engine.send(Event::Fire {
+        timer: Timer::NetWatch,
+        token: u64::MAX,
+    });
+    f.barrier();
+    let (waiting, tunnel, alive, bound) = {
+        let c = f.engine.shared.core.lock().unwrap();
+        (
+            c.resume_after_exit,
+            c.tunnel_if.clone(),
+            c.child_alive(),
+            c.forwarder.as_ref().unwrap().bound_tunnel_interface(),
+        )
+    };
+    drop(f);
+    assert!(
+        alive && waiting,
+        "fixture must still be waiting for a TERM-ignoring child"
+    );
+    assert!(
+        tunnel.is_none(),
+        "watcher must not reconfirm a live but cancelled child"
+    );
+    assert!(
+        retired_on_cancel && stale_epoch && bound.is_none(),
+        "cancel must retire the forwarder binding and its outstanding DNS epoch"
+    );
+}
+
+#[test]
+fn cancelled_child_cannot_rearm_bypasses_or_ack_current_epoch_dns() {
+    let f = Fixture::new();
+    let shared = &f.engine.shared;
+    let inputs = Inputs {
+        tunnel_if: "utun99".into(),
+        gateway_ips: vec!["198.51.100.7".into()],
+        physical_if: "en0".into(),
+        direct_table: true,
+        block_direct: true,
+        ..Inputs::default()
+    };
+    assert!(shared.guard.apply(&shared.holder, false, &inputs).is_none());
+    let (epoch, remained_blocked) = {
+        let mut c = shared.core.lock().unwrap();
+        c.resume_after_exit = true;
+        c.forwarder = Some(Forwarder::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            53,
+            Duration::from_millis(50),
+            vec![],
+            Upstreams {
+                tunnel: vec![],
+                local: vec![],
+                physical_if: None,
+                tunnel_if: None,
+            },
+            None,
+        ));
+        shared.rearm_direct_after_sync(&mut c);
+        (
+            c.forwarder.as_ref().unwrap().epoch(),
+            shared.guard.held().unwrap().1.block_direct,
+        )
+    };
+    let (reply, answer) = mpsc::channel();
+    shared.send(Event::DnsAnswer(
+        dns_forwarder::Observation {
+            epoch,
+            name: "direct.example".into(),
+            entry: Some("direct.example".into()),
+            addresses: vec![Ipv4Addr::new(203, 0, 113, 9)],
+            direct: vec![Ipv4Addr::new(203, 0, 113, 9)],
+        },
+        reply,
+    ));
+    let acknowledged = answer.recv_timeout(Duration::from_secs(5)).unwrap();
+    f.barrier();
+    let claimed = shared.core.lock().unwrap().split_policy.direct();
+    {
+        let mut c = shared.core.lock().unwrap();
+        c.finished = true;
+    }
+    drop(f);
+    assert!(
+        remained_blocked,
+        "cancel wait must keep optional rearm blocked"
+    );
+    assert!(
+        !acknowledged && claimed.is_empty(),
+        "cancel wait must reject even current-epoch DNS work"
+    );
+}
+
+#[test]
+fn suspended_rule_events_retire_routes_without_adding_optional_bypasses() {
+    let f = Fixture::new();
+    let shared = &f.engine.shared;
+    let old = "203.0.113.9".to_string();
+    let new = "203.0.113.10".to_string();
+    let network = "198.18.0.0/24".to_string();
+    assert!(shared
+        .routes
+        .add(&[old.clone(), network.clone()], "192.168.1.1"));
+    let inputs = Inputs {
+        tunnel_if: "utun99".into(),
+        gateway_ips: vec!["198.51.100.7".into()],
+        physical_if: "en0".into(),
+        direct_table: true,
+        block_direct: true,
+        ..Inputs::default()
+    };
+    assert!(shared.guard.apply(&shared.holder, false, &inputs).is_none());
+    assert!(shared.guard.add_direct(std::slice::from_ref(&old)));
+    {
+        let mut c = shared.core.lock().unwrap();
+        c.network.start();
+        c.config.allow_networks = vec![network];
+        c.watching = true;
+        c.last_pf = Some((inputs.tunnel_if.clone(), inputs.gateway_ips.clone()));
+        c.routes_need_repoint = true; // No gateway fact; must not block retirement.
+        c.forwarder = Some(Forwarder::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            53,
+            Duration::from_millis(50),
+            vec!["old.example".into(), "new.example".into()],
+            Upstreams {
+                tunnel: vec![],
+                local: vec![],
+                physical_if: None,
+                tunnel_if: None,
+            },
+            None,
+        ));
+        c.split_policy.observe(
+            "old.example".into(),
+            &[old.parse().unwrap()],
+            &[old.parse().unwrap()],
+        );
+        c.split_policy.observe(
+            "new.example".into(),
+            &[new.parse().unwrap()],
+            &[new.parse().unwrap()],
+        );
+    }
+    f.network(false, Some(1));
+    shared.send(Event::DirectDomains(vec!["new.example".into()]));
+    shared.send(Event::AllowNetworks(vec![]));
+    shared.send(Event::Availability(false));
+    shared.send(Event::Fire {
+        timer: Timer::NetWatch,
+        token: u64::MAX,
+    });
+    f.barrier();
+    let (paused, pending, attempts) = {
+        let mut c = shared.core.lock().unwrap();
+        let result = (c.network.paused, c.split_needs_sync, c.attempts);
+        c.finished = true;
+        result
+    };
+    let routes = shared.routes.addresses();
+    let direct = shared.guard.direct_addresses();
+    let blocked = shared.guard.held().unwrap().1.block_direct;
+    drop(f);
+    assert!(paused && pending && attempts == 0);
+    assert!(routes.is_empty() && direct.is_empty(),
+        "suspended rule events must retire revoked routes/table entries without adding replacements");
+    assert!(blocked, "retirement must not rearm optional bypasses");
+}
+
+#[test]
+fn queued_respawn_waits_for_exit_event_after_process_is_reaped() {
+    let f = Fixture::new();
+    {
+        let mut c = f.engine.shared.core.lock().unwrap();
+        c.network.start();
+        c.resume_after_exit = true;
+        c.child = Some(Child {
+            pid: i32::MAX,
+            generation: c.generation,
+            alive: Arc::new(AtomicBool::new(false)),
+        });
+    }
+    f.engine.shared.send(Event::Respawn);
+    f.barrier();
+    let attempts = {
+        let mut c = f.engine.shared.core.lock().unwrap();
+        let attempts = c.attempts;
+        if attempts == 0 {
+            c.child = None;
+        }
+        attempts
+    };
+    drop(f);
+    assert_eq!(
+        attempts, 0,
+        "queued respawn must wait for the old Exited event to consume its intent"
     );
 }

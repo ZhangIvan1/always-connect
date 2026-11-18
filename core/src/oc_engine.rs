@@ -632,6 +632,11 @@ impl Drop for Engine {
 }
 
 impl Core {
+    /// A cancelled child is unavailable even after the physical path returns.
+    /// Mandatory protection/retirement continues; optional permissions do not.
+    fn recovery_suspended(&self) -> bool {
+        self.network.paused || self.resume_after_exit
+    }
     fn direct_retry_ready(&self,ip:&Ipv4Addr,now:Instant)->bool {
         self.direct_retries.get(ip).is_none_or(|retry|now>=retry.until)
     }
@@ -734,7 +739,7 @@ impl Shared {
                 }
                 Event::Stop { keep_session, notify } => self.stop(&mut c, keep_session, notify),
                 Event::Output { generation, stdout, bytes } => {
-                    if generation == c.generation && c.child.is_some() && !c.network.paused && !c.resume_after_exit {
+                    if generation == c.generation && c.child.is_some() && !c.recovery_suspended() {
                         self.consume(&mut c, stdout, &bytes);
                     }
                 }
@@ -779,7 +784,11 @@ impl Shared {
                     }
                 }
                 Event::DnsAnswer(answer, reply) => {
-                    let current = !c.stop_requested && c.forwarder.as_ref().is_some_and(|f| f.is_current(answer.epoch));
+                    // Do not acknowledge cancelled-session work, even if a
+                    // local/direct query acquired the current DNS epoch.
+                    if c.recovery_suspended() && c.pf_needs_load { self.apply_base_pf(&mut c); }
+                    let current = !c.stop_requested && !c.recovery_suspended()
+                        && c.forwarder.as_ref().is_some_and(|f| f.is_current(answer.epoch));
                     let committed = if current {
                         let direct=if answer.direct.is_empty() {Vec::new()} else {
                             direct_routes::assigned_ipv4().map(|own|answer.direct.iter().copied().filter(|ip|!own.contains(ip)).collect()).unwrap_or_else(||answer.direct.clone())
@@ -837,6 +846,10 @@ impl Shared {
                     // Preserve the guard and its owner. A normal (non-manual)
                     // openconnect exit leaves drop protection in place.
                     c.in_drop_episode |= c.hook_fired;
+                    // Retire both the pinned interface and in-flight answers
+                    // before attempting PF work, which may itself fail.
+                    c.tunnel_if = None;
+                    self.update_forwarder(c);
                     if c.config.drop_protection {
                         if let Some((tunnel, gateways)) = c.last_pf.clone() {
                             self.load_pf(c, Some(tunnel), gateways, false);
@@ -867,7 +880,7 @@ impl Shared {
 
     fn report(&self, c: &Core, detail: &str) {
         let mut state = c.driver.state;
-        if c.network.paused && !c.stop_requested && !c.finished {
+        if c.recovery_suspended() && !c.stop_requested && !c.finished {
             state = SessionStatus::Reconnecting;
         }
         if (c.tunnel_retrying || (c.hook_fired && c.forwarder.is_some() && c.tunnel_if.is_none())) && state == SessionStatus::Connected {
@@ -1010,7 +1023,7 @@ impl Shared {
     /// Confirm this answer, independently of optional work for other names.
     /// A revoked address must have lost its route and effective PF permission.
     fn dns_observation_ready(&self,c:&Core,addresses:&[Ipv4Addr])->bool {
-        if c.pf_needs_load {return false;}
+        if c.pf_needs_load || c.recovery_suspended() {return false;}
         let active=!c.config.drop_protection||self.guard.dynamic_direct_enabled(&self.holder);
         addresses.iter().all(|ip| {
             let text=ip.to_string();
@@ -1036,12 +1049,13 @@ impl Shared {
     fn try_sync_split_routes(&self, c: &mut Core) -> SplitSync {
         let recovering=c.pf_error.is_some();
         if c.pf_needs_load && !self.apply_base_pf(c) { return SplitSync::Blocked; }
-        if !self.repoint_routes(c) { return SplitSync::Blocked; }
+        let suspended = c.recovery_suspended();
+        if !suspended && !self.repoint_routes(c) { return SplitSync::Blocked; }
         if !self.routes.reconcile_metadata(){
             let error="路由退休记录尚未持久化；基础保护保持";c.pf_error=Some(error.into());self.report(c,error);return SplitSync::Blocked;
         }
         let mut desired = c.split_policy.direct();
-        if !desired.is_empty() {
+        if !desired.is_empty() && !suspended {
             let Some(own)=direct_routes::assigned_ipv4() else {
                 let error="本机地址未确认，直连例外未更新；可使用恢复网络";
                 c.pf_error=Some(error.into()); self.report(c,error); return SplitSync::Blocked;
@@ -1070,6 +1084,14 @@ impl Shared {
             let e = "直连例外清理失败，网络保护状态未确认；可使用恢复网络".to_string();
             c.pf_error = Some(e.clone()); self.report(c, &e);
             return SplitSync::Blocked;
+        }
+        // Revocations and mandatory base work above must run while paused or
+        // waiting for exit. Route/table additions and rearm wait for a new
+        // usable session; retain the deferred convergence intent.
+        if suspended {
+            c.split_addresses.retain(|ip| desired.contains(ip));
+            c.split_needs_sync = true;
+            return SplitSync::PendingAdditions;
         }
         let new: Vec<_> = routable.difference(&routed).filter(|ip|ip.parse().is_ok_and(|ip|attempting.contains(&ip))).cloned().collect();
         if !new.is_empty() {
@@ -1114,11 +1136,12 @@ impl Shared {
 
     fn update_forwarder(&self, c: &Core) {
         if let Some(f) = &c.forwarder {
-            let index=c.tunnel_lease.as_ref().filter(|lease|c.tunnel_if.as_ref()==Some(&lease.name)&&lease.generation==c.generation).map(|lease|lease.index);
+            let tunnel_if = c.tunnel_if.clone().filter(|_| !c.recovery_suspended());
+            let index=c.tunnel_lease.as_ref().filter(|lease|tunnel_if.as_ref()==Some(&lease.name)&&lease.generation==c.generation).map(|lease|lease.index);
             f.set_pinned_upstreams(Upstreams {
                 tunnel: c.tunnel_dns.clone(), local: c.local_dns.clone(),
                 physical_if: if c.config.no_routes { None } else { Some(c.config.physical_if.clone()) },
-                tunnel_if: c.tunnel_if.clone(),
+                tunnel_if,
             },index);
         }
     }
@@ -1161,13 +1184,24 @@ impl Shared {
     /// or not (§40.1): a split that could not start must not send the
     /// modem at 192.168.100.1 into the tunnel.
     fn route_networks_direct(&self, c: &mut Core) {
-        if !self.repoint_routes(c) { return; }
-        let Some(gateway)=c.physical_gateway.clone() else {return;};
+        let suspended = c.recovery_suspended();
+        if !suspended && !self.repoint_routes(c) { return; }
         let wanted:HashSet<String>=direct_routes::networks_to_route(&c.direct_networks(),&direct_routes::attached_networks()).into_iter().collect();
         let actual:HashSet<String>=self.routes.managed_addresses().into_iter().filter(|s|direct_routes::is_network(s)).collect();
         let gone:Vec<_>=actual.difference(&wanted).cloned().collect();
         let new:Vec<_>=wanted.difference(&actual).cloned().collect();
         let removed=self.routes.remove(&gone);
+        if suspended {
+            // Withdraw obsolete routes without needing a usable router. New
+            // routes/repoints stay pending until the replacement session.
+            let persisted = self.routes.reconcile_metadata();
+            c.routed_networks=self.routes.addresses().into_iter().filter(|s|direct_routes::is_network(s)).collect();
+            if !removed || !persisted {
+                c.network_routes_error=Some("直连网段清理未确认；基础断线保护保持".into());
+            }
+            return;
+        }
+        let Some(gateway)=c.physical_gateway.clone() else {return;};
         let added=self.routes.add(&new,&gateway);
         c.routed_networks=self.routes.addresses().into_iter().filter(|s|direct_routes::is_network(s)).collect();
         if !removed || !added || c.routed_networks!=wanted {
@@ -1273,7 +1307,7 @@ impl Shared {
                 }
             }
             Timer::NetWatch => {
-                if !c.watching || c.stop_requested || c.network.paused {
+                if !c.watching || c.stop_requested {
                     return;
                 }
                 self.refresh_network(c);
@@ -1320,7 +1354,7 @@ impl Shared {
     }
 
     fn spawn_next(self: &Arc<Self>, c: &mut Core) {
-        if c.stop_requested || c.network.paused || c.child_alive() || c.finished {
+        if c.stop_requested || c.network.paused || c.child.is_some() || c.finished {
             return;
         }
         if let Some(max) = c.config.max_attempts {
@@ -1806,7 +1840,7 @@ impl Shared {
         // Keep the current intent even when an OS operation fails, so later
         // events can retry without relying on another connect hook.
         c.last_pf=Some((tun.clone(),gateway_ips.clone()));
-        c.last_allow_direct_egress=allow_direct_egress;
+        c.last_allow_direct_egress=allow_direct_egress && !c.recovery_suspended();
         if !self.apply_base_pf(c) {return;}
         if c.forwarder.is_some() && !self.sync_split_routes(c) {return;}
         c.pf_error=None;
@@ -1821,7 +1855,7 @@ impl Shared {
         c.pf_needs_load=true;
         let split=c.forwarder.is_some();
         let own_dns=c.config.direct_domains.is_some()||c.config.relay.is_some()||split;
-        let connected=c.last_allow_direct_egress&&!own_dns;
+        let connected=c.last_allow_direct_egress&&!own_dns&&!c.recovery_suspended();
         let inputs=Inputs {tunnel_if:tun,gateway_ips,physical_if:c.config.physical_if.clone(),allow_networks:c.direct_networks(),allow_dns:false,local_dns_servers:c.local_dns.clone(),tunnel_dns_servers:c.tunnel_dns.clone(),direct_table:split,strict_dns:own_dns,block_direct:split};
         // The base guard is mandatory. Optional routing, journaling and table
         // failures may disable bypasses, never the physical blocking policy.
@@ -1835,7 +1869,7 @@ impl Shared {
         if !c.config.drop_protection || c.stop_requested {return true;}
         // Route/PF cleanup may converge while offline; only restoration may
         // reopen optional bypasses. Mandatory base protection still retries.
-        if c.network.paused {return true;}
+        if c.recovery_suspended() {return true;}
         let Some((holder,mut inputs))=self.guard.held() else {return c.last_pf.is_none();};
         if holder!=self.holder || !inputs.direct_table || !inputs.block_direct {return true;}
         inputs.block_direct=false;
@@ -1885,7 +1919,7 @@ impl Shared {
     /// A short physical outage need not make openconnect reconnect. Re-arm
     /// only the exact interface previously confirmed by this live child.
     fn reconfirm_tunnel(&self, c: &mut Core) -> bool {
-        if c.network.paused || c.stop_requested || c.tunnel_retrying || !c.hook_fired { return false; }
+        if c.recovery_suspended() || c.stop_requested || c.tunnel_retrying || !c.hook_fired { return false; }
         let Some(lease) = &c.tunnel_lease else { return false };
         if !c.child.as_ref().is_some_and(|child| child.alive.load(Ordering::SeqCst)
             && child.generation == lease.generation && c.generation == lease.generation)
@@ -1907,6 +1941,13 @@ impl Shared {
     /// Configd can change DNS without a routing event or a different router.
     /// All watchers feed this one reducer path; unchanged facts do no work.
     fn refresh_network(&self, c: &mut Core) {
+        // Watcher/fallback events are protection retry opportunities even
+        // without fresh physical facts. Optional work has its own gates.
+        if c.pf_needs_load { self.apply_base_pf(c); }
+        if c.recovery_suspended() {
+            if c.split_needs_sync { self.sync_split_routes(c); }
+            if c.network_routes_error.is_some() || c.routes_need_repoint { self.route_networks_direct(c); }
+        }
         let Some((gateway, interface)) = (self.hooks.physical_network)(&c.config.physical_if) else {
             if c.physical_gateway.is_some() || c.tunnel_if.is_some() || !c.local_dns.is_empty() {
                 c.physical_gateway = None;
