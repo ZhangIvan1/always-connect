@@ -963,6 +963,7 @@ impl Shared {
     }
 
     fn try_sync_split_routes(&self, c: &mut Core) -> SplitSync {
+        let recovering=c.pf_error.is_some();
         if c.pf_needs_load && !self.apply_base_pf(c) { return SplitSync::Blocked; }
         if !self.repoint_routes(c) { return SplitSync::Blocked; }
         if !self.routes.reconcile_metadata(){
@@ -1033,6 +1034,10 @@ impl Shared {
             c.pf_error=Some(error.into());self.report(c,error);return SplitSync::PendingAdditions;
         }
         c.pf_error=None;
+        if recovering {
+            let detail=c.network_routes_error.as_deref().or(c.last_error.as_deref()).unwrap_or("直连例外已恢复同步");
+            self.report(c,detail);
+        }
         SplitSync::Complete
     }
 
@@ -1908,6 +1913,32 @@ mod tests {
                 Upstreams { tunnel: vec![], local: vec![], physical_if: None, tunnel_if: None }, None));
         }
         (engine, support)
+    }
+    #[test]
+    fn successful_split_recovery_replaces_a_stale_warning_without_repeated_pushes() {
+        let notices=Arc::new(Mutex::new(Vec::<String>::new()));let output=notices.clone();
+        let (engine,support)=split_engine_with_hooks("warning-recovery",Hooks {
+            state:Box::new(move |_,detail|output.lock().unwrap().push(detail.into())),
+            terminal:Box::new(|_|{}),physical_network:Box::new(|_|None),local_dns:Box::new(|_|vec![]),
+            system_roots:Box::new(||None),stopped:Box::new(||{}),
+        });
+        let (message,quiet,preserved)={let mut c=engine.shared.core.lock().unwrap();
+            c.pf_error=Some("直连例外清理失败，网络保护状态未确认".into());
+            engine.shared.report(&c,c.pf_error.as_deref().unwrap());
+            assert!(engine.shared.sync_split_routes(&mut c));assert!(c.pf_error.is_none());
+            let message=notices.lock().unwrap().last().cloned().unwrap();
+            let before=notices.lock().unwrap().len();
+            for _ in 0..4 {assert!(engine.shared.sync_split_routes(&mut c));}
+            let quiet=notices.lock().unwrap().len()==before;
+            c.pf_error=Some("prior split error".into());c.network_routes_error=Some("直连网段仍待核验".into());
+            assert!(engine.shared.sync_split_routes(&mut c));
+            let preserved=notices.lock().unwrap().last().is_some_and(|detail|detail=="直连网段仍待核验");
+            (message,quiet,preserved)
+        };
+        engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);std::fs::remove_dir_all(support).unwrap();
+        assert!(!message.contains("失败")&&!message.contains("未确认"),"a recovered structured error must not leave the old status detail visible");
+        assert!(quiet,"healthy synchronizations must not add state pushes or wakeups");
+        assert!(preserved,"successful host-route recovery cannot hide another pending network error");
     }
     fn dns_event(engine: &Engine, epoch: u64, name: &str, direct: bool) -> bool {
         let (tx, rx) = mpsc::channel();
