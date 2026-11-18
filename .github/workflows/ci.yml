@@ -203,7 +203,9 @@ jobs:
           OUT=$(printf 'pw\n' | FAKE_INTERNAL_RECONNECT=1 "$HELPER" run-once --server https://gw.invalid --user u --max-attempts 1 --no-routes --openconnect "$PWD/core/scripts/fake-openconnect.sh" --cookie-store /tmp/ac-irc/session.json --support-dir /tmp/ac-irc 2>&1 || true)
           echo "$OUT" | grep -E '^STATE' || true
           echo "$OUT" | grep -q '^STATE reconnecting 隧道断了，正在重连'
-          echo "$OUT" | grep -E '^STATE' | grep -A1 '隧道断了，正在重连' | grep -q '^STATE connected tunnel up'
+          # Status notices may appear between reconnecting and tunnel-up.
+          # Require that order without requiring adjacent output lines.
+          echo "$OUT" | awk '/^STATE reconnecting 隧道断了，正在重连/ { seen = 1 } seen && /^STATE connected tunnel up/ { restored = 1 } END { exit !restored }'
       - name: Run Helper (pf anchor smoke check)
         # The scheme also builds AlwaysConnectHelper (a plain tool, no
         # entitlements needed to run). Verify generation output, and
