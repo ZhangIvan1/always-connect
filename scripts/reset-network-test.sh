@@ -12,6 +12,8 @@ s=Path(sys.argv[1]).read_text()
 # Check before executing any extracted shell: an absolute path bypasses the
 # harness's shell function. Keep newline/command boundaries, quoting and
 # comments so both pfctl and /sbin/pfctl are checked without running either.
+# This is a lexical guard, not a shell interpreter: it does not resolve
+# variables such as PF=/sbin/pfctl followed by "$PF" -d.
 lexer=shlex.shlex(s, posix=True, punctuation_chars=';&|()\n')
 lexer.whitespace=' \t\r'; command=[]
 for token in list(lexer)+['\n']:

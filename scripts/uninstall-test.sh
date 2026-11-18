@@ -50,6 +50,9 @@ setup() {
     printf '#!/bin/bash\n# AlwaysConnect emergency network reset (DESIGN.md §24.6).\n' \
         > "$H/Desktop/AlwaysConnect 恢复网络.command"
     cp "$H/Desktop/AlwaysConnect 恢复网络.command" "$H/Desktop/.alwaysconnect-recovery.interrupted"
+    touch "$H/Desktop/.alwaysconnect-recovery.empty"
+    touch "$H/Desktop/empty-personal-file"
+    ln -s "$H/Desktop/empty-personal-file" "$H/Desktop/.alwaysconnect-recovery.link"
     printf 'personal notes\n' > "$H/Desktop/.alwaysconnect-recovery.personal"
     app_bundle "$R/Applications/AlwaysConnect.app" com.alwaysconnect.app
     app_bundle "$R/Applications/Cisco/Cisco Secure Client.app" com.cisco.secureclient.gui
@@ -69,6 +72,9 @@ system_and_user_files_gone() {
     gone "$H/Library/Preferences/group.com.alwaysconnect.render.plist"
     gone "$H/Desktop/AlwaysConnect 恢复网络.command"
     gone "$H/Desktop/.alwaysconnect-recovery.interrupted"
+    gone "$H/Desktop/.alwaysconnect-recovery.empty"
+    kept "$H/Desktop/.alwaysconnect-recovery.link"
+    kept "$H/Desktop/empty-personal-file"
     kept "$H/Desktop/.alwaysconnect-recovery.personal"
     gone "$R/Applications/AlwaysConnect.app"
     logged "reset-network --keep-unloaded"
