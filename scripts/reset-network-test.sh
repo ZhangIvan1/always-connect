@@ -27,6 +27,8 @@ native=s.index('native_route_entry() {'); native_end=s.index('\n}',native)+2
 retire=s.index('direct_route_table() {'); retire_fn=s.index('retire_direct_routes() {'); retire_end=s.index('\n}',retire_fn)+2
 Path(sys.argv[2]).write_text(s[native:native_end]+'\n'+s[retire:retire_end]+'\n'+s[start:end]+'\n')
 Path(sys.argv[2]).with_name('verify.sh').write_text(s[s.index('# 6 verify'):])
+anchor=s.index('clear_our_anchor() {'); anchor_end=s.index('\n}',anchor)+2
+Path(sys.argv[2]).with_name('anchor.sh').write_text(s[anchor:anchor_end]+'\n')
 PY
 source "$WORK/reader.sh"
 for address in 0.0.0.0 127.0.0.1 127.0.0.0/8 169.254.1.2 224.0.0.1 240.0.0.1 255.255.255.255 203.0.113.8; do
@@ -146,6 +148,44 @@ pfctl() { printf '%s\n' "$*" >> "$WORK/pf-calls"; }
 webok() { printf 'probe\n' >> "$WORK/probe-calls"; return "$PROBE_STATUS"; }
 source "$WORK/verify.sh"
 SH
+# Our anchor is read back after the flush; a missing anchor counts as empty,
+# leftover rules or an unreadable anchor do not (§61.4).
+cat > "$WORK/anchor-harness.sh" <<'SH'
+#!/bin/bash
+set -u
+WORK=$1; DRY=$2; MODE=$3; ANCHOR=com.apple/250.AlwaysConnect
+run() { if [ "$DRY" = 1 ]; then echo "  [dry-run] $*"; else "$@" >/dev/null 2>&1; fi; }
+pfctl() {
+  printf '%s\n' "$*" >> "$WORK/anchor-calls"
+  case "$*" in *-F*) return 0;; esac
+  case "$MODE" in
+    empty) return 0;;
+    leftover) echo 'block drop out quick all'; return 0;;
+    missing) echo 'pfctl: DIOCGETRULES: Invalid argument' >&2; return 1;;
+    denied) echo 'pfctl: /dev/pf: Permission denied' >&2; return 1;;
+  esac
+}
+source "$WORK/anchor.sh"
+clear_our_anchor
+SH
+for case in empty:0 missing:0 leftover:1 denied:1; do
+  mode=${case%%:*}; want=${case##*:}; : > "$WORK/anchor-calls"
+  if bash "$WORK/anchor-harness.sh" "$WORK" 0 "$mode"; then got=0; else got=1; fi
+  [ "$got" = "$want" ] || { echo "FAIL anchor read-back $mode: got $got want $want"; exit 1; }
+  grep -q -- '-a com.apple/250.AlwaysConnect -F all' "$WORK/anchor-calls" || { echo 'FAIL anchor not flushed'; exit 1; }
+  if grep -v -- '-a com.apple/250.AlwaysConnect' "$WORK/anchor-calls" | grep -q .; then echo 'FAIL touched PF outside our anchor'; exit 1; fi
+done
+: > "$WORK/anchor-calls"
+bash "$WORK/anchor-harness.sh" "$WORK" 1 leftover > /dev/null
+[ ! -s "$WORK/anchor-calls" ] || { echo 'FAIL dry-run touched PF'; exit 1; }
+for confirmed in 1 0; do
+  if ANCHOR_CONFIRMED=$confirmed bash "$WORK/verify-harness.sh" "$WORK" 0 1 > "$WORK/verify-output"; then
+    echo 'FAIL failed probe reported success'; exit 1
+  fi
+  grep -q '重启电脑' "$WORK/verify-output" || { echo 'FAIL no next step after a failed probe'; exit 1; }
+done
+grep -q '没能确认' "$WORK/verify-output" || { echo 'FAIL unconfirmed anchor not reported'; exit 1; }
+
 for probe_status in 0 1; do
   : > "$WORK/pf-calls"
   if bash "$WORK/verify-harness.sh" "$WORK" 0 "$probe_status" > "$WORK/verify-output"; then
