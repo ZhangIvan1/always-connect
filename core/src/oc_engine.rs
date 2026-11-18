@@ -1833,6 +1833,9 @@ impl Shared {
 
     fn rearm_direct_after_sync(&self,c:&mut Core)->bool {
         if !c.config.drop_protection || c.stop_requested {return true;}
+        // Route/PF cleanup may converge while offline; only restoration may
+        // reopen optional bypasses. Mandatory base protection still retries.
+        if c.network.paused {return true;}
         let Some((holder,mut inputs))=self.guard.held() else {return c.last_pf.is_none();};
         if holder!=self.holder || !inputs.direct_table || !inputs.block_direct {return true;}
         inputs.block_direct=false;
@@ -1882,7 +1885,7 @@ impl Shared {
     /// A short physical outage need not make openconnect reconnect. Re-arm
     /// only the exact interface previously confirmed by this live child.
     fn reconfirm_tunnel(&self, c: &mut Core) -> bool {
-        if c.stop_requested || c.tunnel_retrying || !c.hook_fired { return false; }
+        if c.network.paused || c.stop_requested || c.tunnel_retrying || !c.hook_fired { return false; }
         let Some(lease) = &c.tunnel_lease else { return false };
         if !c.child.as_ref().is_some_and(|child| child.alive.load(Ordering::SeqCst)
             && child.generation == lease.generation && c.generation == lease.generation)

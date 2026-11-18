@@ -184,3 +184,108 @@ fn double_flap_consumes_exit_intent_and_processes_new_child_output() {
         "new hook must install protection through the fake guard"
     );
 }
+
+#[test]
+fn paused_split_recovery_preserves_blocking_until_restoration() {
+    let f = Fixture::new();
+    let shared = &f.engine.shared;
+    let inputs = Inputs {
+        tunnel_if: "utun99".into(),
+        gateway_ips: vec!["198.51.100.7".into()],
+        physical_if: "en0".into(),
+        direct_table: true,
+        strict_dns: true,
+        block_direct: true,
+        ..Inputs::default()
+    };
+    assert!(shared.guard.apply(&shared.holder, false, &inputs).is_none());
+    let (blocked_while_paused, rearmed_after_restore, no_spawn, terminal_retired) = {
+        let mut c = shared.core.lock().unwrap();
+        c.network.start();
+        c.network.observe(false);
+        c.network.deadline(1, false);
+        c.last_pf = Some((inputs.tunnel_if.clone(), inputs.gateway_ips.clone()));
+        c.last_allow_direct_egress = false;
+        c.pf_needs_load = true;
+        // Upstream mandatory recovery must remain usable during a pause.
+        assert!(shared.apply_base_pf(&mut c));
+        assert!(!c.pf_needs_load);
+        // Reinstall an upstream split base, as a route/PF retry would do.
+        assert!(shared.guard.apply(&shared.holder, false, &inputs).is_none());
+        assert!(shared.rearm_direct_after_sync(&mut c));
+        let blocked = shared.guard.held().unwrap().1.block_direct;
+        shared.spawn_next(&mut c);
+        let no_spawn = c.attempts == 0;
+        c.network.observe(true);
+        assert!(shared.rearm_direct_after_sync(&mut c));
+        let rearmed = !shared.guard.held().unwrap().1.block_direct;
+        shared.guard.own_engine_started(&shared.holder);
+        assert!(shared.guard.bootstrap_context().is_some());
+        shared.finish_terminal(&mut c, Terminal::AuthFailure, "fixture terminal");
+        c.network.paused = true;
+        let terminal_retired =
+            shared.guard.bootstrap_context().is_none() && c.network.observe(true).is_empty();
+        (blocked, rearmed, no_spawn, terminal_retired)
+    };
+    drop(f);
+    assert!(
+        blocked_while_paused,
+        "split recovery must not reopen bypasses during offline pause"
+    );
+    assert!(
+        rearmed_after_restore,
+        "restoration must retain upstream split recovery"
+    );
+    assert!(
+        no_spawn,
+        "mandatory recovery cannot respawn an offline engine"
+    );
+    assert!(
+        terminal_retired,
+        "terminal cleanup must retire both guard and network intent"
+    );
+}
+
+#[test]
+fn paused_engine_does_not_reconfirm_a_stopping_childs_interface() {
+    let f = Fixture::new();
+    let (paused, restored) = {
+        let shared = &f.engine.shared;
+        let mut c = shared.core.lock().unwrap();
+        c.network.start();
+        c.network.observe(false);
+        c.network.deadline(1, false);
+        c.hook_fired = true;
+        c.child = Some(Child {
+            pid: i32::MAX, // State-only fixture; never use a process-group signal target.
+            generation: c.generation,
+            alive: Arc::new(AtomicBool::new(true)),
+        });
+        let name = if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        };
+        c.tunnel_lease = Some(TunnelLease {
+            name: name.into(),
+            index: interface_index(name).unwrap(),
+            generation: c.generation,
+        });
+        let paused = shared.reconfirm_tunnel(&mut c);
+        c.tunnel_if = None;
+        c.network.observe(true);
+        let restored = shared.reconfirm_tunnel(&mut c);
+        c.child = None;
+        c.finished = true;
+        (paused, restored)
+    };
+    drop(f);
+    assert!(
+        !paused,
+        "offline refresh must not reconfirm the child being cancelled"
+    );
+    assert!(
+        restored,
+        "restoration still permits upstream exact-interface reconfirmation"
+    );
+}
