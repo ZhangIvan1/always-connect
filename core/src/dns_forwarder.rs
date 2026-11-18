@@ -1784,9 +1784,14 @@ mod tests {
         let pinned = std::mem::take(&mut *peers.lock().unwrap());
         assert_eq!(pinned.len(), 2, "one UDP and one TCP exchange");
         assert!(pinned.iter().all(|p| (low..=high).contains(p)), "physical DNS left from {pinned:?}");
+        // Tunnel DNS uses ordinary kernel-chosen ports. Only macOS keeps those
+        // above the pinned range (49152+); Linux's 32768-60999 may overlap.
         let tunnel = InterfaceBinding::new(loopback_interface()).unwrap();
         exchange_bound(&q, &[format!("127.0.0.1:{port}")], 53, Some(&tunnel), Duration::from_secs(1)).unwrap();
-        assert!(peers.lock().unwrap().iter().all(|p| !(low..=high).contains(p)), "tunnel DNS does not need the physical exception");
+        let tunnel_ports = std::mem::take(&mut *peers.lock().unwrap());
+        assert_eq!(tunnel_ports.len(), 2);
+        #[cfg(target_os = "macos")]
+        assert!(tunnel_ports.iter().all(|p| *p >= 49152), "tunnel DNS stays on ephemeral ports: {tunnel_ports:?}");
     }
 
     #[test]
