@@ -103,6 +103,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         case .awaitingApproval: return "等你在手机上确认登录"
         case .connected: return "已连接 · \(ProfileStore.loadProfile().server)"
         case .reconnecting:
+            if detail == "等待网络恢复" { return detail }
             let retries = dropRetryCount > 0 ? "（第 \(dropRetryCount) 次）" : ""
             if !protectsDrops {
                 return "已断开，正在重连（断线保护已关，流量走本地网络）" + retries
@@ -1602,6 +1603,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         pathMonitor.pathUpdateHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.cisco?.networkChanged()
                 self.onDemandPathReady = true
                 self.scheduleOnDemandEvaluation()
                 if let (ssid, done) = self.pendingOnDemandFacts {
@@ -1755,6 +1757,17 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     private static func dropSignature(_ record: DropRecord?) -> String {
         guard let record else { return "" }
         return "\(record.recoveredAt.timeIntervalSince1970) \(record.sleepDropCount) \(record.outcomeLabel) \(record.retries ?? 0)"
+    }
+
+    /// Fetch only when exporting; keep the timeline out of recurring snapshots.
+    func ciscoTimelineForDiagnostics(_ completion: @escaping (String) -> Void) {
+        if AppRole.isSettings {
+            SettingsLink.shared.send("ciscoTimeline") { result in
+                completion(result ?? "未收到菜单栏 App 的时间线回复\n")
+            }
+            return
+        }
+        completion(ciscoEngine?.timelineText ?? "Cisco 引擎不可用\n")
     }
 
     /// What the settings process shows, as JSON.
