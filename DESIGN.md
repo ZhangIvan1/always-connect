@@ -3704,3 +3704,17 @@ tick 记录观测到的 Connected→Reconnecting→Disconnected 等变化及上�
 验证级别：Rust 单元与真实事件队列回归（Gate held 状态；Cisco 三种状态下是否断开、恢复时是否重新登录；自建子进程离线保留、无网退出后暂停、恢复只派生一次），去掉对应判断后两条回归都失败；Cisco 接线 harness 新增"已连会话离线不断开、恢复不重新登录"场景。均为脚本级 / CI harness，真实 Cisco 与 openconnect 在断网、合盖唤醒下的表现需 I40 实测；开销对照（§三十二）也待在维护者机器上测。
 
 开销对照的豁免（2026-11-19）：维护者问"如果改动对开销影响不大而且风险也比较低的话就就跳过？你觉得呢"，看过下面的估算后答"可以"，豁免本 PR 合入前的 §三十二 改前改后对照。依据（脚本级，非整机对照）：断网判断只在路由/NWPath 变化时运行，无轮询、无新定时器，`PhysicalConnectivity.available()` 在维护者 Mac 上实测平均约 0.36 毫秒/次；Cisco 时间线固定 200 条、每条为数字与枚举，估算常驻不到 20 KB，只在导出时读取；每次断网只多一个 2 秒的一次性截止，暂停期间 Cisco 原有的 15 秒状态检查停止。I40 的真机项不单独安排，随日常使用验证，未跑过的仍记"需实测"。
+
+## 六十五、CI 的 macOS 部分拆成三个并行 job（2026-11-19）
+
+维护者问"这个ci流程怎么这么长？能否优化下？"。原 macOS job 一个 runner 串行约 41 个步骤，单次约 15 分钟（2026-11-19 的 run：步骤合计 894 秒），Linux 约 1 分钟；耗时集中在几个等待型 harness：手机批准等待 212 秒、会话生命周期 114 秒、Cisco 引擎 85 秒、内核 DNS UID 81 秒、内置 openconnect 66 秒、证书转接 61 秒、安装器 50 秒、更新检查 39 秒。编译本身很快（Rust 测试 16 秒、Xcode 编译 16 秒）。
+
+拆法只移动步骤、不改任何测试：
+
+- `macos`：其余全部步骤（编译、pf、引擎整环、证书转接等），顺序不变（约 4–5 分钟）。
+- `macos-harness`：Cisco 引擎、会话生命周期、更新检查、安装器；这几个脚本自己 `cargo build` + `swiftc`，不依赖 Xcode 产物（约 5 分钟）。
+- `macos-openconnect`：重新编译 Xcode 工程拿到后台服务，`brew install openconnect` 后跑手机批准等待与内置 openconnect（约 5–6 分钟）。单独加了安装 openconnect 的步骤：`approval-wait-test.sh` 在找不到 openconnect 时会静默 SKIP，这里先确认它在 PATH 上。
+
+发布闸门 `scripts/release-ci.py` 原来按名字要求 `rust-linux` 与 `macos` 两个 job 成功，拆分后改为要求四个 job 全部成功，`scripts/release-ci-test.py` 同步覆盖"缺任一 job、或某个 job 被跳过都拒绝发布"。代价：每次多占两台 macOS runner，各自重复约 45 秒的检出与编译；macOS arm64 runner 紧张时三个 job 可能分批排队。
+
+验证级别：本地 YAML 解析与步骤计数核对（原 52 个 run 步骤，新增 4 个重复的编译步骤和 1 个安装步骤，共 57 个）、`release-ci-test.py` 通过；实际提速以推送后的 CI 用时为准。之后可再做的：手机批准等待的 5 个场景互不依赖，可以并行跑（端口和目录已各自独立），把这一步从约 3.5 分钟压到约 1 分钟。

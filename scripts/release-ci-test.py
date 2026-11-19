@@ -61,9 +61,10 @@ class GateTests(unittest.TestCase):
         self.assertEqual(release.validate_ci([ci()], SHA), 1)
 
     def test_both_required_jobs_must_pass(self):
-        good = [{"name": n, "conclusion": "success"} for n in ("macos", "rust-linux")]
+        good = [{"name": n, "conclusion": "success"}
+                for n in ("macos", "macos-harness", "macos-openconnect", "rust-linux")]
         release.validate_jobs(good)
-        for jobs in (good[:1], [good[0], {"name": "rust-linux", "conclusion": "skipped"}]):
+        for jobs in (good[:1], good[:3], good[:3] + [{"name": "rust-linux", "conclusion": "skipped"}]):
             with self.assertRaises(ValueError):
                 release.validate_jobs(jobs)
 

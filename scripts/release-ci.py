@@ -42,7 +42,7 @@ def validate_ci(runs, sha):
 
 
 def validate_jobs(jobs):
-    for name in ("rust-linux", "macos"):
+    for name in ("rust-linux", "macos", "macos-harness", "macos-openconnect"):
         found = [j for j in jobs if j["name"] == name]
         if not found or any(j["conclusion"] != "success" for j in found):
             raise ValueError("Required CI job missing or unsuccessful: " + name)
@@ -65,7 +65,7 @@ def check(repo, sha, tag):
         if run_id is not None:
             jobs = api(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")["jobs"]
             validate_jobs(jobs)
-            print("Tagged commit is on main and both required CI jobs passed")
+            print("Tagged commit is on main and all required CI jobs passed")
             return
         print("Waiting for the tagged commit's main CI", flush=True)
         time.sleep(20)

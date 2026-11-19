@@ -1,8 +1,11 @@
 # CI: Rust tests on Linux (full, incl. libopenconnect auth against a
 # local ocserv gateway) and macOS (core tests + staticlib + Xcode build
-# with signing off). The macOS job is the no-local-Mac verification loop:
-# it proves the Swift shell compiles and links against the Rust core,
-# and runs the Helper's pf generation as a smoke check.
+# with signing off). The macOS checks are the no-local-Mac verification
+# loop: they prove the Swift shell compiles and links against the Rust
+# core, and run the Helper's pf generation as a smoke check. They are
+# split into three parallel jobs (macos, macos-harness,
+# macos-openconnect; DESIGN.md §六十五) so the slow harnesses do not run
+# one after another; scripts/release-ci.py requires every job by name.
 # It does NOT prove a real gateway connection, phone approval, or
 # live traffic routing — those still need a trusted Mac (Phase 0).
 name: CI
@@ -280,13 +283,6 @@ jobs:
           "$HELPER" dump-script > /tmp/ac-vpnc-plan.sh
           chmod +x /tmp/ac-vpnc-plan.sh
           core/scripts/vpnc-route-plan-test.sh /tmp/ac-vpnc-plan.sh
-      - name: Cisco engine harness (fake Cisco CLI)
-        # Sources/App/CiscoEngine.swift against core/scripts/
-        # fake-cisco-vpn.sh (DESIGN.md §21.4): connect, drop + re-login,
-        # manual disconnect, rejected login without retry, transient
-        # retry, adopting a live session. Logic only; Cisco itself is
-        # Mac proof.
-        run: scripts/cisco-engine-test.sh
       - name: Cisco session traffic parser
         run: scripts/cisco-traffic-test.sh
       - name: Quit cleanup (descendant processes, SIGTERM then SIGKILL)
@@ -304,11 +300,6 @@ jobs:
         # Sources/Helper/BootSession.swift (DESIGN.md §23.12). The
         # real reboot is Mac proof.
         run: scripts/boot-session-test.sh
-      - name: Background-service lifecycle (session harness, pfctl stand-in)
-        # HelperSession + kill switch + engine with a logging pfctl
-        # stub and fake-openconnect (DESIGN.md §二十五): every
-        # disconnect/release path gives pf back. Real pf is Mac proof.
-        run: scripts/session-test.sh
       - name: Background-service uid ownership
         run: scripts/helper-uid-test.sh
       - name: Drop history (episodes, outcomes, retries, old records)
@@ -353,15 +344,6 @@ jobs:
         run: scripts/quit-test.sh
       - name: Private settings IPC and process lifetime
         run: scripts/settings-transport-test.sh
-      - name: Update check (GitHub releases list, local fake server)
-        # Sources/App/UpdateChecker.swift + core update_check (DESIGN.md
-        # §三十三). The real GitHub answer and the panel notice are Mac proof.
-        run: scripts/update-check-test.sh
-      - name: One-line installer (install.sh, local fake releases)
-        # DESIGN.md §三十五: release choice, checksum, refusals, replace,
-        # stage-then-install, quarantine cleared. Quitting a real running
-        # App and the real GitHub download are Mac proof.
-        run: scripts/install-test.sh
       - name: Installer version and final-copy policy (signature stub)
         run: scripts/install-policy-test.sh
       - name: DNS forwarder harness (domain split, loopback fake upstreams)
@@ -381,6 +363,57 @@ jobs:
           HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
           test -n "$HELPER"
           scripts/relay-test.sh "$HELPER"
+
+  # Script harnesses that build what they need themselves (cargo +
+  # swiftc); split from `macos` so the slow ones run in parallel.
+  macos-harness:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cisco engine harness (fake Cisco CLI)
+        # Sources/App/CiscoEngine.swift against core/scripts/
+        # fake-cisco-vpn.sh (DESIGN.md §21.4): connect, drop + re-login,
+        # manual disconnect, rejected login without retry, transient
+        # retry, adopting a live session. Logic only; Cisco itself is
+        # Mac proof.
+        run: scripts/cisco-engine-test.sh
+      - name: Background-service lifecycle (session harness, pfctl stand-in)
+        # HelperSession + kill switch + engine with a logging pfctl
+        # stub and fake-openconnect (DESIGN.md §二十五): every
+        # disconnect/release path gives pf back. Real pf is Mac proof.
+        run: scripts/session-test.sh
+      - name: Update check (GitHub releases list, local fake server)
+        # Sources/App/UpdateChecker.swift + core update_check (DESIGN.md
+        # §三十三). The real GitHub answer and the panel notice are Mac proof.
+        run: scripts/update-check-test.sh
+      - name: One-line installer (install.sh, local fake releases)
+        # DESIGN.md §三十五: release choice, checksum, refusals, replace,
+        # stage-then-install, quarantine cleared. Quitting a real running
+        # App and the real GitHub download are Mac proof.
+        run: scripts/install-test.sh
+
+  # Real openconnect against the mock gateway; needs the Xcode-built
+  # background service, so it builds it too.
+  macos-openconnect:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Rust staticlib for the Swift shell
+        working-directory: core
+        run: cargo build --release
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build (signing off — compile + link check only)
+        run: >-
+          xcodebuild -project AlwaysConnect.xcodeproj
+          -scheme AlwaysConnect -destination 'platform=macOS'
+          build CODE_SIGNING_ALLOWED=NO
+      - name: Install openconnect
+        # approval-wait-test.sh skips without openconnect on PATH; the
+        # bundle step copies Homebrew's build. Fail here instead.
+        run: brew install openconnect && command -v openconnect
       - name: Own-connection phone-approval wait (real openconnect, mock gateway)
         # DESIGN.md §30.9: the mock holds its answer to the password as
         # the company gateway does while it waits for the phone; the

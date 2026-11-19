@@ -23,7 +23,9 @@ scripts/drop-test.sh                # 真实断线测：需已连 VPN、App 在�
 
 - CI 两路（.github/workflows/ci.yml）：Linux（Rust + 本地 ocserv 认证）与 macOS
   （XcodeGen 工程编译、引擎整环含掉线重连、vpnc-script 分支与路由计划、pfctl 规则解析、
-  Cisco 引擎 harness、证书转接 harness、会话与进程清扫 harness）。推送后 CI 全绿再汇报。
+  Cisco 引擎 harness、证书转接 harness、会话与进程清扫 harness）。macOS 拆成并行的三个 job
+  （macos、macos-harness、macos-openconnect，DESIGN §六十五）；加减 job 要同步 scripts/release-ci.py
+  的必需名单。推送后 CI 全绿再汇报。
 - 后台服务（Helper）的本机安装：App 里点"安装/更新后台服务"（管理员密码框，内部即
   `scripts/dev-helper.sh install`）；救急恢复本地网络 `sudo scripts/reset-network.sh`（不依赖 App 与网络，
   结束本项目进程、清路由/DNS 残留/pf；用户桌面有双击版"AlwaysConnect 恢复网络.command"），
