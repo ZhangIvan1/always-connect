@@ -48,26 +48,30 @@ run() {
     wait $rp 2>/dev/null; kill $wp $mp 2>/dev/null; wait $mp 2>/dev/null
 }
 
-run approved 4471 1 --approval-hold 6
+# The five scenarios share nothing (own port, directory and output), so
+# they run at once; the checks below read their outputs afterwards.
+run approved 4471 1 --approval-hold 6 &
+run quick 4472 1 &
+run expired 4473 2 --approval-expire 4 &
+run rejected 4474 3 --reject-password &
+APPROVAL_MIN=60 run declined 4475 3 --approval-expire 4 &
+wait
+
 check "approved: the held password shows as waiting for the phone" "$(has '^STATE awaiting-approval' approved)"
 check "approved: the answer ends the wait" "$(grep -A1 '^STATE awaiting-approval' "$W/approved.out" | grep -q 'approval answered' && echo yes || echo no)"
 check "approved: not taken as a rejected password" "$(hasnt 'TERMINAL auth-failure' approved)"
 
-run quick 4472 1
 check "quick: an instant answer never shows as an approval wait" "$(hasnt 'awaiting-approval' quick)"
 
-run expired 4473 2 --approval-expire 4
 check "expired: shown as waiting first" "$(has '^STATE awaiting-approval' expired)"
 check "expired: the approval is asked for again" "$(has '手机上的批准已超时' expired)"
 check "expired: a second login follows" "$(has 'spawning openconnect (attempt 2' expired)"
 check "expired: never stopped as a rejected password" "$(hasnt 'TERMINAL auth-failure' expired)"
 
-run rejected 4474 3 --reject-password
 check "rejected: a wrong password still stops at once" "$(has 'TERMINAL auth-failure' rejected)"
 check "rejected: never shown as an approval wait" "$(hasnt 'awaiting-approval' rejected)"
 check "rejected: no second try (anti-lockout)" "$(hasnt 'attempt 2' rejected)"
 
-APPROVAL_MIN=60 run declined 4475 3 --approval-expire 4
 check "declined: shown as waiting first" "$(has '^STATE awaiting-approval' declined)"
 check "declined: asked once more" "$(has '手机上的登录确认没有通过，' declined)"
 check "declined: a second login follows" "$(has 'spawning openconnect (attempt 2' declined)"

@@ -8,14 +8,21 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
-export FAKE_CISCO_DIR=$WORK
 # The engine is Rust (DESIGN.md §32.11); CiscoEngine.swift is its shell.
 (cd "$ROOT/core" && cargo build --release --quiet) || exit 1
 swiftc -O -parse-as-library -module-name CiscoHarness \
     "$ROOT/Sources/Shared/PhysicalConnectivity.swift" "$ROOT/Sources/App/CiscoEngine.swift" "$ROOT/core/scripts/CiscoEngineHarness.swift" \
     "$ROOT/core/target/release/libalwaysconnect_core.a" -o "$WORK/harness" 2>&1 | grep -v "built for newer"
 [ -x "$WORK/harness" ] || exit 1
-OUT=$("$WORK/harness" "$ROOT/core/scripts/fake-cisco-vpn.sh")
+# Two independent halves run at once, each with its own fake Cisco state
+# and, through a different executable name, its own defaults domain.
+mkdir -p "$WORK/a" "$WORK/b"
+cp "$WORK/harness" "$WORK/harness-a"; cp "$WORK/harness" "$WORK/harness-b"
+FAKE_CISCO_DIR="$WORK/a" "$WORK/harness-a" "$ROOT/core/scripts/fake-cisco-vpn.sh" 1 > "$WORK/a.out" 2>&1 &
+FAKE_CISCO_DIR="$WORK/b" "$WORK/harness-b" "$ROOT/core/scripts/fake-cisco-vpn.sh" 2 > "$WORK/b.out" 2>&1 &
+wait
+grep -q '^ *[0-9.]* DONE$' "$WORK/a.out" || { echo "FAIL first half did not finish"; cat "$WORK/a.out"; exit 1; }
+OUT=$(grep -v '^ *[0-9.]* DONE$' "$WORK/a.out"; cat "$WORK/b.out")
 echo "$OUT"
 FAILS=0
 section() { echo "$OUT" | awk -v s="STEP $1" -v e="STEP $2" '$0 ~ s {p=1; next} $0 ~ e {p=0} p'; }
@@ -64,7 +71,7 @@ need offline "$S" "offline owned=true"
 need offline "$S" "offline cancel-issued=true"
 need offline "$S" "offline daemon-state=Disconnected"
 # The daemon cancel must run even though terminating -s already ended the CLI.
-[ -s "$WORK/cancellations" ] || { echo "MISSING Cisco cancel"; FAILS=$((FAILS+1)); }
+[ -s "$WORK/b/cancellations" ] || { echo "MISSING Cisco cancel"; FAILS=$((FAILS+1)); }
 S=$(section offline-resume offline-manual-stop)
 need resume "$S" "state=connected"
 S=$(section restored-after-manual stop-active-login)
@@ -79,7 +86,7 @@ S=$(section offline-keep DONE)
 need offline-keep "$S" "等待网络恢复"
 need offline-keep "$S" "keep cancel-issued=false"
 need offline-keep "$S" "keep relogin=false"
-LOGINS=$(grep -c . "$WORK/commands" 2>/dev/null || true)
+LOGINS=$(cat "$WORK/a/commands" "$WORK/b/commands" 2>/dev/null | grep -c . || true)
 echo "logins attempted: $LOGINS"
 rm -rf "$WORK"
 echo "cisco-engine FAILS=$FAILS"

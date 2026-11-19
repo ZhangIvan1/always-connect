@@ -44,33 +44,40 @@ struct Harness {
         func wait(_ seconds: Double) {
             RunLoop.main.run(until: Date().addingTimeInterval(seconds))
         }
-        log("STEP connect")
-        engine.connect(); wait(4)
-        log("STEP drop")
-        setState("Disconnected"); wait(9)
-        log("STEP manual-disconnect")
-        let done = DispatchSemaphore(value: 0)
-        engine.disconnect { done.signal() }; wait(2)
-        log("STEP rejected")
-        password = "bad"
-        engine.connect(); wait(5)
-        log("STEP transient-then-good")
-        password = "flaky"
-        engine.connect(); wait(2)
-        password = "good"; wait(5)
-        engine.disconnect {}; wait(1)
-        log("STEP approval-expired")
-        password = "noapprove"
-        engine.connect(); wait(3)
-        engine.disconnect {}; wait(1)
-        log("STEP quick-login-failed")
-        password = "quickfail"
-        engine.connect(); wait(2)
-        log("STEP pushed-failure")
-        engine.disconnect {}; wait(1)
-        password = "pushfail"
-        engine.connect(); wait(3)
-        engine.disconnect {}; wait(1)
+        // Part "1" = connect..pushed-failure, "2" = adopt-on-refresh..end.
+        // The two parts share no state, so the test script runs them as two
+        // processes at once (own fake-CLI directory and defaults domain).
+        let part = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "all"
+        if part != "2" {
+            log("STEP connect")
+            engine.connect(); wait(4)
+            log("STEP drop")
+            setState("Disconnected"); wait(9)
+            log("STEP manual-disconnect")
+            let done = DispatchSemaphore(value: 0)
+            engine.disconnect { done.signal() }; wait(2)
+            log("STEP rejected")
+            password = "bad"
+            engine.connect(); wait(5)
+            log("STEP transient-then-good")
+            password = "flaky"
+            engine.connect(); wait(2)
+            password = "good"; wait(5)
+            engine.disconnect {}; wait(1)
+            log("STEP approval-expired")
+            password = "noapprove"
+            engine.connect(); wait(3)
+            engine.disconnect {}; wait(1)
+            log("STEP quick-login-failed")
+            password = "quickfail"
+            engine.connect(); wait(2)
+            log("STEP pushed-failure")
+            engine.disconnect {}; wait(1)
+            password = "pushfail"
+            engine.connect(); wait(3)
+            engine.disconnect {}; wait(1)
+        }
+        if part == "1" { log("DONE"); return }
         password = "good"
         log("STEP adopt-on-refresh")
         setState("Disconnected")

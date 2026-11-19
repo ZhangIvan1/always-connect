@@ -26,9 +26,10 @@ SCENARIOS=("$@")
     own-lan-direct own-replace orphan-sweep journal-at-start direct-routes-journal
     takeover-adopted takeover-replace protection-off-adopted held-allow-update
     direct-table direct-before-hold direct-adopt old-record)
-FAILED=0
-for s in "${SCENARIOS[@]}"; do
-    T="$WORK/$s"; mkdir -p "$T"
+# Each scenario has its own scratch root, stubs and harness process, so
+# they run in parallel (SESSION_JOBS at a time); reports print in order.
+scenario() {
+    local s=$1 T="$WORK/$1"; mkdir -p "$T"
     cat > "$T/pfctl" <<'STUB'
 #!/bin/bash
 D=$(dirname "$0")
@@ -46,12 +47,25 @@ exit 0
 STUB
     cp "$ROOT/core/scripts/fake-openconnect.sh" "$T/openconnect"
     chmod +x "$T/pfctl" "$T/openconnect"
-    echo "== $s"
-    if ! ALWAYSCONNECT_TEST_ROOT="$T" ALWAYSCONNECT_NO_ROUTES=1 ALWAYSCONNECT_TEST_GRACE=2 FAKE_UP_SECONDS=600 \
-        "$WORK/harness" "$s" 2> "$T/stderr.log"; then
-        FAILED=$((FAILED+1)); echo "  pfctl calls:"; sed 's/^/    /' "$T/pfctl.log" 2>/dev/null || true
-        tail -5 "$T/stderr.log" | sed 's/^/    stderr: /'
-    fi
+    {
+        echo "== $s"
+        if ! ALWAYSCONNECT_TEST_ROOT="$T" ALWAYSCONNECT_NO_ROUTES=1 ALWAYSCONNECT_TEST_GRACE=2 FAKE_UP_SECONDS=600 \
+            "$WORK/harness" "$s" 2> "$T/stderr.log"; then
+            touch "$T/failed"; echo "  pfctl calls:"; sed 's/^/    /' "$T/pfctl.log" 2>/dev/null || true
+            tail -5 "$T/stderr.log" | sed 's/^/    stderr: /'
+        fi
+    } > "$WORK/$s.report" 2>&1
+}
+JOBS=${SESSION_JOBS:-$(( $(sysctl -n hw.ncpu 2>/dev/null || echo 2) * 2 ))}
+for s in "${SCENARIOS[@]}"; do
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do sleep 0.1; done
+    scenario "$s" &
+done
+wait
+FAILED=0
+for s in "${SCENARIOS[@]}"; do
+    cat "$WORK/$s.report"
+    [ ! -e "$WORK/$s/failed" ] || FAILED=$((FAILED+1))
 done
 echo "session-test failures: $FAILED"
 [ $FAILED -eq 0 ]
