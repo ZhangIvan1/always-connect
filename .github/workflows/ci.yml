@@ -330,6 +330,8 @@ jobs:
       - name: Connections page classification and route lookup
         # Sources/Helper/Connections.swift (DESIGN.md §28.7).
         run: scripts/connections-test.sh
+      - name: Connections settings scroll and resize (sample data)
+        run: scripts/connections-ui-test.sh
       - name: Clean uninstall (fake file system, commands logged)
         # scripts/uninstall.sh (DESIGN.md §31): what goes, what stays
         # (Cisco, foreign bundles), the from-App detach and wait. The real

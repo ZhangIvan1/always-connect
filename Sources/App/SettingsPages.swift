@@ -10,6 +10,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @AppStorage("settingsTab") private var tab = "general"
+    var connectionPreview: [ConnectionRow]? = nil
 
     var body: some View {
         TabView(selection: $tab) {
@@ -22,20 +23,15 @@ struct SettingsView: View {
             SplitPage()
                 .tabItem { Label("分流", systemImage: "arrow.triangle.branch") }
                 .tag("split")
-            Form {
-                OnDemandSettings()
-                Section("当前连接") {
-                    ConnectionsPage().frame(height: 360)
-                }
-            }
-                .formStyle(.grouped)
+            ConnectionSettingsPage(preview: connectionPreview)
                 .tabItem { Label("连接", systemImage: "point.3.filled.connected.trianglepath.dotted") }
                 .tag("connections")
             DiagnosticsPage()
                 .tabItem { Label("诊断", systemImage: "stethoscope") }
                 .tag("diagnostics")
         }
-        .frame(width: SettingsWindow.size.width, height: SettingsWindow.size.height)
+        .frame(minWidth: SettingsWindow.minimumSize.width, maxWidth: .infinity,
+               minHeight: SettingsWindow.minimumSize.height, maxHeight: .infinity)
         .toggleStyle(.always)
     }
 }
