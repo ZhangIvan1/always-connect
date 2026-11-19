@@ -16,7 +16,8 @@ import SwiftUI
 /// exits when it closes.
 final class SettingsWindow: NSObject, NSWindowDelegate {
     static let shared = SettingsWindow()
-    static let size = NSSize(width: 760, height: 560)
+    static let size = NSSize(width: 1040, height: 640)
+    static let minimumSize = NSSize(width: 900, height: 560)
 
     private var window: NSWindow?
 
@@ -56,12 +57,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: Self.size),
-            styleMask: [.titled, .closable],
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false)
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.contentViewController = NSHostingController(rootView: SettingsView())
+        window.contentMinSize = Self.minimumSize
         window.title = "AlwaysConnect 设置"
         window.center()
         window.makeKeyAndOrderFront(nil)

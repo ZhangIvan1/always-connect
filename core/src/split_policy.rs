@@ -4,19 +4,34 @@
 use crate::dns_forwarder::SplitRules;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 const MAX_ASSOCIATIONS: usize = 8192;
-#[derive(Default)]
+const MAX_NAMES: usize = 4096;
+/// A name not looked up for this long may be forgotten to make room (§61.8).
+/// Recently used VPN owners are never evicted for a new bypass.
+const IDLE_EVICT: Duration = Duration::from_secs(3600);
 struct Claims {
     current: Vec<(Ipv4Addr, bool)>,
     // Historical VPN addresses stay owned by their name. An explicit rule
     // change can release that name's veto, never another name's veto.
     vpn: HashSet<Ipv4Addr>,
+    /// Last DNS answer for this name (monotonic; does not advance in sleep).
+    seen: Instant,
+}
+impl Claims {
+    /// Distinct addresses this name holds. A VPN answer's address sits in both
+    /// `current` and `vpn`; counting it twice halved the budget (§61.3).
+    fn size(&self) -> usize {
+        self.vpn.len() + self.current.iter().filter(|(ip, _)| !self.vpn.contains(ip)).count()
+    }
 }
 #[derive(Default)]
 pub struct SplitPolicy {
     names: HashMap<String, Claims>,
-    saturated: bool,
+    /// Emergency fallback when every record is recent: all dynamic bypasses
+    /// withdrawn, resumed by itself after IDLE_EVICT (no reconnect needed).
+    saturated: Option<Instant>,
     permitted: HashSet<Ipv4Addr>,
     associations: usize,
 }
@@ -24,29 +39,38 @@ impl SplitPolicy {
     /// True only when effective dynamic permissions change. A VPN-only
     /// observation still records its veto, without forcing route reconciliation.
     pub fn observe(&mut self, name: String, addresses: &[Ipv4Addr], direct: &[Ipv4Addr]) -> bool {
-        if self.saturated { return false; }
+        self.observe_at(name, addresses, direct, Instant::now())
+    }
+    pub(crate) fn observe_at(&mut self, name: String, addresses: &[Ipv4Addr], direct: &[Ipv4Addr], now: Instant) -> bool {
+        if let Some(since) = self.saturated {
+            // Everything was forgotten at `since`; once that is as old as any
+            // record we would evict, resume normal learning.
+            if now.saturating_duration_since(since) < IDLE_EVICT { return false; }
+            self.saturated = None;
+        }
         let observation: Vec<_> = addresses.iter().map(|ip| (*ip, direct.contains(ip) && crate::direct_routes::ordinary_unicast(*ip))).collect();
-        match self.names.get(&name) {
-            Some(claims) if claims.current==observation => return false,
+        match self.names.get_mut(&name) {
+            Some(claims) if claims.current==observation => { claims.seen = now; return false; }
             None if observation.is_empty() => return false,
             _=>{},
         }
         // An address-free answer has no new ownership to retain. Existing
         // entries still retire their grants and keep historical VPN vetoes.
         let empty_name=observation.is_empty().then(||name.clone());
-        let claims = self.names.entry(name).or_default();
-        let old_size=claims.current.len()+claims.vpn.len();
+        let claims = self.names.entry(name).or_insert_with(|| Claims { current: Vec::new(), vpn: HashSet::new(), seen: now });
+        claims.seen = now;
+        let old_size=claims.size();
         let affected:HashSet<_>=claims.current.iter().chain(observation.iter()).filter(|(_,allowed)|*allowed).map(|(ip,_)|*ip).collect();
         claims.vpn.extend(addresses.iter().filter(|ip| !direct.contains(ip)).copied());
         claims.current=observation;
-        self.associations=self.associations-old_size+claims.current.len()+claims.vpn.len();
+        self.associations=self.associations-old_size+claims.size();
         if claims.current.is_empty() && claims.vpn.is_empty() {
             if let Some(name)=empty_name {self.names.remove(&name);}
         }
         let mut changed=false;
         for ip in addresses.iter().filter(|ip|!direct.contains(ip)) {changed|=self.permitted.remove(ip);}
-        if self.enforce_limit() {return true;}
-        if self.saturated {return changed;}
+        if self.enforce_limit(now) {return true;}
+        if self.saturated.is_some() {return changed;}
         for ip in affected {
             let allowed=self.names.values().any(|c|c.current.iter().any(|(address,direct)|*address==ip&&*direct))
                 && !self.names.values().any(|c|c.vpn.contains(&ip));
@@ -54,16 +78,38 @@ impl SplitPolicy {
         }
         changed
     }
-    fn enforce_limit(&mut self)->bool {
-        // Never evict a VPN owner to make room for a new bypass.
-        if self.names.len()>4096 || self.associations>MAX_ASSOCIATIONS {
-            let changed=!self.permitted.is_empty();
-            self.names.clear();self.permitted.clear();self.associations=0;self.saturated=true;
-            return changed;
+    fn over_limit(&self)->bool { self.names.len()>MAX_NAMES || self.associations>MAX_ASSOCIATIONS }
+    /// Make room by forgetting names unused for IDLE_EVICT, oldest first; a
+    /// recently used VPN owner is never evicted for a new bypass. Only when
+    /// every record is recent does the emergency fallback withdraw all bypasses.
+    /// True when effective permissions changed.
+    fn enforce_limit(&mut self, now: Instant)->bool {
+        if !self.over_limit() { return false; }
+        let mut idle: Vec<(Instant, String)> = self.names.iter()
+            .filter(|(_, c)| now.saturating_duration_since(c.seen) >= IDLE_EVICT)
+            .map(|(name, c)| (c.seen, name.clone())).collect();
+        idle.sort_unstable();
+        // Evict down to 7/8 of the limits so the scan runs once per batch of
+        // new names, not on every DNS answer at the limit.
+        let roomy = |p: &Self| p.names.len() <= MAX_NAMES * 7 / 8 && p.associations <= MAX_ASSOCIATIONS * 7 / 8;
+        for (_, name) in idle {
+            if roomy(self) { break; }
+            if let Some(claims) = self.names.remove(&name) { self.associations -= claims.size(); }
         }
-        false
+        if !self.over_limit() {
+            let before = std::mem::take(&mut self.permitted);
+            self.rebuild_permitted();
+            return before != self.permitted;
+        }
+        let changed=!self.permitted.is_empty();
+        self.names.clear();self.permitted.clear();self.associations=0;self.saturated=Some(now);
+        changed
     }
-    pub fn is_saturated(&self)->bool {self.saturated}
+    fn rebuild_permitted(&mut self) {
+        let veto:HashSet<_>=self.names.values().flat_map(|c|c.vpn.iter().copied()).collect();
+        self.permitted=self.names.values().flat_map(|c|c.current.iter()).filter(|(ip,direct)|*direct&&!veto.contains(ip)).map(|(ip,_)|*ip).collect();
+    }
+    pub fn is_saturated(&self)->bool {self.saturated.is_some()}
     pub fn allows(&self,ip:&Ipv4Addr)->bool {self.permitted.contains(ip)}
     pub fn direct_name(&self,ip:&Ipv4Addr)->Option<&str> {
         self.names.iter().filter(|(_,claims)|claims.current.iter().any(|(address,direct)|address==ip&&*direct))
@@ -81,12 +127,9 @@ impl SplitPolicy {
             }
         }
         self.names.retain(|_,claims|!claims.current.is_empty()||!claims.vpn.is_empty());
-        self.associations=self.names.values().map(|c|c.current.len()+c.vpn.len()).sum();
-        self.enforce_limit();
-        if !self.saturated {
-            let veto:HashSet<_>=self.names.values().flat_map(|c|c.vpn.iter().copied()).collect();
-            self.permitted=self.names.values().flat_map(|c|c.current.iter()).filter(|(ip,direct)|*direct&&!veto.contains(ip)).map(|(ip,_)|*ip).collect();
-        }
+        self.associations=self.names.values().map(Claims::size).sum();
+        self.enforce_limit(Instant::now());
+        if self.saturated.is_none() { self.rebuild_permitted(); }
     }
     pub fn direct(&self) -> HashSet<String> {
         self.permitted.iter().map(ToString::to_string).collect()
@@ -103,6 +146,70 @@ mod tests {
         let ips=[std::net::Ipv4Addr::LOCALHOST,std::net::Ipv4Addr::UNSPECIFIED,ip(9)];
         policy.observe("direct.example".into(),&ips,&ips);
         assert_eq!(policy.direct(),HashSet::from([ip(9).to_string()]));
+    }
+
+    #[test]
+    fn vpn_answers_count_each_address_once_against_the_budget() {
+        let mut p = SplitPolicy::default();
+        p.observe("direct.example".into(), &[Ipv4Addr::new(198,51,100,1)], &[Ipv4Addr::new(198,51,100,1)]);
+        // 4000 ordinary VPN names with two addresses each: 8000 distinct
+        // addresses, below the 8192 budget once each is counted once.
+        for n in 0..4000u32 {
+            let ips: Vec<_> = (0..2).map(|k| Ipv4Addr::from(0x0a00_0000 + n * 4 + k)).collect();
+            p.observe(format!("vpn{n}.example"), &ips, &[]);
+        }
+        assert!(!p.is_saturated(), "a VPN address must not be charged twice");
+        assert!(p.direct().contains("198.51.100.1"));
+        // Rotation still grows history, and the bound still holds.
+        for n in 0..200u32 { p.observe("rotating.example".into(), &[Ipv4Addr::from(0x0b00_0000 + n)], &[]); }
+        assert!(p.is_saturated() && p.direct().is_empty());
+    }
+    fn vpn_names(p: &mut SplitPolicy, from: u32, count: u32, at: Instant) {
+        for n in from..from + count {
+            p.observe_at(format!("vpn{n}.example"), &[Ipv4Addr::from(0x0a00_0000 + n * 2), Ipv4Addr::from(0x0a00_0000 + n * 2 + 1)], &[], at);
+        }
+    }
+    #[test]
+    fn long_sessions_forget_idle_names_instead_of_dropping_the_split() {
+        let t0 = Instant::now();
+        let mut p = SplitPolicy::default();
+        vpn_names(&mut p, 0, 4000, t0);
+        let later = t0 + IDLE_EVICT + Duration::from_secs(1);
+        // A VPN name still in use keeps its veto; an idle one may be forgotten.
+        p.observe_at("vpn0.example".into(), &[Ipv4Addr::from(0x0a00_0000), Ipv4Addr::from(0x0a00_0001)], &[], later);
+        p.observe_at("direct.example".into(), &[ip(1)], &[ip(1)], later);
+        vpn_names(&mut p, 10_000, 3000, later);
+        assert!(!p.is_saturated(), "idle names make room; the split keeps working");
+        assert!(p.direct().contains(&ip(1).to_string()));
+        assert!(p.names.contains_key("vpn0.example"), "a refreshed VPN owner is not evicted");
+        assert!(p.names.len() <= MAX_NAMES && p.associations <= MAX_ASSOCIATIONS);
+        // The refreshed name still vetoes a direct claim on its address.
+        p.observe_at("shared.direct.example".into(), &[Ipv4Addr::from(0x0a00_0000)], &[Ipv4Addr::from(0x0a00_0000)], later);
+        assert!(!p.allows(&Ipv4Addr::from(0x0a00_0000)));
+    }
+    #[test]
+    fn an_evicted_idle_veto_no_longer_blocks_a_current_direct_name() {
+        let t0 = Instant::now();
+        let mut p = SplitPolicy::default();
+        p.observe_at("old-vpn.example".into(), &[ip(7)], &[], t0);
+        vpn_names(&mut p, 0, 4000, t0);
+        let later = t0 + IDLE_EVICT + Duration::from_secs(1);
+        p.observe_at("direct.example".into(), &[ip(7)], &[ip(7)], later);
+        assert!(!p.allows(&ip(7)), "the old VPN owner still vetoes before any eviction");
+        vpn_names(&mut p, 10_000, 3000, later);
+        assert!(p.allows(&ip(7)), "after an hour unused, the old VPN record may be forgotten");
+    }
+    #[test]
+    fn when_every_record_is_recent_the_fallback_recovers_by_itself() {
+        let t0 = Instant::now();
+        let mut p = SplitPolicy::default();
+        p.observe_at("direct.example".into(), &[ip(1)], &[ip(1)], t0);
+        vpn_names(&mut p, 0, 4100, t0);
+        assert!(p.is_saturated() && p.direct().is_empty(), "no recent VPN owner is evicted for a bypass");
+        assert!(!p.observe_at("direct.example".into(), &[ip(1)], &[ip(1)], t0 + Duration::from_secs(60)));
+        assert!(p.direct().is_empty());
+        assert!(p.observe_at("direct.example".into(), &[ip(1)], &[ip(1)], t0 + IDLE_EVICT));
+        assert!(!p.is_saturated() && p.direct().contains(&ip(1).to_string()), "learning resumes without reconnecting");
     }
 
     #[test]
@@ -157,7 +264,7 @@ mod tests {
         let mut empty = SplitPolicy::default();
         empty.observe("active.example".into(), &[ip(9)], &[ip(9)]);
         for n in 0..4097 { empty.observe(format!("{n}.example"), &[], &[]); }
-        assert!(!empty.saturated, "address-free answers must not force unrelated direct traffic back into VPN");
+        assert!(!empty.is_saturated(), "address-free answers must not force unrelated direct traffic back into VPN");
         assert_eq!(empty.names.len(),1);
         assert!(empty.allows(&ip(9)));
     }
@@ -177,9 +284,15 @@ mod tests {
     fn rule_revocation_cannot_expand_associations_without_limit() {
         let mut p = SplitPolicy::default();
         for n in 0..4096 { p.observe(format!("{n}.example"), &[ip(1), ip(2)], &[ip(1), ip(2)]); }
-        assert!(!p.saturated);
+        assert!(!p.is_saturated());
+        let before = p.associations;
         p.revalidate(&SplitRules::new::<&str>(&[]));
-        assert!(p.saturated && p.names.is_empty());
+        // A revoked grant becomes that name's VPN veto: the same address, so
+        // the distinct count (and the memory bound it implies) cannot grow.
+        assert_eq!(p.associations, before);
+        assert!(p.direct().is_empty() && !p.is_saturated());
+        p.observe("one-more.example".into(), &[ip(3)], &[]);
+        assert!(p.is_saturated() && p.names.is_empty(), "the bound still applies after revalidation");
     }
     #[test]
     fn saturation_revokes_instead_of_forgetting_vpn_conflicts() {

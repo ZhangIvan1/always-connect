@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 /// entries and group are hidden everywhere and split-list entries are
 /// counted, not listed (DiagnosticsRedaction, DESIGN.md §36.3).
 /// Every exported textual category is reconstructed in Rust; raw status and
-/// history summaries are never copied (§60.5). The live panel is unchanged.
+/// history summaries are never copied (§64.5). The live panel is unchanged.
 enum DiagnosticsExporter {
     static func export(manager: HelperClient, profile: Profile) {
         let panel = NSSavePanel()

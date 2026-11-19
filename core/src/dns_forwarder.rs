@@ -46,6 +46,9 @@ const SVC_IPV4HINT: u16 = 4;
 const SVC_IPV6HINT: u16 = 6;
 
 const MAX_INFLIGHT: usize = 64;
+/// Upstream exchanges per path (direct/local DNS vs company DNS). A dead or
+/// blocked upstream on one path cannot take every worker slot (§61.6).
+const PATH_INFLIGHT: usize = 48;
 const WORKER_STACK: usize = 128 * 1024;
 /// How long a worker waits for the next query before it leaves.
 const WORKER_IDLE: Duration = Duration::from_secs(30);
@@ -873,8 +876,13 @@ pub struct Inner {
     names: Mutex<HashMap<Ipv4Addr, String>>,
     on_direct: Option<DirectHook>,
     inflight: AtomicUsize,
+    /// [company DNS, direct/local DNS] upstream exchanges in progress.
+    path_inflight: [AtomicUsize; 2],
     pool: Pool,
 }
+
+struct PathSlot<'a>(&'a AtomicUsize);
+impl Drop for PathSlot<'_> { fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); } }
 
 type Job = Box<dyn FnOnce(&Inner) + Send>;
 
@@ -936,7 +944,15 @@ impl Inner {
             // after a drop, or while an interface change is being confirmed.
             (&up.tunnel, Some(tunnel_binding.as_ref()?))
         };
-        let answer = exchange_bound(query, servers, self.upstream_port, interface, self.timeout)?;
+        let path = &self.path_inflight[usize::from(entry.is_some())];
+        if path.fetch_add(1, Ordering::AcqRel) >= PATH_INFLIGHT {
+            path.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        let slot = PathSlot(path);
+        let answer = exchange_bound(query, servers, self.upstream_port, interface, self.timeout);
+        drop(slot);
+        let answer = answer?;
         let mut addresses = if q.qtype == TYPE_A && answer[3] & 0x0f == 0 {
             answer_addresses(&answer, query)?
         } else { Vec::new() };
@@ -1099,6 +1115,7 @@ impl Forwarder {
                 names: Mutex::new(HashMap::new()),
                 on_direct,
                 inflight: AtomicUsize::new(0),
+                path_inflight: [AtomicUsize::new(0), AtomicUsize::new(0)],
                 pool: Pool::default(),
             }),
             listen,
@@ -1835,6 +1852,32 @@ mod tests {
         let rebound=UdpSocket::bind(("127.0.0.1",port));
         release.send(()).unwrap();
         assert!(rebound.is_ok(),"stop retained the UDP listener through an outstanding policy acknowledgement: {:?}",rebound.err());
+    }
+
+    #[test]
+    fn a_hung_path_cannot_take_the_other_paths_worker_slots() {
+        // Direct (local) DNS exchanges already fill their per-path budget, as
+        // when the local DNS hangs or is blocked: further direct queries are
+        // dropped at once, company DNS still resolves (and vice versa).
+        assert!(PATH_INFLIGHT < MAX_INFLIGHT, "each path must leave worker slots to the other");
+        let (vpn_port, vpn_seen) = fake_udp([198, 51, 100, 4], false);
+        let (local_port, local_seen) = fake_udp([203, 0, 113, 4], false);
+        let forwarder = Forwarder::new(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 53, Duration::from_millis(500),
+            vec!["direct.example".into()],
+            Upstreams { tunnel: vec![format!("127.0.0.1:{vpn_port}")], local: vec![format!("127.0.0.1:{local_port}")],
+                physical_if: None, tunnel_if: Some(loopback_interface().into()) }, None);
+        let inner = forwarder.inner();
+        inner.path_inflight[1].store(PATH_INFLIGHT, Ordering::SeqCst);
+        assert!(inner.resolve(&query("a.direct.example", TYPE_A, 1)).is_none());
+        assert_eq!(local_seen.load(Ordering::SeqCst), 0, "a full path does not query its upstream");
+        assert!(inner.resolve(&query("company.example", TYPE_A, 2)).is_some());
+        assert_eq!(inner.path_inflight[0].load(Ordering::SeqCst), 0, "the slot is returned after the exchange");
+        inner.path_inflight[1].store(0, Ordering::SeqCst);
+        inner.path_inflight[0].store(PATH_INFLIGHT, Ordering::SeqCst);
+        assert!(inner.resolve(&query("company2.example", TYPE_A, 3)).is_none());
+        assert!(inner.resolve(&query("b.direct.example", TYPE_A, 4)).is_some());
+        assert_eq!((vpn_seen.load(Ordering::SeqCst), local_seen.load(Ordering::SeqCst)), (1, 1));
+        assert_eq!(inner.path_inflight[1].load(Ordering::SeqCst), 0);
     }
 
     #[test]

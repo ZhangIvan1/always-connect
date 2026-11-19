@@ -1552,7 +1552,9 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
         ensureConnection { proxy in
             var finished = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            // Read-only checks (≤2 s) plus the active probes run in parallel
+            // (§63); an older service still answers well within this limit.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
                 if !finished { finished = true; done(nil) }
             }
             proxy.runLeakCheck { json in

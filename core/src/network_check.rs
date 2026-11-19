@@ -1,5 +1,6 @@
 //! Read-only checks of the configuration actually loaded by macOS (§48).
-//! Decisions and parsers are Rust; no probe sends traffic or changes the network.
+//! Decisions and parsers are Rust; nothing here changes the network. The
+//! active leak probes (leak_probe.rs, §63) run alongside as an ordinary user.
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -13,6 +14,8 @@ pub struct Expected {
     pub dns: Vec<String>, pub split: bool, pub protection: bool,
     pub rules: Option<String>, pub direct: Vec<String>, pub routes: Vec<String>,
     pub error: Option<String>, pub epoch: u64,
+    /// The physical network's own DNS servers, for the active probe.
+    pub local_dns: Vec<String>,
 }
 #[derive(Serialize)]
 pub struct Item { pub item: String, pub passed: bool, pub informational: bool, pub detail: String }
@@ -283,7 +286,12 @@ pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Ou
             let words: Vec<_> = line.split_whitespace().collect();
             words.windows(2).any(|w| w[0] == "on" && w[1].starts_with("utun") && w[1] != tunnel)
         });
-        let mut compatibility=item("其他 VPN 隧道兼容", pf.ok && !other_tunnel, "保留其他隧道的兼容放行；本项目不接管其他 VPN，不承诺整机唯一出口");
+        // The DNS barrier precedes the tunnel passes: other tunnels keep their
+        // ordinary traffic, not their port-53 DNS (§61.2). Say so.
+        let dns_barrier=expected.rules.as_deref().is_some_and(|r|r.contains("block drop out quick proto { udp tcp } to any port 53"));
+        let detail=if dns_barrier {"其他隧道的普通流量保留兼容放行，但它们的 DNS（53 端口）被按网站分流的 DNS 保护拦截；本项目不接管其他 VPN，不承诺整机唯一出口"}
+            else {"保留其他隧道的兼容放行；本项目不接管其他 VPN，不承诺整机唯一出口"};
+        let mut compatibility=item("其他 VPN 隧道兼容", pf.ok && !other_tunnel, detail);
         compatibility.informational=true;result.push(compatibility);
         if expected.split {
             let table = get("/sbin/pfctl", &["-a", crate::pf::ANCHOR, "-t", crate::pf::DIRECT_TABLE, "-T", "show"]);
@@ -302,7 +310,16 @@ pub fn run_with(expected: &Expected, mut exec: impl FnMut(&str, &[String]) -> Ou
 /// Only fixed system binaries and read-only arguments are used.
 pub fn run(expected: &Expected) -> Vec<Item> {
     let deadline = Instant::now() + Duration::from_secs(2);
-    run_with(expected, |path,args| read_command(path,args,deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(400))))
+    // Active probes run in parallel with the read-only commands (§63).
+    let plan = crate::leak_probe::Plan { physical: expected.physical.clone(), local_dns: expected.local_dns.clone(),
+        external_v4: Vec::new(), external_v6: None, dns_port: None, tcp_port: None, timeout_ms: 800 };
+    let probes = expected.tunnel.is_some().then(|| std::thread::spawn(move || crate::leak_probe::run_child(&plan, Duration::from_millis(1800))));
+    let mut items = run_with(expected, |path,args| read_command(path,args,deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(400))));
+    if let Some(probes) = probes {
+        let report = probes.join().ok().flatten();
+        items.extend(crate::leak_probe::items(report.as_ref(), expected.protection));
+    }
+    items
 }
 
 pub(crate) fn read_command(path: &str, args: &[String], limit: Duration) -> Output {
@@ -326,7 +343,7 @@ mod tests {
     use super::*;
     fn expected() -> Expected {
         let rules = crate::pf::generate(&crate::pf::PfInput { tunnel_if:"utun5".into(), physical_if:"en0".into(), gateway_ips:vec!["203.0.113.1".into()], allow_networks:vec!["192.168.0.0/16".into()], allow_direct_egress:false, allow_dns:false, dns_servers:vec!["192.168.1.1".into()],tunnel_dns_servers:vec!["10.1.1.1".into()],direct_table:true,strict_dns:false,block_direct:false }).unwrap();
-        Expected { tunnel:Some("utun5".into()),dns_interface:Some("utun5".into()),physical:"en0".into(),gateway:Some("192.168.1.1".into()),vpn_gateways:vec!["203.0.113.1".into()],dns:vec!["10.1.1.1".into()],split:true,protection:true,rules:Some(rules),direct:vec!["198.51.100.9".into()],routes:vec!["198.51.100.9".into()],error:None,epoch:1 }
+        Expected { tunnel:Some("utun5".into()),dns_interface:Some("utun5".into()),physical:"en0".into(),gateway:Some("192.168.1.1".into()),vpn_gateways:vec!["203.0.113.1".into()],dns:vec!["10.1.1.1".into()],split:true,protection:true,rules:Some(rules),direct:vec!["198.51.100.9".into()],routes:vec!["198.51.100.9".into()],error:None,epoch:1,local_dns:vec![] }
     }
     fn fixture(e:&Expected, path:&str,args:&[String]) -> Output {
         let text = if args==["-s","rules"] {"anchor \"com.apple/*\" all".into()}
@@ -420,6 +437,10 @@ mod tests {
         }
         let compatibility=run(true,"203.0.113.1\n192.168.0.0/16").into_iter().find(|r|r.item=="其他 VPN 隧道兼容").unwrap();
         assert!(compatibility.informational, "compatibility outside our scope must not require disabling other clients");
+        let e=expected();
+        let strict=e.rules.as_deref().unwrap().contains("to any port 53");
+        let row=run_with(&e,|p,a|fixture(&e,p,a)).into_iter().find(|r|r.item=="其他 VPN 隧道兼容").unwrap();
+        assert_eq!(row.detail.contains("DNS（53 端口）被"),strict,"the compatibility note must not hide the DNS barrier");
     }
     #[test]
     fn kernel_parser_output_matches_implicit_flags_and_deduplicated_passes() {

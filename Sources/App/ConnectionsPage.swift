@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @_silgen_name("ac_traffic_sample")
@@ -81,8 +82,14 @@ struct ConnectionsPage: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(width: 220)
-                TextField("搜程序或地址", text: $search)
-                    .textFieldStyle(.roundedBorder)
+                Spacer(minLength: 0)
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                    TextField("搜程序或地址", text: $search, prompt: Text("搜程序或地址"))
+                        .textFieldStyle(.roundedBorder)
+                        .labelsHidden()
+                }
+                .frame(minWidth: 180, maxWidth: 340)
                 Button("刷新", action: refresh)
             }
             Text(summary)
@@ -90,33 +97,34 @@ struct ConnectionsPage: View {
                 .foregroundStyle(.secondary)
             Table(shown, sortOrder: $sortOrder) {
                 TableColumn("程序") { row in
-                    Text(row.process).lineLimit(1)
+                    Text(row.process).lineLimit(1).help(row.process)
                 }
-                .width(92)
+                .width(processColumnWidth)
                 TableColumn("地址") { row in
                     Text(row.address + (row.count > 1 ? "  ×\(row.count)" : ""))
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .help(row.address)
                 }
-                .width(min: 120, ideal: 170)
+                .width(min: 160, ideal: 180)
                 TableColumn("协议") { row in
                     Text(row.protocolName).lineLimit(1).help(row.protocolName)
                 }
-                .width(110)
+                .width(protocolColumnWidth)
                 // Click the header to put the busiest first (§四十五).
                 TableColumn("速度", value: \.busiest) { row in
                     Text(row.speed == 0 ? "—" : "↓" + Self.rate(row.down) + " ↑" + Self.rate(row.up))
                         .font(.callout.monospacedDigit())
                         .foregroundStyle(row.speed == 0 ? Color.secondary : Color.primary)
                         .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
-                .width(84)
+                .width(92)
                 TableColumn("走向") { row in
                     Text(row.via == "vpn" ? "VPN" : row.via == "local" ? "本机" : "直连")
                         .foregroundStyle(row.via == "vpn" ? Color.green : row.via == "local" ? Color.secondary : Color.orange)
                 }
-                .width(42)
+                .width(34)
                 // The action sits at the end of the reason cell: a column
                 // of its own cut "VPN 隧道本身" short (§44.3).
                 TableColumn("原因") { row in
@@ -126,8 +134,10 @@ struct ConnectionsPage: View {
                         action(row)
                     }
                 }
-                .width(min: 90, ideal: 112)
+                .width(110)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .layoutPriority(1)
             if let notice {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
@@ -152,12 +162,27 @@ struct ConnectionsPage: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
-            sites = DirectSites.sites(ProfileStore.loadAppSettings())
-            if let preview { rows = Self.group(preview); updated = Date() } else { refresh() }
+            if preview == nil { sites = DirectSites.sites(ProfileStore.loadAppSettings()) }
+            refresh()
         }
+        .onChange(of: preview) { if let sample = $0 { update(sample) } }
         .onReceive(timer) { _ in if preview == nil { refresh() } }
         .onDisappear { if preview == nil { DispatchQueue.global(qos: .utility).async { ac_traffic_stop() } } }
+    }
+
+    private var protocolColumnWidth: CGFloat {
+        max(80, Self.textWidth(Set(rows.map(\.protocolName))) + 8)
+    }
+
+    private var processColumnWidth: CGFloat {
+        min(220, max(96, Self.textWidth(Set(rows.map(\.process))) + 8))
+    }
+
+    private static func textWidth(_ values: Set<String>) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        return ceil(values.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0)
     }
 
     /// The background service calls every network it was given "局域网":
@@ -272,6 +297,10 @@ struct ConnectionsPage: View {
     }
 
     private func refresh() {
+        if let preview {
+            update(preview)
+            return
+        }
         HelperClient.shared.fetchConnections { result in
             guard let result else {
                 message = "后台服务没有回复：可能是旧版本（面板上点「更新」），或者还没装。"
@@ -281,16 +310,18 @@ struct ConnectionsPage: View {
             // nettop takes a few tens of ms: off the main thread.
             DispatchQueue.global(qos: .utility).async {
                 let speeds = Self.sample(result)
-                DispatchQueue.main.async {
-                    updated = Date()
-                    rows = Self.group(result, speeds: speeds?.ready == true ? speeds?.rows : nil)
-                    if let speeds, speeds.ready, speeds.vpn.count == 2, speeds.direct.count == 2 {
-                        totals = (speeds.vpn, speeds.direct)
-                    } else {
-                        totals = nil
-                    }
-                }
+                DispatchQueue.main.async { update(result, speeds: speeds) }
             }
+        }
+    }
+
+    private func update(_ result: [ConnectionRow], speeds: Speeds? = nil) {
+        updated = Date()
+        rows = Self.group(result, speeds: speeds?.ready == true ? speeds?.rows : nil)
+        if let speeds, speeds.ready, speeds.vpn.count == 2, speeds.direct.count == 2 {
+            totals = (speeds.vpn, speeds.direct)
+        } else {
+            totals = nil
         }
     }
 

@@ -167,6 +167,19 @@ restore_scoped_routes_from_journal() {
     run /sbin/route -n delete -ifscope "$tun" default
 }
 
+# 0 = our anchor flushed and read back without rules (an anchor that no
+# longer exists has none either); 1 = not confirmed. Only our anchor.
+clear_our_anchor() {
+    run pfctl -a "$ANCHOR" -F all
+    [ "$DRY" = 1 ] && return 0
+    if remaining=$(pfctl -a "$ANCHOR" -s rules 2>/dev/null); then
+        [ -z "$remaining" ]; return
+    fi
+    detail=$(pfctl -a "$ANCHOR" -s rules 2>&1 >/dev/null || true)
+    case "$detail" in *"Invalid argument"*|*"does not exist"*) return 0;; esac
+    return 1
+}
+
 web() { curl -s -m 6 -o /dev/null -w '%{http_code}' https://www.apple.com 2>/dev/null || true; }
 webok() { case "$(web)" in 200|301|302) return 0;; *) return 1;; esac; }
 
@@ -309,7 +322,8 @@ run killall -HUP mDNSResponder
 
 # 5 pf: our anchor and our enable reference only
 say "empty our pf anchor"
-run pfctl -a "$ANCHOR" -F all
+ANCHOR_CONFIRMED=1
+clear_our_anchor || { ANCHOR_CONFIRMED=0; say "our pf anchor still has rules or could not be read"; }
 [ -n "$TOKEN" ] && { say "release our pf enable reference"; run pfctl -X "$TOKEN"; }
 
 # The background service back in place, idle: nothing is held any more,
@@ -323,9 +337,21 @@ fi
 [ $DRY = 1 ] && { echo "== dry-run done, nothing changed"; exit 0; }
 sleep 2
 if webok; then
-    echo "== 网络已恢复：默认路由 $(route -n get default 2>/dev/null | awk '/interface:/{print $2}')，网页可以打开。"
-    exit 0
+    # Success also needs our anchor confirmed clear: a working page alone
+    # does not prove our rules are gone (they may bite after a network change).
+    if [ "${ANCHOR_CONFIRMED:-0}" = 1 ]; then
+        echo "== 网络已恢复：默认路由 $(route -n get default 2>/dev/null | awk '/interface:/{print $2}')，网页可以打开。"
+        exit 0
+    fi
+    echo "== 网页可以打开，但没能确认 AlwaysConnect 的防火墙规则已清除：之后若断网，请重启电脑（本程序开机时不会封网）。"
+    exit 1
 fi
-echo "== AlwaysConnect 的恢复操作已执行，但尚未确认网络可用；保留系统及其他 VPN 的过滤规则。"
+# Shared PF stays on (§55.7); give the user a next step instead.
+if [ "${ANCHOR_CONFIRMED:-0}" = 1 ]; then
+    echo "== AlwaysConnect 的设置已清除，但网页仍打不开：请检查 Wi-Fi 或网线；仍不行就重启电脑（本程序开机时不会封网）。"
+else
+    echo "== 没能确认 AlwaysConnect 的防火墙规则已清除，网页仍打不开：请重启电脑（本程序开机时不会封网）。"
+fi
+echo "   系统和其他 VPN 的过滤规则保持不变。"
 echo "   当前默认路由：$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
 exit 1
