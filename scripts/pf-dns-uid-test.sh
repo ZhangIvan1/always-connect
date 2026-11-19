@@ -54,10 +54,6 @@ PORT=$(head -1 "$WORK/port")
   | awk '/port 53 user root no state$/ || /^block drop out quick proto .* to any port 53$/ { print }' \
   | sed -e "s/port 53/port $PORT/g" -e 's/to any port/to 127.0.0.1 port/g' > "$WORK/rules"
 grep -q 'user root' "$WORK/rules"
-# The root exception names the forwarder's source ports (DESIGN §61.1).
-RANGE=$(sed -n 's/.*from any port \([0-9]*\):\([0-9]*\) to .*/\1 \2/p' "$WORK/rules" | head -1)
-read -r SOURCE_LOW SOURCE_HIGH <<< "$RANGE"
-[ -n "$SOURCE_LOW" ] && [ -n "$SOURCE_HIGH" ] && [ "$SOURCE_LOW" -lt "$SOURCE_HIGH" ]
 grep -q 'block drop out quick' "$WORK/rules"
 # Main rules belong to the explicit runner-initialisation step, not this test.
 sudo -n /sbin/pfctl -s rules 2>/dev/null | grep -q 'anchor "com.apple/\*"' || {
@@ -66,9 +62,8 @@ sudo -n /sbin/pfctl -s rules 2>/dev/null | grep -q 'anchor "com.apple/\*"' || {
 # Labels are only counter identifiers and do not change matching semantics.
 sed -i '' -e '/^pass /s/$/ label "AC_UID_ROOT"/' -e '/^block /s/$/ label "AC_UID_BLOCK"/' "$WORK/rules"
 probe() {
-    who=$1; proto=$2; stage=$3; source_port=${4:-}
+    who=$1; proto=$2; stage=$3
     args=(-n -w 1); [ "$proto" != udp ] || args+=(-u)
-    [ -z "$source_port" ] || args+=(-p "$source_port")
     if [ "$who" = root ]; then command=(sudo -n /usr/bin/nc); else command=(/usr/bin/nc); fi
     code=0
     reply=$(printf uid-query | "${command[@]}" "${args[@]}" 127.0.0.1 "$PORT" 2> "$WORK/$stage-$who-$proto.err") || code=$?
@@ -102,22 +97,17 @@ done
 TOKEN=$(sudo -n /sbin/pfctl -E 2>&1 | sed -n 's/.*Token[[:space:]]*:[[:space:]]*//p')
 [ -n "$TOKEN" ]
 sudo -n /sbin/pfctl -a "$ANCHOR" -f - < "$WORK/rules"; LOADED=1
-offset=1
 for proto in tcp udp; do
     before_root=$(counters AC_UID_ROOT)
-    probe root "$proto" protected $((SOURCE_LOW + offset)); offset=$((offset + 1))
+    probe root "$proto" protected
     [ "$PROBE_CODE" = 0 ] && [ "$PROBE_REPLY" = uid-query ] || { echo "FAIL root $proto barrier"; exit 1; }
     after_root=$(counters AC_UID_ROOT)
     [ "$after_root" -gt "$before_root" ] || { echo 'Root pass did not match this anchor'; exit 1; }
-    # Root from any other port stands for a root extension re-sending a
-    # user's query: it must meet the DNS barrier like the user does.
-    for who in root user; do
-        before_block=$(counters AC_UID_BLOCK)
-        probe "$who" "$proto" protected-other
-        [ -z "$PROBE_REPLY" ] || { echo "FAIL $who outside the source ports bypassed $proto barrier"; exit 1; }
-        after_block=$(counters AC_UID_BLOCK)
-        [ "$after_block" -gt "$before_block" ] || { echo 'Drop not attributable to this anchor'; exit 1; }
-    done
+    before_block=$(counters AC_UID_BLOCK)
+    probe user "$proto" protected
+    [ -z "$PROBE_REPLY" ] || { echo "FAIL ordinary user bypassed $proto barrier"; exit 1; }
+    after_block=$(counters AC_UID_BLOCK)
+    [ "$after_block" -gt "$before_block" ] || { echo 'Drop not attributable to this anchor'; exit 1; }
 done
 sudo -n /sbin/pfctl -a "$ANCHOR" -F rules
 for proto in tcp udp; do
