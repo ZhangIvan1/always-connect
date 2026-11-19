@@ -3733,3 +3733,5 @@ tick 记录观测到的 Connected→Reconnecting→Disconnected 等变化及上�
 推送后实测（run f67acfb）：总用时约 4.8 分钟（原 15 分钟、拆分后 7.7 分钟）。手机批准等待 178 → 16 秒，内核 DNS UID 81 → 9 秒，证书转接 63 → 31 秒，会话生命周期 122 → 49 秒，Cisco 引擎 118 → 84 秒。此时 `macos-openconnect` 只用 2.4 分钟，另两个约 4.6 分钟，于是把证书转接（需要后台服务产物，该 job 也有）和安装器测试再挪到 `macos-openconnect`。各 runner 冷启动时编译用时差别很大（同一 Xcode 编译 22–60 秒），之后的分钟级差异以实际 run 为准。
 
 再推送后（run 335ab5d）三个 macOS job 分别约 2.6、3.4、5.2 分钟，但 Linux 这次在 `apt-get install` 上花了约 9 分钟：Ubuntu 镜像逐个包卡 15–35 秒（平时整个 Linux job 约 1 分钟）。安装改为不装推荐包，并给 apt 加 15 秒超时与 3 次重试，镜像卡住时尽快换源重试而不是一直等。
+
+之后（run 4887f6c）Linux 回到约 50 秒，总用时约 5.7 分钟，最慢的是 `macos-openconnect`（5.5 分钟，另两个约 3.5 分钟），于是把不依赖 Xcode 产物的安装器、名单规则、按需连接三项挪到 `macos-harness`。
