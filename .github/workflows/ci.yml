@@ -33,7 +33,13 @@ jobs:
       - name: Release gate and publication failure cases (no secrets or network)
         run: python3 scripts/release-ci-test.py
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libopenconnect-dev ocserv openconnect
+        # No recommended extras (dnsmasq, docs, test tools: ~55 -> fewer
+        # packages), and a stalled mirror fetch times out and retries
+        # instead of hanging (one run spent 9 min here, DESIGN §65.1).
+        run: >-
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update &&
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15
+          install -y --no-install-recommends libopenconnect-dev ocserv openconnect
       - name: Start test gateway
         # ocserv refuses to run without root ("This server requires root
         # access to operate"); Actions runners have passwordless sudo.
