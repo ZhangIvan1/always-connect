@@ -14,6 +14,7 @@ pub mod dns_forwarder;
 pub mod dns_routes;
 pub mod ffi;
 pub mod kill_switch;
+pub mod leak_probe;
 pub mod network_guard;
 pub mod network_check;
 pub mod oc_engine;

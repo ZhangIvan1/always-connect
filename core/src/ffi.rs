@@ -1794,6 +1794,12 @@ pub extern "C" fn ac_oc_network_check(engine: *const crate::oc_engine::Engine) -
 }
 
 
+/// `AlwaysConnectHelper leak-probe <plan>` child (§63): runs as nobody.
+#[no_mangle]
+pub extern "C" fn ac_leak_probe_child(plan: *const c_char) -> *mut c_char {
+    c_str(plan).and_then(|plan| crate::leak_probe::child_main(&plan)).map(owned).unwrap_or(std::ptr::null_mut())
+}
+
 #[no_mangle]
 pub extern "C" fn ac_gateway_literal(host:*const c_char)->*mut c_char {
     c_str(host).and_then(|host|host.parse::<Ipv4Addr>().ok()).map(|ip|owned(ip.to_string())).unwrap_or(std::ptr::null_mut())

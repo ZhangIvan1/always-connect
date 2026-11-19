@@ -583,6 +583,7 @@ impl Engine {
             rules: self.shared.guard.expected_rules(), direct: self.shared.guard.direct_addresses(),
             routes: self.shared.routes.addresses(), error: c.pf_error.clone().or_else(||c.network_routes_error.clone()),
             epoch: c.forwarder.as_ref().map(|f| f.epoch()).unwrap_or(c.generation),
+            local_dns: c.local_dns.clone(),
         }
     }
     pub fn run_network_check(&self) -> String {

@@ -50,6 +50,12 @@ struct HelperMain {
             dumpScript()
         case "relay-client-cert":
             relayClientCert(args: args)
+        case "leak-probe":
+            // Self-check child (DESIGN.md §63): started by the root service as
+            // nobody; the probes and the refusal to run as root are in Rust.
+            guard let plan = args.first, let report = NetworkGuard.take(ac_leak_probe_child(plan)) else { exit(1) }
+            print(report)
+            exit(0)
         default:
             usage()
             exit(2)
@@ -364,3 +370,6 @@ struct HelperMain {
         fputs("  AlwaysConnectHelper dump-script\n", stderr)
     }
 }
+
+@_silgen_name("ac_leak_probe_child")
+func ac_leak_probe_child(_ plan: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
