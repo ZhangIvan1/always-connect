@@ -63,7 +63,9 @@ sudo -n /sbin/pfctl -s rules 2>/dev/null | grep -q 'anchor "com.apple/\*"' || {
 sed -i '' -e '/^pass /s/$/ label "AC_UID_ROOT"/' -e '/^block /s/$/ label "AC_UID_BLOCK"/' "$WORK/rules"
 probe() {
     who=$1; proto=$2; stage=$3
-    args=(-n -w 1); [ "$proto" != udp ] || args+=(-u)
+    # -G bounds the TCP connect: a dropped SYN otherwise waits for the
+    # kernel's ~75 s connect timeout (-w does not cover it on macOS nc).
+    args=(-n -w 1); if [ "$proto" = udp ]; then args+=(-u); else args+=(-G 2); fi
     if [ "$who" = root ]; then command=(sudo -n /usr/bin/nc); else command=(/usr/bin/nc); fi
     code=0
     reply=$(printf uid-query | "${command[@]}" "${args[@]}" 127.0.0.1 "$PORT" 2> "$WORK/$stage-$who-$proto.err") || code=$?

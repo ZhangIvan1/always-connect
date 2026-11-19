@@ -41,6 +41,7 @@ Usage:
 """
 
 import http.server
+import socketserver
 import ssl
 import sys
 import threading
@@ -176,6 +177,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 MODE = {"hold": 0.0, "expire": None, "reject": False}
 
 
+
+class LocalServer(http.server.ThreadingHTTPServer):
+    """No reverse lookup of 127.0.0.1 before listening: HTTPServer's
+    server_bind calls getfqdn, which can stall for many seconds on CI
+    runners while every client is already waiting to connect."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "localhost", self.server_address[1]
+
+
 def main():
     args = sys.argv[5:]
     for flag in ("--approval-hold", "--approval-expire"):
@@ -185,7 +197,7 @@ def main():
     MODE["reject"] = "--reject-password" in args
     port = int(sys.argv[1])
     cert, key = sys.argv[2], sys.argv[3]
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server = LocalServer(("127.0.0.1", port), Handler)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
     if "--require-client-cert" in sys.argv[5:]:
