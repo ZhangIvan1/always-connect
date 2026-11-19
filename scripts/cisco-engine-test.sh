@@ -70,11 +70,15 @@ need resume "$S" "state=connected"
 S=$(section restored-after-manual stop-active-login)
 none manual-offline "$S" "state=authenticating"
 none manual-offline "$S" "state=connected"
-S=$(section stop-active-login DONE)
+S=$(section stop-active-login offline-keep)
 need active-stop "$S" "manual disconnect"
 need active-stop "$S" "cancelled owned=false"
 need active-stop "$S" "active cancel-issued=true"
 none active-stop "$S" "秒后重试"
+S=$(section offline-keep DONE)
+need offline-keep "$S" "等待网络恢复"
+need offline-keep "$S" "keep cancel-issued=false"
+need offline-keep "$S" "keep relogin=false"
 LOGINS=$(grep -c . "$WORK/commands" 2>/dev/null || true)
 echo "logins attempted: $LOGINS"
 rm -rf "$WORK"

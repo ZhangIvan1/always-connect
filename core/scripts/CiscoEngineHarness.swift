@@ -125,6 +125,22 @@ struct Harness {
         engine.disconnect {}; wait(3)
         log("cancelled owned=\(engine.isManaging)")
         log("active cancel-issued=\(cancellationCount() > beforeActiveStop)")
+        // A session Cisco already holds is kept through an outage (§64.2).
+        log("STEP offline-keep")
+        func loginCount() -> Int {
+            (try? String(contentsOfFile: dir + "/commands", encoding: .utf8))?.split(separator: "\n").count ?? 0
+        }
+        password = "good"
+        engine.connect(); wait(3)
+        let loginsBeforeKeep = loginCount()
+        let cancelsBeforeKeep = cancellationCount()
+        available = false
+        engine.networkChanged(); wait(3)
+        log("keep cancel-issued=\(cancellationCount() > cancelsBeforeKeep)")
+        available = true
+        engine.networkChanged(); wait(3)
+        log("keep relogin=\(loginCount() > loginsBeforeKeep)")
+        engine.disconnect {}; wait(1)
         log("DONE")
     }
 }

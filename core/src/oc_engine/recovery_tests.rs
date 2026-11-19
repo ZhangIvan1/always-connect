@@ -361,105 +361,62 @@ fn offline_watcher_retries_blocking_without_physical_facts() {
 }
 
 #[test]
-fn restored_watcher_never_reconfirms_a_live_cancelled_child() {
+fn offline_keeps_an_established_session_and_pauses_only_after_it_exits() {
     let f = Fixture::with_physical_facts(true);
-    let name = if cfg!(target_os = "macos") {
-        "lo0"
-    } else {
-        "lo"
-    };
     std::fs::write(
         f.dir.join("openconnect"),
-        format!(
-            r#"#!/bin/sh
+        r#"#!/bin/sh
 root=$(dirname "$0")
 read -r credential
-trap '' TERM
-printf 'AC_HOOK connect tun={} gateway=198.51.100.7 dns=10.8.0.1\n'
-touch "$root/ready"
-while [ ! -f "$root/exit" ]; do sleep 0.01; done
+if mkdir "$root/first" 2>/dev/null; then
+    trap 'touch "$root/term"' TERM
+    printf 'AC_HOOK connect tun=utun99 gateway=198.51.100.7\n'
+    while [ ! -f "$root/exit" ]; do sleep 0.01; done
+else
+    touch "$root/second"
+    while [ ! -f "$root/finish" ]; do sleep 0.01; done
+fi
 "#,
-            name
-        ),
     )
     .unwrap();
     f.engine.start();
-    assert!(wait_until(|| f
-        .engine
-        .shared
-        .core
-        .lock()
-        .unwrap()
-        .hook_fired));
-    let epoch = {
-        let mut c = f.engine.shared.core.lock().unwrap();
-        c.watching = true;
-        c.physical_gateway = None;
-        c.forwarder = Some(Forwarder::new(
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
-            53,
-            Duration::from_millis(50),
-            vec![],
-            Upstreams {
-                tunnel: c.tunnel_dns.clone(),
-                local: vec![],
-                physical_if: None,
-                tunnel_if: c.tunnel_if.clone(),
-            },
-            None,
-        ));
-        f.engine.shared.update_forwarder(&c);
-        assert_eq!(
-            c.forwarder
-                .as_ref()
-                .unwrap()
-                .bound_tunnel_interface()
-                .as_deref(),
-            Some(name)
-        );
-        c.forwarder.as_ref().unwrap().epoch()
-    };
+    let hooked = wait_until(|| f.engine.shared.core.lock().unwrap().hook_fired);
+    // Lose the network past the debounce: the live session is kept.
     f.network(false, Some(1));
-    let (retired_on_cancel, stale_epoch) = {
+    let (held, paused_while_held, alive) = {
         let c = f.engine.shared.core.lock().unwrap();
-        let forwarder = c.forwarder.as_ref().unwrap();
-        (
-            forwarder.bound_tunnel_interface().is_none(),
-            !forwarder.is_current(epoch),
-        )
+        (c.network.held(), c.network.paused, c.child_alive())
     };
-    // Exercise upstream refresh too, rather than directly mutating the lease.
-    f.engine.send(Event::NetworkChanged);
-    f.barrier();
-    assert!(f.engine.shared.core.lock().unwrap().tunnel_if.is_none());
+    std::thread::sleep(Duration::from_millis(200));
+    let terminated = f.dir.join("term").exists();
+    // Network back while held: nothing to resume, the same child continues.
     f.network(true, None);
-    f.engine.send(Event::Fire {
-        timer: Timer::NetWatch,
-        token: u64::MAX,
-    });
-    f.barrier();
-    let (waiting, tunnel, alive, bound) = {
+    let (cleared, attempts_after_restore) = {
         let c = f.engine.shared.core.lock().unwrap();
-        (
-            c.resume_after_exit,
-            c.tunnel_if.clone(),
-            c.child_alive(),
-            c.forwarder.as_ref().unwrap().bound_tunnel_interface(),
-        )
+        (!c.network.held() && !c.resume_after_exit, c.attempts)
     };
+    // Lose it again, then the session ends on its own while still offline.
+    f.network(false, Some(2));
+    std::fs::write(f.dir.join("exit"), "").unwrap();
+    let exited = wait_until(|| f.engine.shared.core.lock().unwrap().child.is_none());
+    f.barrier();
+    let (paused_after_exit, attempts_offline, protected) = {
+        let c = f.engine.shared.core.lock().unwrap();
+        (c.network.paused, c.attempts, f.engine.shared.guard.held().is_some())
+    };
+    // Restoration resumes exactly once.
+    f.network(true, None);
+    let respawned = wait_until(|| f.dir.join("second").exists());
+    let attempts_final = f.engine.shared.core.lock().unwrap().attempts;
     drop(f);
-    assert!(
-        alive && waiting,
-        "fixture must still be waiting for a TERM-ignoring child"
-    );
-    assert!(
-        tunnel.is_none(),
-        "watcher must not reconfirm a live but cancelled child"
-    );
-    assert!(
-        retired_on_cancel && stale_epoch && bound.is_none(),
-        "cancel must retire the forwarder binding and its outstanding DNS epoch"
-    );
+    assert!(hooked && exited, "fixture must establish and then end a session");
+    assert!(held && !paused_while_held && alive && !terminated,
+        "an established session must not be cancelled when the network is lost");
+    assert!(cleared && attempts_after_restore == 1,
+        "restoration while held must not respawn or fence the live child");
+    assert!(paused_after_exit && attempts_offline == 1 && protected,
+        "a held session ending offline must pause without respawn and keep protection");
+    assert!(respawned && attempts_final == 2, "restoration must resume exactly once");
 }
 
 #[test]

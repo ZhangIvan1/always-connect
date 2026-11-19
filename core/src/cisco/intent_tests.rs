@@ -345,6 +345,69 @@ while :; do sleep 0.05; done
 }
 
 #[test]
+fn offline_keeps_a_session_cisco_already_holds() {
+    let scratch = Scratch::new();
+    let cli = scratch.0.join("vpn");
+    std::fs::write(
+        &cli,
+        r#"#!/bin/sh
+root=$(dirname "$0")
+case "$1" in
+state) echo "  >> state: $(cat "$root/state")";;
+stats) printf '    Server Address:              198.51.100.9\n';;
+-s) touch "$root/login";;
+disconnect) touch "$root/cancel";;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let f = Fixture::with_cli(Some(cli.to_str().unwrap()));
+    f.calls.store(1, Ordering::SeqCst); // A login attempt would find no credentials.
+    f.engine.shared.managing.store(true, Ordering::SeqCst);
+    let mut outcome = Vec::new();
+    for held in ["Connected", "Reconnecting", "Connecting"] {
+        std::fs::write(scratch.0.join("state"), held).unwrap();
+        let _ = std::fs::remove_file(scratch.0.join("cancel"));
+        let _ = std::fs::remove_file(scratch.0.join("login"));
+        let mut st = State {
+            intent: 0,
+            wanted: true,
+            ever_connected: true,
+            tunnel_if: String::new(),
+            monitor_at: None,
+            retry_at: None,
+            backoff_index: 0,
+            push_backoff_index: 0,
+            unanswered_since: None,
+            last_kill_switch: None,
+            last_tick: None,
+        };
+        // The gate marks the engine offline before the queued pause runs.
+        f.engine.shared.offline.store(true, Ordering::SeqCst);
+        f.engine.shared.command(&mut st, Command_::Network { available: false, intent: 0 });
+        let cancelled = scratch.0.join("cancel").exists();
+        f.engine.shared.offline.store(false, Ordering::SeqCst);
+        f.engine.shared.command(&mut st, Command_::Network { available: true, intent: 0 });
+        let logged_in = scratch.0.join("login").exists();
+        let adopted = f.engine.shared.reported() == CONNECTED;
+        outcome.push((held, cancelled, logged_in, adopted));
+    }
+    f.finish();
+    assert_eq!(
+        outcome,
+        vec![
+            // A held session is neither disconnected nor logged in over.
+            ("Connected", false, false, true),
+            ("Reconnecting", false, false, false),
+            // An unfinished login is cancelled; recovery tries again
+            // (no credentials here, so no CLI login is submitted).
+            ("Connecting", true, false, false),
+        ]
+    );
+}
+
+#[test]
 fn network_recovery_preserves_approval_rate_limit_but_resets_ordinary_backoff() {
     let f = Fixture::new();
     // No credentials: test the recovery decision without submitting a login.

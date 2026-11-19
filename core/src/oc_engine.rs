@@ -846,27 +846,17 @@ impl Shared {
                     self.after(2.0, Event::OfflineDeadline(token))
                 }
                 crate::offline::Action::Cancel => {
-                    // Preserve the guard and its owner. A normal (non-manual)
-                    // openconnect exit leaves drop protection in place.
-                    c.in_drop_episode |= c.hook_fired;
-                    // Retire both the pinned interface and in-flight answers
-                    // before attempting PF work, which may itself fail.
-                    c.tunnel_if = None;
-                    self.update_forwarder(c);
-                    if c.config.drop_protection {
-                        if let Some((tunnel, gateways)) = c.last_pf.clone() {
-                            self.load_pf(c, Some(tunnel), gateways, false);
-                        }
+                    if c.hook_fired && c.child_alive() {
+                        // An established session rides the outage out on
+                        // openconnect's own reconnect, exactly as before
+                        // (§64.2): a SIGTERM would log it off and cost a new
+                        // approval, and automatic VPN disconnects must be
+                        // opt-in (AGENTS.md). Only its exit, if still offline,
+                        // pauses the engine (child_exited).
+                        c.network.hold();
+                        continue;
                     }
-                    c.driver.on_drop(false);
-                    Self::cancel(c, Timer::ApprovalTimeout);
-                    Self::cancel(c, Timer::ApprovalProbe);
-                    if let Some(child) = c.child.as_ref().filter(|_| c.child_alive()) {
-                        let (pid, generation) = (child.pid, child.generation);
-                        unsafe { libc::kill(pid, libc::SIGTERM) };
-                        self.after(8.0, Event::StopKill { pid, generation });
-                    }
-                    self.report(c, "等待网络恢复");
+                    self.suspend_offline(c);
                 }
                 crate::offline::Action::Resume => {
                     if !c.stop_requested && !c.finished {
@@ -881,6 +871,33 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// Pause for a lost physical network: a login still in progress is
+    /// cancelled; protection stays (tightened to blocking) and no respawn
+    /// runs until the network returns. Never the manual-release path.
+    fn suspend_offline(self: &Arc<Self>, c: &mut Core) {
+        // Preserve the guard and its owner. A normal (non-manual)
+        // openconnect exit leaves drop protection in place.
+        c.in_drop_episode |= c.hook_fired;
+        // Retire both the pinned interface and in-flight answers
+        // before attempting PF work, which may itself fail.
+        c.tunnel_if = None;
+        self.update_forwarder(c);
+        if c.config.drop_protection {
+            if let Some((tunnel, gateways)) = c.last_pf.clone() {
+                self.load_pf(c, Some(tunnel), gateways, false);
+            }
+        }
+        c.driver.on_drop(false);
+        Self::cancel(c, Timer::ApprovalTimeout);
+        Self::cancel(c, Timer::ApprovalProbe);
+        if let Some(child) = c.child.as_ref().filter(|_| c.child_alive()) {
+            let (pid, generation) = (child.pid, child.generation);
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            self.after(8.0, Event::StopKill { pid, generation });
+        }
+        self.report(c, "等待网络恢复");
     }
 
     fn report(&self, c: &Core, detail: &str) {
@@ -1732,6 +1749,17 @@ impl Shared {
         if c.stop_requested {
             self.finish_manual_stop(c);
             return;
+        }
+        if c.network.held() {
+            // The session kept through the outage ended: pause now if the
+            // network is still gone, otherwise retry as usual.
+            if (self.hooks.network_available)() {
+                c.network.observe(true);
+            } else {
+                c.network.release_hold();
+                self.suspend_offline(c);
+                return;
+            }
         }
         if c.network.paused {
             self.report(c, "等待网络恢复");

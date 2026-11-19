@@ -744,7 +744,14 @@ impl Shared {
             _ => Operation::Connect,
         };
         let trace = self.timeline.begin(operation, intent);
-        let cancelled = || args != ["disconnect"] && !self.permits_attempt(intent);
+        // A state read touches only the local daemon: going offline does not
+        // cancel it (the offline pause must see whether Cisco holds a
+        // session); a stop or a newer intent still does.
+        let cancelled = || match args {
+            ["disconnect"] => false,
+            ["state"] => !self.is_current(intent) || self.stop_requested.load(Ordering::SeqCst),
+            _ => !self.permits_attempt(intent),
+        };
         if cancelled() {
             trace.note(Phase::Cancel, Outcome::Cancelled);
             trace.result(Outcome::Cancelled);
@@ -923,20 +930,36 @@ impl Shared {
                     if st.last_kill_switch.is_some() {
                         self.send_kill_switch(st, 2, "", Vec::new());
                     }
-                    self.cli(
-                        st.intent,
-                        &["disconnect"],
-                        None,
-                        Duration::from_secs(30),
-                        &mut |_| {},
-                    );
+                    // Only an unfinished login is cancelled. A session Cisco
+                    // already holds (Connected, or resuming it as
+                    // Reconnecting) is left to Cisco: disconnecting it would
+                    // cost a new phone approval, and automatic VPN
+                    // disconnects must be opt-in (AGENTS.md, DESIGN §64.2).
+                    let state = self.state_now(st.intent);
+                    if !matches!(state.as_deref(), Some("Connected" | "Reconnecting")) {
+                        self.cli(
+                            st.intent,
+                            &["disconnect"],
+                            None,
+                            Duration::from_secs(30),
+                            &mut |_| {},
+                        );
+                    }
                     if self.is_current(intent) {
                         self.report(RECONNECTING, "等待网络恢复");
                     }
                 } else if !self.stopped() {
                     st.backoff_index = 0;
                     st.monitor_at = Some(Instant::now() + self.config.monitor);
-                    self.attempt(st);
+                    // Cisco may have kept or resumed its session meanwhile:
+                    // adopt it instead of logging in over it.
+                    match self.state_now(st.intent).as_deref() {
+                        Some("Connected") => self.adopt_connected(st),
+                        Some("Reconnecting") => {
+                            self.report(RECONNECTING, "Cisco 正在重连，网络已拦截")
+                        }
+                        _ => self.attempt(st),
+                    }
                 }
             }
             Command_::Disconnect(intent) => {

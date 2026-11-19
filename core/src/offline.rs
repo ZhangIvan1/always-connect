@@ -16,6 +16,9 @@ pub struct Gate {
     wanted: bool,
     pending: Option<u64>,
     generation: u64,
+    /// A live session absorbed this loss (own connection only): no pause
+    /// while it lasts; its exit while still offline pauses at once.
+    held: bool,
 }
 
 impl Gate {
@@ -31,10 +34,11 @@ impl Gate {
     pub fn observe(&mut self, available: bool) -> Vec<Action> {
         if available {
             self.pending = None;
+            self.held = false;
             if std::mem::take(&mut self.paused) && self.wanted {
                 return vec![Action::Resume];
             }
-        } else if !self.paused && self.pending.is_none() {
+        } else if !self.paused && !self.held && self.pending.is_none() {
             self.generation = self.generation.wrapping_add(1);
             self.pending = Some(self.generation);
             return vec![Action::Deadline(self.generation)];
@@ -56,6 +60,22 @@ impl Gate {
             vec![Action::Cancel]
         } else {
             vec![]
+        }
+    }
+    /// The engine kept a live session instead of cancelling: undo the pause
+    /// (nothing is cancelled) until that session ends or the network returns.
+    pub fn hold(&mut self) {
+        self.paused = false;
+        self.held = true;
+    }
+    pub fn held(&self) -> bool {
+        self.held
+    }
+    /// The held session ended while still offline: pause without a new
+    /// debounce, so restoration resumes exactly once.
+    pub fn release_hold(&mut self) {
+        if std::mem::take(&mut self.held) {
+            self.paused = true;
         }
     }
 }
@@ -83,6 +103,26 @@ mod tests {
         gate.deadline(1, false);
         gate.stop();
         assert!(gate.observe(true).is_empty());
+    }
+    #[test]
+    fn held_session_pauses_only_when_it_ends_offline() {
+        let mut gate = Gate::default();
+        gate.start();
+        gate.observe(false);
+        assert_eq!(gate.deadline(1, false), vec![Action::Cancel]);
+        gate.hold();
+        assert!(!gate.paused && gate.held());
+        // Further loss events while held schedule nothing.
+        assert!(gate.observe(false).is_empty());
+        gate.release_hold();
+        assert!(gate.paused && !gate.held());
+        assert_eq!(gate.observe(true), vec![Action::Resume]);
+        // Restoration while still held clears it without a resume.
+        gate.observe(false);
+        gate.deadline(2, false);
+        gate.hold();
+        assert!(gate.observe(true).is_empty());
+        assert!(!gate.held() && !gate.paused);
     }
     #[test]
     fn flap_and_stale_deadlines_do_nothing() {
