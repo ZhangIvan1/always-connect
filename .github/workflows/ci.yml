@@ -63,9 +63,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Rust tests (macOS, default features)
-        working-directory: core
-        run: cargo test
       - name: Build Rust staticlib for the Swift shell
         working-directory: core
         run: cargo build --release
@@ -78,8 +75,6 @@ jobs:
           xcodebuild -project AlwaysConnect.xcodeproj
           -scheme AlwaysConnect -destination 'platform=macOS'
           build CODE_SIGNING_ALLOWED=NO
-      - name: Private descriptor creation and explicit child IO
-        run: scripts/private-descriptors-test.sh
       - name: Gateway resolution XPC wiring (substitutes only)
         run: scripts/gateway-resolution-test.sh
       - name: Emergency recovery route plan (stubbed, no network changes)
@@ -290,8 +285,6 @@ jobs:
         # processes (DESIGN.md §23.11). The App's and the background
         # service's actual quit is Mac proof.
         run: scripts/process-sweep-test.sh
-      - name: Diagnostics file names no VPN (DESIGN.md §36.3)
-        run: scripts/diagnostics-redaction-test.sh
       - name: Background-service client check (same certificate only, DESIGN.md §36.3)
         run: scripts/helper-client-test.sh
       - name: Administrator child authenticates its parent
@@ -310,24 +303,12 @@ jobs:
         # Sources/App/ApprovalPromptTracker.swift (DESIGN.md §29). The
         # window on a real screen is Mac proof.
         run: scripts/approval-prompt-test.sh
-      - name: On-demand policy and connection orchestration
-        run: scripts/on-demand-test.sh
-      - name: Split list rules (domains, geosite, geoip, networks; bundled data)
-        # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
-        run: scripts/list-rules-test.sh
       - name: Other VPN / proxy notices (classification only)
         # Sources/App/NetworkNeighbors.swift (DESIGN.md §27.2).
         run: scripts/neighbors-test.sh
       - name: Connections page classification and route lookup
         # Sources/Helper/Connections.swift (DESIGN.md §28.7).
         run: scripts/connections-test.sh
-      - name: Connections settings scroll and resize (sample data)
-        run: scripts/connections-ui-test.sh
-      - name: Clean uninstall (fake file system, commands logged)
-        # scripts/uninstall.sh (DESIGN.md §31): what goes, what stays
-        # (Cisco, foreign bundles), the from-App detach and wait. The real
-        # removal and network restore on a Mac are Mac proof.
-        run: scripts/uninstall-test.sh
       - name: Privileged bundle verification and quoting (no administrator operation)
         run: scripts/privileged-bundle-test.sh
       - name: Third-party notices match Cargo.lock
@@ -337,11 +318,6 @@ jobs:
         # Sources/App/ConnectionCheck.swift (DESIGN.md §26.11). The probes
         # and the automatic disconnect in the running App are Mac proof.
         run: scripts/connection-check-test.sh
-      - name: Quit from any caller (terminateLater from main-queue blocks)
-        # Sources/App/AppQuit.swift (DESIGN.md §37): the uninstall from
-        # Settings and the one-click update quit from inside main-queue
-        # blocks. The real quit on a Mac is Mac proof.
-        run: scripts/quit-test.sh
       - name: Private settings IPC and process lifetime
         run: scripts/settings-transport-test.sh
       - name: Installer version and final-copy policy (signature stub)
@@ -370,6 +346,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Rust tests (macOS, default features)
+        working-directory: core
+        run: cargo test
       - name: Cisco engine harness (fake Cisco CLI)
         # Sources/App/CiscoEngine.swift against core/scripts/
         # fake-cisco-vpn.sh (DESIGN.md §21.4): connect, drop + re-login,
@@ -391,6 +370,20 @@ jobs:
         # stage-then-install, quarantine cleared. Quitting a real running
         # App and the real GitHub download are Mac proof.
         run: scripts/install-test.sh
+      - name: Private descriptor creation and explicit child IO
+        run: scripts/private-descriptors-test.sh
+      - name: Diagnostics file names no VPN (DESIGN.md §36.3)
+        run: scripts/diagnostics-redaction-test.sh
+      - name: Clean uninstall (fake file system, commands logged)
+        # scripts/uninstall.sh (DESIGN.md §31): what goes, what stays
+        # (Cisco, foreign bundles), the from-App detach and wait. The real
+        # removal and network restore on a Mac are Mac proof.
+        run: scripts/uninstall-test.sh
+      - name: Quit from any caller (terminateLater from main-queue blocks)
+        # Sources/App/AppQuit.swift (DESIGN.md §37): the uninstall from
+        # Settings and the one-click update quit from inside main-queue
+        # blocks. The real quit on a Mac is Mac proof.
+        run: scripts/quit-test.sh
 
   # Real openconnect against the mock gateway; needs the Xcode-built
   # background service, so it builds it too.
@@ -433,3 +426,10 @@ jobs:
           scripts/bundle-openconnect.sh /tmp/oc-bundle
           /tmp/oc-bundle/bin/openconnect --version | head -1
           ALWAYSCONNECT_TEST_OPENCONNECT=/tmp/oc-bundle/bin/openconnect scripts/relay-test.sh "$HELPER"
+      - name: Connections settings scroll and resize (sample data)
+        run: scripts/connections-ui-test.sh
+      - name: Split list rules (domains, geosite, geoip, networks; bundled data)
+        # Sources/App/ListRules.swift with Sources/App/GeoData (DESIGN.md §26.13).
+        run: scripts/list-rules-test.sh
+      - name: On-demand policy and connection orchestration
+        run: scripts/on-demand-test.sh
