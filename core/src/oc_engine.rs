@@ -357,7 +357,7 @@ struct Child {
 #[derive(Clone)]
 struct TunnelLease { name: String, index: u32, generation: u64 }
 const TUNNEL_RECONFIRM_ERROR: &str = "VPN 接口已变化，请重新连接；断线保护保持";
-const SPLIT_CAPACITY_ERROR: &str = "分流记录已达到容量上限，本次连接暂时全部走 VPN；请重新连接以恢复按网站分流";
+const SPLIT_CAPACITY_ERROR: &str = "近一小时访问的网站过多，按网站分流暂时全部走 VPN；约一小时内自动恢复，无需重新连接";
 enum SplitSync { Complete, PendingAdditions, Blocked }
 struct DirectRetry { until:Instant, delay:Duration }
 fn interface_index(name: &str) -> Option<u32> {
@@ -776,6 +776,8 @@ impl Shared {
                         }
                         if c.split_policy.is_saturated() && c.last_error.as_deref()!=Some(SPLIT_CAPACITY_ERROR) {
                             c.last_error=Some(SPLIT_CAPACITY_ERROR.into());self.report(&c,SPLIT_CAPACITY_ERROR);
+                        } else if !c.split_policy.is_saturated() && c.last_error.as_deref()==Some(SPLIT_CAPACITY_ERROR) {
+                            c.last_error=None;self.report(&c,"按网站分流已恢复");
                         }
                         let ok=self.dns_observation_ready(&c,&answer.addresses);
                         if let Some(entry) = answer.entry {
@@ -2558,8 +2560,8 @@ mod tests {
         let shown=engine.shared.info.lock().unwrap().last_error.clone();
         let panel=serde_json::to_value(&*engine.shared.info.lock().unwrap()).unwrap();
         engine.stop(false,false);assert!(!dns_event(&engine,0,"barrier.example",false));drop(engine);std::fs::remove_dir_all(support).unwrap();
-        assert!(shown.is_some_and(|s|s.contains("容量")),"safe capacity fallback must be visible");
-        assert!(panel["splitWarning"].as_str().is_some_and(|s|s.contains("容量")),"panel warning must have a dedicated transport field");
+        assert!(shown.is_some_and(|s|s.contains("自动恢复")),"safe capacity fallback must be visible and say it recovers by itself");
+        assert!(panel["splitWarning"].as_str().is_some_and(|s|s.contains("自动恢复")),"panel warning must have a dedicated transport field");
     }
 
     #[test]
