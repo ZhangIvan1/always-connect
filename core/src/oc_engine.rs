@@ -2004,10 +2004,16 @@ mod tests {
         for client_tcp in [false, true] {
             for upstream_tcp in [false, true] {
                 for change in ["rules", "upstreams", "listener"] {
-                    let udp = crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+                    // A random UDP port may already carry another test's TCP
+                    // socket; pick again until both protocols bind.
+                    let (udp, tcp) = (0..200).find_map(|_| {
+                        let udp = crate::child_io::udp_bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).ok()?;
+                        let address = udp.local_addr().ok()?;
+                        let tcp = crate::child_io::creation(|| TcpListener::bind(address)).ok()?;
+                        Some((udp, tcp))
+                    }).expect("a loopback port free for both UDP and TCP");
                     udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                     let server = udp.local_addr().unwrap();
-                    let tcp = crate::child_io::creation(|| TcpListener::bind(server)).unwrap();
                     tcp.set_nonblocking(true).unwrap();
                     let (seen_tx, seen_rx) = mpsc::channel();
                     let (release_tx, release_rx) = mpsc::channel();
