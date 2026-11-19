@@ -119,6 +119,9 @@ final class SettingsLink {
         case "onDemandChanged": client.onDemandSettingsChanged()
         case "connect": reply(id, client.connectWithStoredCredentials(manual: true) ? "1" : "0"); return
         case "refreshStatus": client.refreshStatus()
+        case "ciscoTimeline":
+            client.ciscoTimelineForDiagnostics { [weak self] text in self?.reply(id, text) }
+            return
         case "hotkey": HotkeyManager.shared.apply(ProfileStore.loadAppSettings())
         case "approvalCard": ApprovalPrompt.shared.settingsChanged()
         case "quit": AppQuit.request()  // the uninstaller, from Settings (not from this block, §37)

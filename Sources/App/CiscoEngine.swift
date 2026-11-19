@@ -74,6 +74,7 @@ final class CiscoEngine {
     /// Fallback interval of the state check between routing changes;
     /// 0 = the engine's own (15 s). Settable for the harness only.
     static var monitorInterval: TimeInterval = 0
+    static var physicalAvailability: () -> Bool = { PhysicalConnectivity.available() }
 
     /// The App started this Cisco session (DESIGN.md §25.4, F8):
     /// persisted, so a relaunch after a crash takes it back, while a
@@ -102,6 +103,15 @@ final class CiscoEngine {
     var isManaging: Bool { existing.map(ac_cisco_is_managing) ?? false }
     var episodeRetries: Int { existing.map { Int(ac_cisco_episode_retries($0)) } ?? 0 }
 
+    /// Read the Rust ring directly; exporting never starts a dormant engine.
+    var timelineText: String {
+        guard let engine = existing, let raw = ac_cisco_timeline(engine) else {
+            return "Cisco 引擎尚未启动\n"
+        }
+        defer { ac_string_free(raw) }
+        return String(cString: raw)
+    }
+
     // MARK: - Public
 
     func connect() { ac_cisco_connect(handle) }
@@ -110,6 +120,9 @@ final class CiscoEngine {
         completionLock.lock(); completions.append(completion); completionLock.unlock()
         ac_cisco_disconnect(handle)
     }
+
+    /// A routing / NWPath change: re-read the physical network (DESIGN §64).
+    func networkChanged() { existing.map(ac_cisco_network_changed) }
 
     /// The Helper restarted: send it the current kill switch again.
     func rearm() { existing.map(ac_cisco_rearm) }
@@ -157,6 +170,7 @@ final class CiscoEngine {
                 if let entry = engine.credentialsProvider?()?.entry { hosts.append(CiscoProfiles.resolve(entry)) }
                 return strdup(hosts.joined(separator: ","))
             },
+            networkAvailable: { _ in CiscoEngine.physicalAvailability() },
             beforeLogin: { _ in CiscoEngine.quitCiscoGUI() },
             owned: { _, owned in UserDefaults.standard.set(owned, forKey: CiscoEngine.ownedKey) },
             log: { _, line in
@@ -242,6 +256,7 @@ struct AcCiscoHooks {
                                      UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?,
                                      UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?) -> Bool
     var profileHosts: @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+    var networkAvailable: @convention(c) (UnsafeMutableRawPointer?) -> Bool
     var beforeLogin: @convention(c) (UnsafeMutableRawPointer?) -> Void
     var owned: @convention(c) (UnsafeMutableRawPointer?, Bool) -> Void
     var log: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Void
@@ -264,6 +279,8 @@ func ac_cisco_refresh(_ e: OpaquePointer)
 func ac_cisco_is_managing(_ e: OpaquePointer) -> Bool
 @_silgen_name("ac_cisco_episode_retries")
 func ac_cisco_episode_retries(_ e: OpaquePointer) -> UInt32
+@_silgen_name("ac_cisco_timeline")
+func ac_cisco_timeline(_ e: OpaquePointer) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_cisco_run")
 func ac_cisco_run(_ cli: UnsafePointer<CChar>, _ args: UnsafePointer<CChar>, _ input: UnsafePointer<CChar>?,
                   _ timeoutMs: UInt32, _ status: UnsafeMutablePointer<Int32>) -> UnsafeMutablePointer<CChar>?
@@ -271,3 +288,6 @@ func ac_cisco_run(_ cli: UnsafePointer<CChar>, _ args: UnsafePointer<CChar>, _ i
 func ac_cisco_parse_state(_ output: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_default_route_tunnel")
 func ac_default_route_tunnel() -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("ac_cisco_network_changed")
+func ac_cisco_network_changed(_ e: OpaquePointer)

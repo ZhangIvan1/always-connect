@@ -100,6 +100,7 @@ pub struct Hooks {
     /// 0 = manual stop, 1 = auth failure, 2 = attempts exhausted.
     pub terminal: Box<dyn Fn(i32) + Send + Sync>,
     /// The physical network now (configd): (router, interface).
+    pub network_available: Box<dyn Fn() -> bool + Send + Sync>,
     pub physical_network: Box<dyn Fn(&str) -> Option<(String, String)> + Send + Sync>,
     /// The local network's DNS servers for an interface (configd).
     pub local_dns: Box<dyn Fn(&str) -> Vec<String> + Send + Sync>,
@@ -149,6 +150,10 @@ enum Event {
     DnsAnswer(dns_forwarder::Observation, Sender<bool>),
     /// A scheduled retry: spawn again unless a manual stop landed first.
     Respawn,
+    #[cfg(test)]
+    Barrier(Sender<()>),
+    Availability(bool),
+    OfflineDeadline(u64),
     Release,
 }
 
@@ -372,6 +377,8 @@ struct Core {
     child: Option<Child>,
     generation: u64,
     stop_requested: bool,
+    network: crate::offline::Gate,
+    resume_after_exit: bool,
     hook_fired: bool,
     saw_login_failed: bool,
     fed: Credential,
@@ -458,6 +465,8 @@ impl Engine {
                 child: None,
                 generation: 0,
                 stop_requested: false,
+                network: crate::offline::Gate::default(),
+                resume_after_exit: false,
                 hook_fired: false,
                 saw_login_failed: false,
                 fed: Credential::Password,
@@ -624,6 +633,11 @@ impl Drop for Engine {
 }
 
 impl Core {
+    /// A cancelled child is unavailable even after the physical path returns.
+    /// Mandatory protection/retirement continues; optional permissions do not.
+    fn recovery_suspended(&self) -> bool {
+        self.network.paused || self.resume_after_exit
+    }
     fn direct_retry_ready(&self,ip:&Ipv4Addr,now:Instant)->bool {
         self.direct_retries.get(ip).is_none_or(|retry|now>=retry.until)
     }
@@ -715,10 +729,18 @@ impl Shared {
         while let Ok(event) = rx.recv() {
             let mut c = self.core.lock().unwrap();
             match event {
-                Event::Start => self.begin(&mut c),
+                Event::Start => {
+                    c.network.start();
+                    self.network_event(&mut c, None, (self.hooks.network_available)());
+                    self.begin(&mut c);
+                }
+                Event::Availability(available) => self.network_event(&mut c, None, available),
+                Event::OfflineDeadline(token) => {
+                    self.network_event(&mut c, Some(token), (self.hooks.network_available)());
+                }
                 Event::Stop { keep_session, notify } => self.stop(&mut c, keep_session, notify),
                 Event::Output { generation, stdout, bytes } => {
-                    if generation == c.generation && c.child.is_some() {
+                    if generation == c.generation && c.child.is_some() && !c.recovery_suspended() {
                         self.consume(&mut c, stdout, &bytes);
                     }
                 }
@@ -763,7 +785,11 @@ impl Shared {
                     }
                 }
                 Event::DnsAnswer(answer, reply) => {
-                    let current = !c.stop_requested && c.forwarder.as_ref().is_some_and(|f| f.is_current(answer.epoch));
+                    // Do not acknowledge cancelled-session work, even if a
+                    // local/direct query acquired the current DNS epoch.
+                    if c.recovery_suspended() && c.pf_needs_load { self.apply_base_pf(&mut c); }
+                    let current = !c.stop_requested && !c.recovery_suspended()
+                        && c.forwarder.as_ref().is_some_and(|f| f.is_current(answer.epoch));
                     let committed = if current {
                         let direct=if answer.direct.is_empty() {Vec::new()} else {
                             direct_routes::assigned_ipv4().map(|own|answer.direct.iter().copied().filter(|ip|!own.contains(ip)).collect()).unwrap_or_else(||answer.direct.clone())
@@ -795,6 +821,10 @@ impl Shared {
                         self.spawn_next(&mut c);
                     }
                 }
+                #[cfg(test)]
+                Event::Barrier(done) => {
+                    let _ = done.send(());
+                }
                 Event::Release => c.released = true,
             }
             self.publish(&c);
@@ -804,8 +834,77 @@ impl Shared {
         }
     }
 
+    /// Availability changes never traverse stop(), the manual-release path.
+    fn network_event(self: &Arc<Self>, c: &mut Core, token: Option<u64>, available: bool) {
+        let actions = match token {
+            Some(token) => c.network.deadline(token, available),
+            None => c.network.observe(available),
+        };
+        for action in actions {
+            match action {
+                crate::offline::Action::Deadline(token) => {
+                    self.after(2.0, Event::OfflineDeadline(token))
+                }
+                crate::offline::Action::Cancel => {
+                    if c.hook_fired && c.child_alive() {
+                        // An established session rides the outage out on
+                        // openconnect's own reconnect, exactly as before
+                        // (§64.2): a SIGTERM would log it off and cost a new
+                        // approval, and automatic VPN disconnects must be
+                        // opt-in (AGENTS.md). Only its exit, if still offline,
+                        // pauses the engine (child_exited).
+                        c.network.hold();
+                        continue;
+                    }
+                    self.suspend_offline(c);
+                }
+                crate::offline::Action::Resume => {
+                    if !c.stop_requested && !c.finished {
+                        // Reaped is not yet retired: buffered output/Exited may
+                        // still be queued for this cancelled generation.
+                        if c.child.is_some() {
+                            c.resume_after_exit = true;
+                        } else {
+                            self.spawn_next(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pause for a lost physical network: a login still in progress is
+    /// cancelled; protection stays (tightened to blocking) and no respawn
+    /// runs until the network returns. Never the manual-release path.
+    fn suspend_offline(self: &Arc<Self>, c: &mut Core) {
+        // Preserve the guard and its owner. A normal (non-manual)
+        // openconnect exit leaves drop protection in place.
+        c.in_drop_episode |= c.hook_fired;
+        // Retire both the pinned interface and in-flight answers
+        // before attempting PF work, which may itself fail.
+        c.tunnel_if = None;
+        self.update_forwarder(c);
+        if c.config.drop_protection {
+            if let Some((tunnel, gateways)) = c.last_pf.clone() {
+                self.load_pf(c, Some(tunnel), gateways, false);
+            }
+        }
+        c.driver.on_drop(false);
+        Self::cancel(c, Timer::ApprovalTimeout);
+        Self::cancel(c, Timer::ApprovalProbe);
+        if let Some(child) = c.child.as_ref().filter(|_| c.child_alive()) {
+            let (pid, generation) = (child.pid, child.generation);
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            self.after(8.0, Event::StopKill { pid, generation });
+        }
+        self.report(c, "等待网络恢复");
+    }
+
     fn report(&self, c: &Core, detail: &str) {
         let mut state = c.driver.state;
+        if c.recovery_suspended() && !c.stop_requested && !c.finished {
+            state = SessionStatus::Reconnecting;
+        }
         if (c.tunnel_retrying || (c.hook_fired && c.forwarder.is_some() && c.tunnel_if.is_none())) && state == SessionStatus::Connected {
             state = SessionStatus::Reconnecting;
         }
@@ -875,6 +974,7 @@ impl Shared {
             return;
         }
         c.stop_requested = true;
+        c.network.stop();
         Self::cancel(c, Timer::ApprovalTimeout);
         Self::cancel(c, Timer::ForceKill);
         c.driver.on_manual_disconnect();
@@ -894,6 +994,9 @@ impl Shared {
     }
 
     fn finish_terminal(&self, c: &mut Core, reason: Terminal, detail: &str) {
+        // Retire the offline intent before guard cleanup and terminal callbacks:
+        // queued network events must not revive a completed engine.
+        c.network.stop();
         self.guard.own_engine_finished(&self.holder);
         c.last_terminal = Some(reason);
         c.in_drop_episode = false;
@@ -942,7 +1045,7 @@ impl Shared {
     /// Confirm this answer, independently of optional work for other names.
     /// A revoked address must have lost its route and effective PF permission.
     fn dns_observation_ready(&self,c:&Core,addresses:&[Ipv4Addr])->bool {
-        if c.pf_needs_load {return false;}
+        if c.pf_needs_load || c.recovery_suspended() {return false;}
         let active=!c.config.drop_protection||self.guard.dynamic_direct_enabled(&self.holder);
         addresses.iter().all(|ip| {
             let text=ip.to_string();
@@ -968,12 +1071,13 @@ impl Shared {
     fn try_sync_split_routes(&self, c: &mut Core) -> SplitSync {
         let recovering=c.pf_error.is_some();
         if c.pf_needs_load && !self.apply_base_pf(c) { return SplitSync::Blocked; }
-        if !self.repoint_routes(c) { return SplitSync::Blocked; }
+        let suspended = c.recovery_suspended();
+        if !suspended && !self.repoint_routes(c) { return SplitSync::Blocked; }
         if !self.routes.reconcile_metadata(){
             let error="路由退休记录尚未持久化；基础保护保持";c.pf_error=Some(error.into());self.report(c,error);return SplitSync::Blocked;
         }
         let mut desired = c.split_policy.direct();
-        if !desired.is_empty() {
+        if !desired.is_empty() && !suspended {
             let Some(own)=direct_routes::assigned_ipv4() else {
                 let error="本机地址未确认，直连例外未更新；可使用恢复网络";
                 c.pf_error=Some(error.into()); self.report(c,error); return SplitSync::Blocked;
@@ -1002,6 +1106,14 @@ impl Shared {
             let e = "直连例外清理失败，网络保护状态未确认；可使用恢复网络".to_string();
             c.pf_error = Some(e.clone()); self.report(c, &e);
             return SplitSync::Blocked;
+        }
+        // Revocations and mandatory base work above must run while paused or
+        // waiting for exit. Route/table additions and rearm wait for a new
+        // usable session; retain the deferred convergence intent.
+        if suspended {
+            c.split_addresses.retain(|ip| desired.contains(ip));
+            c.split_needs_sync = true;
+            return SplitSync::PendingAdditions;
         }
         let new: Vec<_> = routable.difference(&routed).filter(|ip|ip.parse().is_ok_and(|ip|attempting.contains(&ip))).cloned().collect();
         if !new.is_empty() {
@@ -1046,11 +1158,12 @@ impl Shared {
 
     fn update_forwarder(&self, c: &Core) {
         if let Some(f) = &c.forwarder {
-            let index=c.tunnel_lease.as_ref().filter(|lease|c.tunnel_if.as_ref()==Some(&lease.name)&&lease.generation==c.generation).map(|lease|lease.index);
+            let tunnel_if = c.tunnel_if.clone().filter(|_| !c.recovery_suspended());
+            let index=c.tunnel_lease.as_ref().filter(|lease|tunnel_if.as_ref()==Some(&lease.name)&&lease.generation==c.generation).map(|lease|lease.index);
             f.set_pinned_upstreams(Upstreams {
                 tunnel: c.tunnel_dns.clone(), local: c.local_dns.clone(),
                 physical_if: if c.config.no_routes { None } else { Some(c.config.physical_if.clone()) },
-                tunnel_if: c.tunnel_if.clone(),
+                tunnel_if,
             },index);
         }
     }
@@ -1093,13 +1206,24 @@ impl Shared {
     /// or not (§40.1): a split that could not start must not send the
     /// modem at 192.168.100.1 into the tunnel.
     fn route_networks_direct(&self, c: &mut Core) {
-        if !self.repoint_routes(c) { return; }
-        let Some(gateway)=c.physical_gateway.clone() else {return;};
+        let suspended = c.recovery_suspended();
+        if !suspended && !self.repoint_routes(c) { return; }
         let wanted:HashSet<String>=direct_routes::networks_to_route(&c.direct_networks(),&direct_routes::attached_networks()).into_iter().collect();
         let actual:HashSet<String>=self.routes.managed_addresses().into_iter().filter(|s|direct_routes::is_network(s)).collect();
         let gone:Vec<_>=actual.difference(&wanted).cloned().collect();
         let new:Vec<_>=wanted.difference(&actual).cloned().collect();
         let removed=self.routes.remove(&gone);
+        if suspended {
+            // Withdraw obsolete routes without needing a usable router. New
+            // routes/repoints stay pending until the replacement session.
+            let persisted = self.routes.reconcile_metadata();
+            c.routed_networks=self.routes.addresses().into_iter().filter(|s|direct_routes::is_network(s)).collect();
+            if !removed || !persisted {
+                c.network_routes_error=Some("直连网段清理未确认；基础断线保护保持".into());
+            }
+            return;
+        }
+        let Some(gateway)=c.physical_gateway.clone() else {return;};
         let added=self.routes.add(&new,&gateway);
         c.routed_networks=self.routes.addresses().into_iter().filter(|s|direct_routes::is_network(s)).collect();
         if !removed || !added || c.routed_networks!=wanted {
@@ -1144,7 +1268,10 @@ impl Shared {
                 match wake {
                     crate::route_watch::Wake::Stopped => return,
                     _ => match weak.upgrade() {
-                        Some(me) => me.send(Event::Fire { timer: Timer::NetWatch, token: u64::MAX }),
+                        Some(me) => {
+                            me.send(Event::Availability((me.hooks.network_available)()));
+                            me.send(Event::Fire { timer: Timer::NetWatch, token: u64::MAX });
+                        }
                         None => return,
                     },
                 }
@@ -1249,12 +1376,17 @@ impl Shared {
     }
 
     fn spawn_next(self: &Arc<Self>, c: &mut Core) {
+        if c.stop_requested || c.network.paused || c.child.is_some() || c.finished {
+            return;
+        }
         if let Some(max) = c.config.max_attempts {
             if c.attempts >= max {
                 self.finish_terminal(c, Terminal::AttemptsExhausted, "attempt limit reached");
                 return;
             }
         }
+        // No generation may inherit output suppression for a previous child.
+        c.resume_after_exit = false;
         c.attempts += 1;
         c.hook_fired = false;
         c.tunnel_retrying = false;
@@ -1593,8 +1725,14 @@ impl Shared {
     // MARK: Child exit
 
     fn child_exited(self: &Arc<Self>, c: &mut Core) {
+        // This intent belongs to the exiting child, even when another offline
+        // episode currently prevents its requested restart.
+        let resume_after_exit = std::mem::take(&mut c.resume_after_exit);
         // Partial trailing lines.
         for stdout in [true, false] {
+            if c.network.paused || resume_after_exit {
+                break;
+            }
             let rest = std::mem::take(if stdout { &mut c.out_buffer } else { &mut c.err_buffer });
             if !rest.is_empty() {
                 let line = String::from_utf8_lossy(&rest).trim_matches(|ch| ch == '\n' || ch == '\r').to_string();
@@ -1610,6 +1748,25 @@ impl Shared {
         self.leave_approval_wait(c, "openconnect exited");
         if c.stop_requested {
             self.finish_manual_stop(c);
+            return;
+        }
+        if c.network.held() {
+            // The session kept through the outage ended: pause now if the
+            // network is still gone, otherwise retry as usual.
+            if (self.hooks.network_available)() {
+                c.network.observe(true);
+            } else {
+                c.network.release_hold();
+                self.suspend_offline(c);
+                return;
+            }
+        }
+        if c.network.paused {
+            self.report(c, "等待网络恢复");
+            return;
+        }
+        if resume_after_exit {
+            self.spawn_next(c);
             return;
         }
         if c.saw_login_failed && c.last_credential_wait >= c.config.approval_expiry_minimum {
@@ -1716,7 +1873,7 @@ impl Shared {
         // Keep the current intent even when an OS operation fails, so later
         // events can retry without relying on another connect hook.
         c.last_pf=Some((tun.clone(),gateway_ips.clone()));
-        c.last_allow_direct_egress=allow_direct_egress;
+        c.last_allow_direct_egress=allow_direct_egress && !c.recovery_suspended();
         if !self.apply_base_pf(c) {return;}
         if c.forwarder.is_some() && !self.sync_split_routes(c) {return;}
         c.pf_error=None;
@@ -1731,7 +1888,7 @@ impl Shared {
         c.pf_needs_load=true;
         let split=c.forwarder.is_some();
         let own_dns=c.config.direct_domains.is_some()||c.config.relay.is_some()||split;
-        let connected=c.last_allow_direct_egress&&!own_dns;
+        let connected=c.last_allow_direct_egress&&!own_dns&&!c.recovery_suspended();
         let inputs=Inputs {tunnel_if:tun,gateway_ips,physical_if:c.config.physical_if.clone(),allow_networks:c.direct_networks(),allow_dns:false,local_dns_servers:c.local_dns.clone(),tunnel_dns_servers:c.tunnel_dns.clone(),direct_table:split,strict_dns:own_dns,block_direct:split};
         // The base guard is mandatory. Optional routing, journaling and table
         // failures may disable bypasses, never the physical blocking policy.
@@ -1743,6 +1900,9 @@ impl Shared {
 
     fn rearm_direct_after_sync(&self,c:&mut Core)->bool {
         if !c.config.drop_protection || c.stop_requested {return true;}
+        // Route/PF cleanup may converge while offline; only restoration may
+        // reopen optional bypasses. Mandatory base protection still retries.
+        if c.recovery_suspended() {return true;}
         let Some((holder,mut inputs))=self.guard.held() else {return c.last_pf.is_none();};
         if holder!=self.holder || !inputs.direct_table || !inputs.block_direct {return true;}
         inputs.block_direct=false;
@@ -1792,7 +1952,7 @@ impl Shared {
     /// A short physical outage need not make openconnect reconnect. Re-arm
     /// only the exact interface previously confirmed by this live child.
     fn reconfirm_tunnel(&self, c: &mut Core) -> bool {
-        if c.stop_requested || c.tunnel_retrying || !c.hook_fired { return false; }
+        if c.recovery_suspended() || c.stop_requested || c.tunnel_retrying || !c.hook_fired { return false; }
         let Some(lease) = &c.tunnel_lease else { return false };
         if !c.child.as_ref().is_some_and(|child| child.alive.load(Ordering::SeqCst)
             && child.generation == lease.generation && c.generation == lease.generation)
@@ -1814,6 +1974,13 @@ impl Shared {
     /// Configd can change DNS without a routing event or a different router.
     /// All watchers feed this one reducer path; unchanged facts do no work.
     fn refresh_network(&self, c: &mut Core) {
+        // Watcher/fallback events are protection retry opportunities even
+        // without fresh physical facts. Optional work has its own gates.
+        if c.pf_needs_load { self.apply_base_pf(c); }
+        if c.recovery_suspended() {
+            if c.split_needs_sync { self.sync_split_routes(c); }
+            if c.network_routes_error.is_some() || c.routes_need_repoint { self.route_networks_direct(c); }
+        }
         let Some((gateway, interface)) = (self.hooks.physical_network)(&c.config.physical_if) else {
             if c.physical_gateway.is_some() || c.tunnel_if.is_some() || !c.local_dns.is_empty() {
                 c.physical_gateway = None;
@@ -1893,7 +2060,7 @@ mod tests {
     fn split_engine(name: &str) -> (Engine, PathBuf) {
         split_engine_with_hooks(name, Hooks {
             state: Box::new(|_, _| {}), terminal: Box::new(|_| {}),
-            physical_network: Box::new(|_| None), local_dns: Box::new(|_| vec![]),
+            network_available: Box::new(|| true), physical_network: Box::new(|_| None), local_dns: Box::new(|_| vec![]),
             system_roots: Box::new(|| None), stopped: Box::new(|| {}),
         })
     }
@@ -1922,7 +2089,7 @@ mod tests {
         let notices=Arc::new(Mutex::new(Vec::<String>::new()));let output=notices.clone();
         let (engine,support)=split_engine_with_hooks("warning-recovery",Hooks {
             state:Box::new(move |_,detail|output.lock().unwrap().push(detail.into())),
-            terminal:Box::new(|_|{}),physical_network:Box::new(|_|None),local_dns:Box::new(|_|vec![]),
+            terminal:Box::new(|_|{}),network_available: Box::new(|| true), physical_network:Box::new(|_|None),local_dns:Box::new(|_|vec![]),
             system_roots:Box::new(||None),stopped:Box::new(||{}),
         });
         let (message,quiet,preserved)={let mut c=engine.shared.core.lock().unwrap();
@@ -2163,7 +2330,7 @@ mod tests {
         let f = facts.clone(); let d = dns.clone();
         let (engine, support) = split_engine_with_hooks("dns-only", Hooks {
             state: Box::new(|_, _| {}), terminal: Box::new(|_| {}),
-            physical_network: Box::new(move |_| f.lock().unwrap().clone()),
+            network_available: Box::new(|| true), physical_network: Box::new(move |_| f.lock().unwrap().clone()),
             local_dns: Box::new(move |_| d.lock().unwrap().clone()),
             system_roots: Box::new(|| None), stopped: Box::new(|| {}),
         });
@@ -2277,7 +2444,7 @@ mod tests {
         let guard=Arc::new(Guard::new(network_guard::Settings {support_dir:support.clone(),boot:Some("B1".into()),grace:Duration::from_secs(120),pfctl:Some(tool.to_string_lossy().into())}));
         guard.owner_attached();
         let engine=Engine::new(Config {no_routes:true,test_active:true,support_dir:support.to_string_lossy().into(),boot_session:"B1".into(),script_path:"/usr/bin/true".into(),drop_protection:true,..Config::default()},Hooks {
-            state:Box::new(|_,_|{}),terminal:Box::new(|_|{}),physical_network:Box::new(|_|None),local_dns:Box::new(|_|vec![]),system_roots:Box::new(||None),stopped:Box::new(||{}),
+            state:Box::new(|_,_|{}),terminal:Box::new(|_|{}),network_available: Box::new(|| true), physical_network:Box::new(|_|None),local_dns:Box::new(|_|vec![]),system_roots:Box::new(||None),stopped:Box::new(||{}),
         },guard);
         {
             let mut c=engine.shared.core.lock().unwrap();c.physical_gateway=Some("192.168.1.1".into());
@@ -2338,7 +2505,7 @@ mod tests {
         let observed = facts.clone();
         let (engine, support) = split_engine_with_hooks("live-binding", Hooks {
             state: Box::new(|_,_| {}), terminal: Box::new(|_| {}),
-            physical_network: Box::new(move |_| observed.lock().unwrap().clone()),
+            network_available: Box::new(|| true), physical_network: Box::new(move |_| observed.lock().unwrap().clone()),
             local_dns: Box::new(|_| vec![]), system_roots: Box::new(|| None), stopped: Box::new(|| {}),
         });
         let iface = if cfg!(target_os="macos") { "lo0" } else { "lo" };
@@ -2415,6 +2582,90 @@ mod tests {
     }
 
     #[test]
+    fn offline_pauses_respawn_without_releasing_the_held_guard() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "ac-offline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let pfctl = dir.join("fake-pfctl");
+        std::fs::write(
+            &pfctl,
+            "#!/bin/sh\ncat >/dev/null\necho 'Token : 123' >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&pfctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = Arc::new(Guard::new(network_guard::Settings {
+            support_dir: dir.clone(),
+            boot: Some("test".into()),
+            grace: Duration::from_secs(120),
+            pfctl: Some(pfctl.to_string_lossy().into()),
+        }));
+        guard.owner_attached();
+        let engine = Engine::new(
+            Config {
+                no_routes: true,
+                physical_if: "en0".into(),
+                drop_protection: true,
+                allow_direct_egress_when_connected: true,
+                test_active: true,
+                support_dir: dir.to_string_lossy().into(),
+                ..Config::default()
+            },
+            Hooks {
+                state: Box::new(|_, _| {}),
+                terminal: Box::new(|_| {}),
+                network_available: Box::new(|| true),
+                physical_network: Box::new(|_| None),
+                local_dns: Box::new(|_| vec![]),
+                system_roots: Box::new(|| None),
+                stopped: Box::new(|| {}),
+            },
+            guard.clone(),
+        );
+        let inputs = Inputs {
+            tunnel_if: "utun99".into(),
+            gateway_ips: vec!["198.51.100.7".into()],
+            physical_if: "en0".into(),
+            ..Inputs::default()
+        };
+        assert!(guard.apply(&engine.holder(), true, &inputs).is_none());
+        {
+            let mut core = engine.shared.core.lock().unwrap();
+            core.last_pf = Some((inputs.tunnel_if.clone(), inputs.gateway_ips.clone()));
+            core.last_allow_direct_egress = true;
+            core.network.start();
+            core.network.observe(false);
+            engine.shared.network_event(&mut core, Some(1), false);
+            engine.shared.spawn_next(&mut core);
+            assert_eq!(core.attempts, 0, "offline queued respawns must not spawn");
+            assert!(!core.stop_requested, "offline is not a manual release");
+            assert_eq!(guard.held().unwrap().1, inputs);
+            assert!(!dir.join("last-release.json").exists());
+            let record: network_guard::Record =
+                serde_json::from_slice(&std::fs::read(dir.join("guard.json")).unwrap()).unwrap();
+            assert!(
+                !record.connected,
+                "offline must replace connected-mode physical egress with blocking"
+            );
+            assert!(!core.last_allow_direct_egress);
+            core.network.stop();
+            assert!(
+                core.network.observe(true).is_empty(),
+                "manual stop prevents restoration from starting"
+            );
+            core.finished = true;
+        }
+        // No processes, routes or real pfctl are used by this fixture.
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn root_default_never_falls_back_to_user_tools() {
         let selected = Shared::default_executable(true);
         match selected {
@@ -2452,7 +2703,7 @@ mod tests {
     }
     fn recovery_engine(support: &Path,guard: Arc<Guard>)->Engine {
         Engine::new(Config {no_routes:true,test_active:true,support_dir:support.to_string_lossy().into(),boot_session:"B1".into(),script_path:"/usr/bin/true".into(),physical_if:"en0".into(),drop_protection:true,direct_domains:Some(vec![]),..Config::default()},Hooks {
-            state:Box::new(|_,_|{}),terminal:Box::new(|_|{}),physical_network:Box::new(|_|Some(("192.168.1.1".into(),"en0".into()))),local_dns:Box::new(|_|vec![]),system_roots:Box::new(||None),stopped:Box::new(||{}),
+            state:Box::new(|_,_|{}),terminal:Box::new(|_|{}),network_available: Box::new(|| true), physical_network:Box::new(|_|Some(("192.168.1.1".into(),"en0".into()))),local_dns:Box::new(|_|vec![]),system_roots:Box::new(||None),stopped:Box::new(||{}),
         },guard)
     }
     #[test]
@@ -2683,3 +2934,6 @@ exit 0
     }
 
 }
+
+#[cfg(test)]
+mod recovery_tests;
