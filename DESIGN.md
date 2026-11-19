@@ -3729,3 +3729,5 @@ tick 记录观测到的 Connected→Reconnecting→Disconnected 等变化及上�
 - 重新均衡三个 macOS job：不依赖 Xcode 产物的脚本级测试（Rust 单测、私有描述符、诊断脱敏、卸载、退出）挪到 `macos-harness`，连接页界面、名单规则、按需连接挪到 `macos-openconnect`；`macos` 只留需要后台服务产物和真实 pf 的步骤。
 
 验证级别：改动过的脚本在本机各跑 2–3 次全部通过，`build-local.sh --tests` FAILS=0，会话测试另用一个不存在的场景做反向对照，确认失败仍被计数；内核 DNS UID 测试会改 pf，只在 CI 上跑。
+
+推送后实测（run f67acfb）：总用时约 4.8 分钟（原 15 分钟、拆分后 7.7 分钟）。手机批准等待 178 → 16 秒，内核 DNS UID 81 → 9 秒，证书转接 63 → 31 秒，会话生命周期 122 → 49 秒，Cisco 引擎 118 → 84 秒。此时 `macos-openconnect` 只用 2.4 分钟，另两个约 4.6 分钟，于是把证书转接（需要后台服务产物，该 job 也有）和安装器测试再挪到 `macos-openconnect`。各 runner 冷启动时编译用时差别很大（同一 Xcode 编译 22–60 秒），之后的分钟级差异以实际 run 为准。

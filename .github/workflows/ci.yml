@@ -327,18 +327,6 @@ jobs:
         # before the answer, IPv4 only; other names to the tunnel's DNS
         # with server switching and TCP fallback. Real DNS is Mac proof.
         run: scripts/dns-forwarder-test.sh
-      - name: Certificate relay harness (mock gateway demanding a client certificate)
-        # Sources/App/CertificateRelay.swift with test certificates only
-        # (DESIGN.md §二十三): CSTP reassembly, one TLS record per packet
-        # both ways, local mutual TLS refusing foreign clients, and the
-        # Helper's openconnect engine logging in through the relay to a
-        # mock gateway that demands a client certificate. Real gateway
-        # and keychain identity are Mac proof.
-        timeout-minutes: 8
-        run: |
-          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
-          test -n "$HELPER"
-          scripts/relay-test.sh "$HELPER"
 
   # Script harnesses that build what they need themselves (cargo +
   # swiftc); split from `macos` so the slow ones run in parallel.
@@ -365,11 +353,6 @@ jobs:
         # Sources/App/UpdateChecker.swift + core update_check (DESIGN.md
         # §三十三). The real GitHub answer and the panel notice are Mac proof.
         run: scripts/update-check-test.sh
-      - name: One-line installer (install.sh, local fake releases)
-        # DESIGN.md §三十五: release choice, checksum, refusals, replace,
-        # stage-then-install, quarantine cleared. Quitting a real running
-        # App and the real GitHub download are Mac proof.
-        run: scripts/install-test.sh
       - name: Private descriptor creation and explicit child IO
         run: scripts/private-descriptors-test.sh
       - name: Diagnostics file names no VPN (DESIGN.md §36.3)
@@ -433,3 +416,20 @@ jobs:
         run: scripts/list-rules-test.sh
       - name: On-demand policy and connection orchestration
         run: scripts/on-demand-test.sh
+      - name: Certificate relay harness (mock gateway demanding a client certificate)
+        # Sources/App/CertificateRelay.swift with test certificates only
+        # (DESIGN.md §二十三): CSTP reassembly, one TLS record per packet
+        # both ways, local mutual TLS refusing foreign clients, and the
+        # Helper's openconnect engine logging in through the relay to a
+        # mock gateway that demands a client certificate. Real gateway
+        # and keychain identity are Mac proof.
+        timeout-minutes: 8
+        run: |
+          HELPER=$(find ~/Library/Developer/Xcode/DerivedData/AlwaysConnect-*/Build/Products/Debug -maxdepth 1 -name AlwaysConnectHelper -type f | head -1)
+          test -n "$HELPER"
+          scripts/relay-test.sh "$HELPER"
+      - name: One-line installer (install.sh, local fake releases)
+        # DESIGN.md §三十五: release choice, checksum, refusals, replace,
+        # stage-then-install, quarantine cleared. Quitting a real running
+        # App and the real GitHub download are Mac proof.
+        run: scripts/install-test.sh
