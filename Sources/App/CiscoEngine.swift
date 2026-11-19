@@ -121,9 +121,10 @@ final class CiscoEngine {
         ac_cisco_disconnect(handle)
     }
 
-    /// The Helper restarted: send it the current kill switch again.
+    /// A routing / NWPath change: re-read the physical network (DESIGN §64).
     func networkChanged() { existing.map(ac_cisco_network_changed) }
 
+    /// The Helper restarted: send it the current kill switch again.
     func rearm() { existing.map(ac_cisco_rearm) }
 
     /// Launch / panel open: adopt a tunnel Cisco already has up (the
