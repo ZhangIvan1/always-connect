@@ -44,7 +44,12 @@ final class Client {
     func ensureConnection(_ body: (Proxy) -> Void) { body(proxy) }
 '''+resolve+'''
 }
+enum RelayLog {
+    static var lines: [String] = []
+    static func write(_ line: String) { lines.append(line) }
+}
 final class Relay {
+    let sessionId = "fixture-session"
     enum RelayError: Error { case unsupportedSystem, unresolved }
     struct Prepared { let gatewayIp: String; let serverPin: String; let addresses: [String] }
     let host = "gw.example"
@@ -115,6 +120,10 @@ final class Daemon {
             do { _ = try relay.prepare(resolved: []); fatalError("empty bootstrap cannot use system DNS") }
             catch Relay.RelayError.unresolved { }
             precondition(Relay.dnsCalls == 0)
+            precondition(RelayLog.lines.count == 2)
+            precondition(RelayLog.lines[0].contains("session=fixture-session stage=dns source=cache candidates=0 port=443"))
+            precondition(RelayLog.lines[1].contains("source=resolved candidates=1"))
+            precondition(!RelayLog.lines.contains { $0.contains("198.51.100.") || $0.contains("gw.example") })
         }
         print("PASS gateway XPC match gate, 3-second timeout, duplicate/late reply and fresh-unheld-only system bootstrap, protected/unknown no fallback (substituted wiring)")
     }

@@ -3758,3 +3758,5 @@ tick 记录观测到的 Connected→Reconnecting→Disconnected 等变化及上�
 Linux：定向 Rust relay 测试覆盖任意响应头分片、不提前转发跨节点 Location、同源原样转发、正文/中间响应边界、CONNECT 跳转、畸形及超大头、原有 CSTP/DTLS。本机为 aarch64 Linux，原 FFI 测试缓冲区改用 c_char（不假设 i8），仅测试代码的可移植性修正。
 
 尚需：匹配 App/后台服务的编译与 mock 网关 harness、敏感认证状态识别、允许节点集合、一次性切换票据、旧引擎退出和监听释放屏障、有限退避、真实网络验证。真实入口跳转、直接节点 TLS、手机确认、取消与失败保护、分流、Cisco 回退及性能对照列入 I41。没有在 Linux 安装或更新 App/后台服务，也没有操作系统网络或公司凭据。常驻路径的真实 footprint/CPU/idlew 对照未测，不能以 Rust 单元测试替代。
+
+§66 首轮 CI：Rust、macOS harness 与 OpenConnect harness 通过；macOS 的 gateway-resolution 抽取夹具缺少新增 session/log 依赖，已补齐并增加 DNS 元数据关联和地址不出日志的断言。修正后的 CI 结果待回读，不将此前三个通过项算作整套 CI 通过。
