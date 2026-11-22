@@ -1951,3 +1951,33 @@ pub extern "C" fn ac_private_fd_duplicate(fd:i32)->i32 {
 pub extern "C" fn ac_loopback_dns_busy(port:u16,timeout_milliseconds:u32)->bool {
     crate::dns_forwarder::loopback_dns_busy(port,std::time::Duration::from_millis(timeout_milliseconds.min(500) as u64))
 }
+
+
+#[no_mangle]
+pub extern "C" fn ac_relay_switch_new() -> *mut crate::relay_switch::Handover {
+    Box::into_raw(Box::new(crate::relay_switch::Handover::default()))
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_switch_free(p: *mut crate::relay_switch::Handover) {
+    if !p.is_null() { drop(unsafe { Box::from_raw(p) }); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_switch_command(p: *mut crate::relay_switch::Handover, request: *const c_char) -> *mut c_char {
+    let Some(p) = (unsafe { p.as_mut() }) else { return std::ptr::null_mut() };
+    let Some(command) = c_str(request).filter(|s| s.len() <= 131072)
+        .and_then(|s| serde_json::from_str::<crate::relay_switch::Command>(&s).ok()) else { return std::ptr::null_mut() };
+    serde_json::to_string(&p.command(command)).ok().map(|s| cstring(&s).into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_oc_authentication_exposed(e: *const oc_engine::Engine) -> bool {
+    (unsafe { e.as_ref() }).is_none_or(|e| e.authentication_exposed())
+}
+
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_set_context(s: *mut Stream, session: *const c_char, attempt: u32) {
+    let (Some(s), Some(session)) = (unsafe { s.as_mut() }, c_str(session)) else { return };
+    if session.len() == 36 && session.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        s.set_context(session, attempt);
+    }
+}

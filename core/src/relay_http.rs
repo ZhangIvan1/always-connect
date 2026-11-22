@@ -1,6 +1,7 @@
 //! Authentication response framing. Headers must be inspected before any byte
 //! reaches openconnect; otherwise it can follow a redirect outside the relay.
 use crate::relay::{Chunks, FramingError};
+use std::collections::VecDeque;
 
 const LIMIT: usize = 131_072;
 
@@ -24,9 +25,22 @@ pub struct Responses {
     blocked: bool,
     redirect: Option<(u16, String)>,
     trailer_bytes: usize,
+    requests: VecDeque<bool>,
 }
 
 impl Responses {
+    pub fn enqueue_request(&mut self, head: bool) -> Result<(), FramingError> {
+        if self.requests.len() >= 64 {
+            return Err(FramingError::Oversized);
+        }
+        self.requests.push_back(head);
+        Ok(())
+    }
+
+    pub fn has_pending_request(&self) -> bool {
+        !self.requests.is_empty() || !matches!(self.body, Body::Header) || !self.pending.is_empty()
+    }
+
     pub fn set_target(&mut self, host: &str, port: u16) {
         self.authority = Some((host.to_ascii_lowercase(), port));
     }
@@ -233,7 +247,16 @@ impl Responses {
             self.redirect = location.map(|l| (code, l.to_string()));
             return Err(FramingError::Redirect);
         }
-        self.body = if (100..200).contains(&code) || code == 204 || code == 304 || length == Some(0)
+        let head = if (100..200).contains(&code) {
+            false
+        } else {
+            self.requests.pop_front().unwrap_or(false)
+        };
+        self.body = if head
+            || (100..200).contains(&code)
+            || code == 204
+            || code == 304
+            || length == Some(0)
         {
             if code == 101 {
                 return Err(FramingError::Invalid);
@@ -326,6 +349,17 @@ mod tests {
             assert!(!p.safe_location(value), "{value}");
         }
     }
+    #[test]
+    fn head_content_length_does_not_hide_the_next_redirect() {
+        let mut p = parser();
+        let mut out = Chunks::default();
+        p.enqueue_request(true).unwrap();
+        p.enqueue_request(false).unwrap();
+        let wire = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 9000\r\n\r\nHTTP/1.1 302 Found\r\nLocation: https://vpn-b.example:6443/\r\n\r\n";
+        assert_eq!(p.feed(wire, &mut out), Err(FramingError::Redirect));
+        assert!(!String::from_utf8_lossy(&out.to_vecs().concat()).contains("302"));
+    }
+
     #[test]
     fn oversized_headers_and_large_bodies() {
         let mut p = parser();

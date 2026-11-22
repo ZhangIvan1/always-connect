@@ -97,10 +97,32 @@ struct RelayHarness {
             fputs("prepare failed: \(error.localizedDescription)\n", stderr)
             exit(1)
         }
+        let rebind = ProcessInfo.processInfo.environment["ALWAYSCONNECT_TEST_REBIND"] == "1"
+        if rebind {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 10) {
+                fputs("FAIL listener cancellation/rebind timed out\n", stderr); exit(1)
+            }
+        }
         relay.start(clientCertificate: der) { error in
             if let error {
                 fputs("start failed: \(error.localizedDescription)\n", stderr)
                 exit(1)
+            }
+            if rebind {
+                relay.stop {
+                    let next = CertificateRelay(host: "localhost", port: listen, identity: first,
+                                                upstreamPort: upstream, anchor: ca)
+                    do { _ = try next.prepare(resolved: ["127.0.0.1"]) }
+                    catch { fputs("FAIL replacement prepare\n", stderr); exit(1) }
+                    next.start(clientCertificate: der) { error in
+                        guard error == nil else { fputs("FAIL same-port listener replacement\n", stderr); exit(1) }
+                        next.stop {
+                            print("PASS listener cancellation releases the same local port before replacement")
+                            exit(0)
+                        }
+                    }
+                }
+                return
             }
             print("READY \(prepared.gatewayIp) \(prepared.serverPin)")
             fflush(stdout)

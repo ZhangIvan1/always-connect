@@ -218,6 +218,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private var activeParameters: [String]?
     /// Set by prepareRelay, used by the next connect (DESIGN.md §二十三).
     private var relay: RelaySettings?
+    private let relayHandover = RelayHandover()
+    private var relayCredentials: (group: String, username: String, password: String)?
     /// Names that go out the local network (DESIGN.md §26.5), from the App.
     private var directDomains: [String] = []
     /// The App's direct networks (its list and the local network), kept
@@ -303,6 +305,12 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         NetworkGuard.shared.ownerAttached()
     }
 
+    /// Read-only test seam, never exported over XPC.
+    func harnessAuthenticationExposed() -> Bool {
+        precondition(TestSeam.isActive)
+        return queue.sync { engine?.authenticationExposed ?? true }
+    }
+
     /// Session harness only: an App attaching or vanishing, no XPC.
     func harnessOwner(attached: Bool, appPath: String? = nil) {
         queue.sync {
@@ -342,6 +350,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         withReply reply: @escaping (Bool) -> Void
     ) {
         queue.async {
+            _ = self.relayHandover.command(["op": "reset"])
+            self.relayCredentials = nil
             // A new relay (the App restarted it: new pin, maybe a new
             // gateway address) must restart the engine too.
             let parameters = [server, group, username, password,
@@ -352,6 +362,112 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             }
             self.startEngine(server: server, group: group, username: username,
                              password: password, parameters: parameters, reply: reply)
+        }
+    }
+
+    func connectRelayed(server: String, group: String, username: String, password: String,
+                        context: String, withReply reply: @escaping (Bool) -> Void) {
+        queue.async {
+            guard context.utf8.count <= 131072,
+                  let data = context.data(using: .utf8),
+                  let value = try? JSONDecoder().decode(RelayConnectionContext.self, from: data),
+                  UUID(uuidString: value.session) != nil,
+                  let relay = self.relay,
+                  RelayHandover.target(server) == value.target, relay.serverPin == value.pin,
+                  let (decision, _) = self.relayHandover.command([
+                    "op": "register", "session": value.session, "target": value.target,
+                    "pin": relay.serverPin, "allowed": value.allowed]), decision.ok else { reply(false); return }
+            Self.log("relay session=\(value.session) attempt=0 stage=register")
+            self.relayCredentials = (group, username, password)
+            let parameters = [server, group, username, password, relay.gatewayIp, relay.serverPin]
+            self.startEngine(server: server, group: group, username: username,
+                             password: password, parameters: parameters, reply: reply)
+        }
+    }
+
+    func beginRelayHandover(_ event: String, withReply reply: @escaping (String) -> Void) {
+        queue.async {
+            guard event.utf8.count <= 131072,
+                  let data = event.data(using: .utf8),
+                  var request = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let current = self.engine, self.stoppingEngine == nil,
+                  let parameters = self.activeParameters, parameters.count == 6,
+                  request["pin"] as? String == parameters[5],
+                  request["source"] as? String == RelayHandover.target(parameters[0]) else { reply(""); return }
+            request["op"] = "begin"
+            request["replay_unsafe"] = (request["replay_unsafe"] as? Bool ?? true) || current.authenticationExposed
+            guard let (decision, result) = self.relayHandover.command(request) else { reply(""); return }
+            // A stale event must not stop a newer intent. Policy failures for
+            // the current intent still freeze retries without restoring direct.
+            guard decision.code != "stale_context" else { reply(result); return }
+            if let session = request["session"] as? String {
+                Self.log("relay session=\(session) attempt=\(decision.attempt) stage=handover code=\(decision.code)")
+            }
+            self.startGeneration += 1
+            if self.dropProtection, NetworkGuard.shared.isHolding {
+                NetworkGuard.shared.supersedeOwnHolders()
+            }
+            self.engine = nil
+            self.activeParameters = nil
+            self.stoppingEngine = current
+            self.lastStateCode = decision.ok ? 1 : 0
+            self.lastDetail = decision.ok ? "正在切换 VPN 节点" : "当前认证流程发生节点跳转，无法安全继续"
+            self.push(state: self.lastStateCode, detail: self.lastDetail)
+            current.stop { [weak self, weak current] in
+                guard let self, let current else { reply(""); return }
+                self.queue.async {
+                    if self.stoppingEngine === current { self.stoppingEngine = nil }
+                    guard decision.ok, let ticket = decision.ticket else { reply(result); return }
+                    let stopped = self.relayHandover.command(["op": "engine_stopped", "ticket": ticket])
+                    reply(stopped?.1 ?? "")
+                }
+            }
+            // No timer is allowed to claim successful process termination.
+        }
+    }
+
+    func commitRelayHandover(ticket: String, server: String, serverPin: String, listenerClosed: Bool,
+                             withReply reply: @escaping (Bool, Int) -> Void) {
+        queue.async {
+            guard self.engine == nil, self.stoppingEngine == nil,
+                  let relay = self.relay, relay.serverPin == serverPin, let credentials = self.relayCredentials,
+                  let (decision, _) = self.relayHandover.command([
+                    "op": "commit", "ticket": ticket, "target": server,
+                    "pin": relay.serverPin, "listener_closed": listenerClosed]), decision.ok else { reply(false, 0); return }
+            Self.log("relay attempt=\(decision.attempt) stage=commit")
+            let parameters = [server, credentials.group, credentials.username, credentials.password,
+                              relay.gatewayIp, relay.serverPin]
+            self.startEngineNow(server: server, group: credentials.group, username: credentials.username,
+                                password: credentials.password, parameters: parameters) { accepted in
+                reply(accepted, Int(decision.attempt))
+            }
+        }
+    }
+
+    func cancelRelayHandover(session: String, withReply reply: @escaping () -> Void) {
+        queue.async {
+            if let (decision, _) = self.relayHandover.command(["op": "cancel", "session": session]), decision.ok {
+                self.startGeneration += 1
+                if let current = self.engine {
+                    if self.dropProtection, NetworkGuard.shared.isHolding {
+                        NetworkGuard.shared.supersedeOwnHolders()
+                    }
+                    self.engine = nil
+                    self.activeParameters = nil
+                    self.stoppingEngine = current
+                    current.stop { [weak self, weak current] in
+                        guard let self, let current else { return }
+                        self.queue.async {
+                            if self.stoppingEngine === current { self.stoppingEngine = nil }
+                        }
+                    }
+                }
+                self.relayCredentials = nil
+                self.lastStateCode = 0
+                self.lastDetail = "VPN 节点切换已停止"
+                self.push(state: self.lastStateCode, detail: self.lastDetail)
+            }
+            reply()
         }
     }
 
@@ -475,6 +591,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 // instead of releasing the kill switch (§25.1, F1).
                 self.engine = nil
                 self.activeParameters = nil
+                self.relayCredentials = nil
+                _ = self.relayHandover.command(["op": "reset"])
                 switch reason {
                 case .stoppedManual: self.lastReasonCode = 1
                 case .authFailure: self.lastReasonCode = 2
@@ -518,6 +636,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     /// On `queue`. pf first — the network is direct the moment this
     /// returns — then the parts that take their time.
     private func releaseEverythingLocked(reason: String) {
+        _ = relayHandover.command(["op": "reset"])
+        relayCredentials = nil
         startGeneration += 1 // a replacement waiting to start never does
         if reason == NetworkGuard.Reason.user { userReleased = true }
         NetworkGuard.shared.release(holder: nil, reason: reason)

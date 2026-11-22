@@ -15,6 +15,16 @@ for arg in "$@"; do
   case "$arg" in --script=*) script=${arg#--script=} ;; esac
 done
 read -r credential || true
+# An early authentication socket: no password/Cookie has crossed HTTP yet.
+# Used only by the isolated relay handover lifecycle scenarios.
+if [ "${FAKE_RELAY_PREAUTH:-}" = 1 ]; then
+  [ "${FAKE_RELAY_AUTH_EXPOSED:-}" = 1 ] && echo '> <password>fixture</password>'
+  sleep 600 &
+  preauth=$!
+  trap 'kill "$preauth" 2>/dev/null; exit 143' TERM HUP
+  wait "$preauth"
+  exit 1
+fi
 # FAKE_SIGNAL_LOG: record how the engine ended this process (HUP keeps
 # the session, TERM logs it off, DESIGN.md §30.1).
 if [ -n "${FAKE_SIGNAL_LOG:-}" ]; then

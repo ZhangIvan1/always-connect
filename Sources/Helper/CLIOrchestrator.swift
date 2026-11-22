@@ -164,6 +164,7 @@ final class CLIOrchestrator {
 
     /// The network gate's holder name for this engine (§25.2).
     var holder: String { NetworkGuard.take(ac_oc_holder(handle)) ?? "" }
+    var authenticationExposed: Bool { ac_oc_authentication_exposed(handle) }
 
     /// `completion` runs once openconnect has exited and routes and pf
     /// are restored (§25.7). `keepSession`: SIGHUP, no log-off (§30.1).
@@ -355,3 +356,6 @@ func ac_oc_network_changed(_ engine: OpaquePointer)
 
 @_silgen_name("ac_oc_network_check")
 func ac_oc_network_check(_ engine: OpaquePointer) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("ac_oc_authentication_exposed")
+private func ac_oc_authentication_exposed(_ e: OpaquePointer) -> Bool

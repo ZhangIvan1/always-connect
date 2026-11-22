@@ -50,6 +50,7 @@ enum RelayLog {
 }
 final class Relay {
     let sessionId = "fixture-session"
+    let attempt = 0
     enum RelayError: Error { case unsupportedSystem, unresolved }
     struct Prepared { let gatewayIp: String; let serverPin: String; let addresses: [String] }
     let host = "gw.example"

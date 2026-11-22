@@ -25,6 +25,7 @@
 //! tunnel, ours included (§23.6).
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -184,6 +185,7 @@ pub struct HttpRequests {
     header: Vec<u8>,
     body_remaining: usize,
     session: Arc<RelaySession>,
+    methods: VecDeque<(bool, bool)>,
 }
 
 impl HttpRequests {
@@ -214,7 +216,7 @@ impl HttpRequests {
             let mut request = lines.first().copied().unwrap_or("").split_whitespace();
             let method = request.next().unwrap_or("");
             let path = request.next().unwrap_or("");
-            if !matches!(method, "GET" | "HEAD" | "CONNECT") || path.contains('?') {
+            if !matches!(method, "GET" | "HEAD") || path != "/" {
                 self.session.sensitive.store(true, Ordering::SeqCst);
             }
             if lines.first().is_some_and(|l| l.starts_with("CONNECT ")) {
@@ -233,6 +235,9 @@ impl HttpRequests {
             for line in lines.iter().skip(1) {
                 let Some((name, value)) = line.split_once(':') else { continue };
                 let name = name.trim().to_ascii_lowercase();
+                if !matches!(name.as_str(), "host" | "user-agent" | "accept" | "accept-encoding" | "connection" | "content-length") {
+                    self.session.sensitive.store(true, Ordering::SeqCst);
+                }
                 if matches!(name.as_str(), "cookie" | "authorization" | "proxy-authorization") {
                     self.session.sensitive.store(true, Ordering::SeqCst);
                 }
@@ -248,6 +253,8 @@ impl HttpRequests {
                     return Err(FramingError::Invalid);
                 }
             }
+            if self.methods.len() >= 64 { return Err(FramingError::Oversized); }
+            self.methods.push_back((method == "HEAD", method == "CONNECT"));
             out.push(&head);
             // What came after the header: the body or the next request.
             let tail = whole[boundary..].to_vec();
@@ -590,7 +597,7 @@ impl Stream {
             interface: None,
             auth: AuthTrace::new(pair, log.clone()),
             log,
-            requests: HttpRequests { header: Vec::new(), body_remaining: 0, session: Arc::clone(&session) },
+            requests: HttpRequests { header: Vec::new(), body_remaining: 0, session: Arc::clone(&session), methods: VecDeque::new() },
             responses: crate::relay_http::Responses::default(),
             session,
             connect_requested: false,
@@ -618,6 +625,14 @@ impl Stream {
             .and_then(|l| Ipv4Addr::from_str(l).ok())
             .and_then(interface_of)
             .or_else(|| interface.filter(|i| !i.is_empty()).map(str::to_string));
+    }
+
+    pub fn set_context(&mut self, session: String, attempt: u32) {
+        if let Some(log) = self.log.clone() {
+            let log: Log = Arc::new(move |line| log(&format!("session={session} attempt={attempt} {line}")));
+            self.auth.log = Some(log.clone());
+            self.log = Some(log);
+        }
     }
 
     pub fn set_session(&mut self, session: Arc<RelaySession>) {
@@ -663,6 +678,12 @@ impl Stream {
         self.auth.observe(data, from_client);
         if from_client {
             let connect = self.requests.pass(data, out)?;
+            while let Some((head, is_connect)) = self.requests.methods.pop_front() {
+                // CONNECT may only start after earlier authentication replies
+                // are complete; never mistake an earlier 200 for a tunnel.
+                if is_connect && self.responses.has_pending_request() { return Err(FramingError::Invalid); }
+                self.responses.enqueue_request(head)?;
+            }
             self.connect_requested = connect || self.connect_requested;
             return Ok(());
         }
@@ -893,12 +914,31 @@ mod tests {
     }
 
     #[test]
+    fn connect_cannot_overtake_an_authentication_response() {
+        let get = b"GET / HTTP/1.1\r\n\r\n";
+        let connect = b"CONNECT /CSCOSSLC/tunnel HTTP/1.1\r\n\r\n";
+        let mut pending = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+        pending.feed(get, true).unwrap();
+        assert_eq!(pending.feed(connect, true), Err(FramingError::Invalid));
+        let mut body = Stream::new(2, Ipv4Addr::LOCALHOST, None);
+        body.feed(get, true).unwrap();
+        body.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbo", false).unwrap();
+        assert_eq!(body.feed(connect, true), Err(FramingError::Invalid));
+        let mut ready = Stream::new(3, Ipv4Addr::LOCALHOST, None);
+        ready.feed(get, true).unwrap();
+        ready.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody", false).unwrap();
+        assert!(ready.feed(connect, true).is_ok());
+    }
+
+    #[test]
     fn authentication_boundary_survives_a_new_tls_pair() {
         for request in [
             "POST /auth HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
             "GET / HTTP/1.1\r\nCookie: webvpn=secret\r\n\r\n",
             "GET / HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\n",
             "GET /login?token=secret HTTP/1.1\r\n\r\n",
+            "GET /auth/opaque-value HTTP/1.1\r\n\r\n",
+            "GET / HTTP/1.1\r\nX-Unknown-Authentication: opaque\r\n\r\n",
             "GET / HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
         ] {
             let session = Arc::new(RelaySession::default());

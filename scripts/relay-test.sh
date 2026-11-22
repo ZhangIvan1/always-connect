@@ -73,6 +73,17 @@ done
 cp "$W/support/relay/client.key" relay-client.key
 [ -s relay-client.pem ] && [ -s relay-client.key ] || { echo "FAIL relay client identity"; exit 1; }
 
+# Real listener cancellation, then a new listener on the same loopback port.
+# Test identities only; this never initiates an upstream connection.
+ALWAYSCONNECT_TEST_REBIND=1 "$W/RelayHarness" relay company.p12 test ca.der 4467 4464 relay-client.pem > "$W/rebind.out" 2>&1
+REBIND_STATUS=$?
+if [ "$REBIND_STATUS" = 77 ]; then echo "SKIP relay: memory-only import requires macOS 15"; exit 0; fi
+if [ "$REBIND_STATUS" = 0 ]; then
+    pass "old listener cancellation completes before same-port replacement"
+else
+    fail "same-port relay replacement"; cat "$W/rebind.out"
+fi
+
 start_relay() { # listen upstream [identity.p12 [renewal.p12]] -> sets RELAY_IP RELAY_PIN
     "$W/RelayHarness" relay "${3:-company.p12}" test ca.der "$1" "$2" relay-client.pem ${4:+"$4"} \
         > "$W/relay-$1.out" 2>&1 &

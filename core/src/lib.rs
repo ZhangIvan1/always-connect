@@ -23,6 +23,7 @@ pub mod offline;
 pub mod pf;
 pub mod relay;
 pub mod relay_http;
+pub mod relay_switch;
 pub mod relay_log;
 pub mod route_watch;
 pub mod rules;

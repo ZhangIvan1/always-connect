@@ -101,8 +101,8 @@ struct SessionHarness {
         return text.components(separatedBy: "=== load").last ?? ""
     }
 
-    static func prepareRelay(_ s: HelperSession, gateway: String) -> Bool {
-        let pin = "pin-sha256:" + Data(repeating: 7, count: 32).base64EncodedString()
+    static func prepareRelay(_ s: HelperSession, gateway: String, pinByte: UInt8 = 7) -> Bool {
+        let pin = "pin-sha256:" + Data(repeating: pinByte, count: 32).base64EncodedString()
         let pem: String? = sync { reply in s.prepareRelay(gatewayIp: gateway, serverPin: pin, withReply: reply) }
         return !(pem ?? "").isEmpty
     }
@@ -294,6 +294,65 @@ struct SessionHarness {
                 (sync { reply in session.getSessionInfo { reason, _ in reply(reason) } } ?? 0) == 1
             }
             assertReleased("own-replace")
+        case "relay-handover", "relay-handover-cancel", "relay-handover-unsafe":
+            setenv("FAKE_RELAY_PREAUTH", "1", 1)
+            if scenario == "relay-handover-unsafe" { setenv("FAKE_RELAY_AUTH_EXPOSED", "1", 1) }
+            writeOwnRecord(connected: false)
+            NetworkGuard.shared.adoptAtStart()
+            let a = "https://vpn-a.example:6443/"
+            let b = "https://vpn-b.example:6443/"
+            let identity = "00000000-0000-4000-8000-000000000001"
+            let pinA = "pin-sha256:" + Data(repeating: 7, count: 32).base64EncodedString()
+            let pinB = "pin-sha256:" + Data(repeating: 8, count: 32).base64EncodedString()
+            check(prepareRelay(session, gateway: "198.51.100.7"), "initial relay configuration prepared")
+            let context = RelayConnectionContext(session: identity, target: a, pin: pinA, allowed: [a, b])
+            let encoded = String(data: try! JSONEncoder().encode(context), encoding: .utf8)!
+            let accepted: Bool? = sync { reply in
+                session.connectRelayed(server: a, group: "Staff", username: "user", password: "fixture",
+                                       context: encoded, withReply: reply)
+            }
+            check(accepted == true, "initial relayed intent accepted")
+            check(waitFor(5) { [1, 2].contains(status(session)) && NetworkGuard.shared.holder?.hasPrefix("own:") == true },
+                  "pre-authentication engine owns the original hold")
+            if scenario == "relay-handover-unsafe" {
+                check(waitFor(5) { session.harnessAuthenticationExposed() }, "helper independently observed a sent credential")
+            }
+            let releaseCount = pfLog().filter { $0.hasPrefix("-X ") }.count
+            let fields: [String: Any] = ["session": identity, "attempt": 0, "source": a, "pin": pinA,
+                "location": b, "status": 302, "replay_unsafe": false]
+            let request = String(data: try! JSONSerialization.data(withJSONObject: fields), encoding: .utf8)!
+            let raw: String? = sync { reply in session.beginRelayHandover(request, withReply: reply) }
+            let grant = raw.flatMap { try? JSONDecoder().decode(RelayHandover.Reply.self, from: Data($0.utf8)) }
+            check(NetworkGuard.shared.isHolding, "handover stop retained protection")
+            check(pfLog().filter { $0.hasPrefix("-X ") }.count == releaseCount, "old process did not release the hold")
+            if scenario == "relay-handover-unsafe" {
+                check(grant?.ok == false && grant?.code == "authentication_replay_unsafe", "unsafe authentication stopped instead of replaying")
+            } else if let grant, grant.ok, let ticket = grant.ticket {
+                check(grant.code == "stop_listener", "reply proves actual engine stop")
+                if scenario == "relay-handover-cancel" {
+                    let _: Bool? = sync { reply in session.cancelRelayHandover(session: identity) { reply(true) } }
+                }
+                check(prepareRelay(session, gateway: "198.51.100.9", pinByte: 8), "new target has a fresh relay pin")
+                let unready: (Bool, Int)? = sync { reply in
+                    session.commitRelayHandover(ticket: ticket, server: b, serverPin: pinB, listenerClosed: false) { reply(($0, $1)) }
+                }
+                check(unready?.0 == false, "no new engine before listener closure")
+                let committed: (Bool, Int)? = sync { reply in
+                    session.commitRelayHandover(ticket: ticket, server: b, serverPin: pinB, listenerClosed: true) { reply(($0, $1)) }
+                }
+                check(committed?.0 == (scenario == "relay-handover"), "cancelled ticket cannot start; live ticket starts once")
+                if scenario == "relay-handover" {
+                    check(committed?.1 == 1, "helper reports the new attempt")
+                    check(waitFor(5) { lastRules().contains("198.51.100.9") && !lastRules().contains("198.51.100.7") },
+                          "new hold permits only the actual new gateway")
+                    let repeated: (Bool, Int)? = sync { reply in
+                        session.commitRelayHandover(ticket: ticket, server: b, serverPin: pinB, listenerClosed: true) { reply(($0, $1)) }
+                    }
+                    check(repeated?.0 == false, "ticket commit cannot be replayed")
+                }
+            } else { check(false, "early redirect granted a stop-complete ticket") }
+            check(disconnect(session), "explicit disconnect remains available")
+            assertReleased(scenario, adoptedReferences: 1)
         case "orphan-sweep":
             // F6: a crashed run's openconnect / routing core is ended at start.
             // One process each (no child that could outlive it and hold

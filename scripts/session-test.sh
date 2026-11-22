@@ -25,7 +25,8 @@ SCENARIOS=("$@")
     grace-expiry grace-cancelled quit-no-relaunch restart-same-boot restart-other-boot legacy-pf-state
     own-lan-direct own-replace orphan-sweep journal-at-start direct-routes-journal
     takeover-adopted takeover-replace protection-off-adopted held-allow-update
-    direct-table direct-before-hold direct-adopt old-record)
+    direct-table direct-before-hold direct-adopt old-record
+    relay-handover relay-handover-cancel relay-handover-unsafe)
 # Each scenario has its own scratch root, stubs and harness process, so
 # they run in parallel (SESSION_JOBS at a time); reports print in order.
 scenario() {

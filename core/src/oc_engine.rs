@@ -281,20 +281,26 @@ pub fn restore_without_engine(script: &str, reason: &str, support: &Path, boot: 
 #[serde(rename_all = "camelCase")]
 struct CookieRecord {
     cookie: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    group: String,
     gateway: String,
     server_fingerprint: String,
     saved_at_unix: i64,
 }
 
-fn cookie_load(path: &str, gateway: &str) -> Option<String> {
+fn cookie_load(path: &str, gateway: &str, username: &str, group: &str) -> Option<String> {
     let record: CookieRecord = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    (record.gateway == gateway && !record.cookie.is_empty()).then_some(record.cookie)
+    (record.gateway == gateway && record.username == username && record.group == group && !record.cookie.is_empty()).then_some(record.cookie)
 }
 
-fn cookie_save(path: &str, cookie: &str, gateway: &str) {
+fn cookie_save(path: &str, cookie: &str, gateway: &str, username: &str, group: &str) {
     use std::os::unix::fs::PermissionsExt;
     let record = CookieRecord {
         cookie: cookie.to_string(),
+        username: username.to_string(),
+        group: group.to_string(),
         gateway: gateway.to_string(),
         server_fingerprint: String::new(),
         saved_at_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
@@ -390,6 +396,7 @@ struct Core {
     err_buffer: Vec<u8>,
     tail: Vec<String>,
     credential_sent_at: Option<Instant>,
+    authentication_exposed: bool,
     last_credential_wait: f64,
     unanswered_since: Option<Instant>,
     expired_approvals: usize,
@@ -478,6 +485,7 @@ impl Engine {
                 err_buffer: Vec::new(),
                 tail: Vec::new(),
                 credential_sent_at: None,
+                authentication_exposed: false,
                 last_credential_wait: 0.0,
                 unanswered_since: None,
                 expired_approvals: 0,
@@ -576,6 +584,10 @@ impl Engine {
         if alive.load(Ordering::SeqCst) {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
+    }
+
+    pub fn authentication_exposed(&self) -> bool {
+        self.shared.core.lock().unwrap().authentication_exposed
     }
 
     pub fn info(&self) -> Info {
@@ -1398,7 +1410,7 @@ impl Shared {
         if c.in_drop_episode {
             c.episode_retries += 1;
         }
-        let cookie = cookie_load(&c.config.cookie_store_path, &c.config.server);
+        let cookie = cookie_load(&c.config.cookie_store_path, &c.config.server, &c.config.username, &c.config.group);
         let Some(executable) = Self::executable(c) else {
             let detail = "内置连接组件缺失或不可信，请重新安装后台服务";
             self.stop_split(c);
@@ -1430,6 +1442,7 @@ impl Shared {
         }
         let mut credential = match cookie {
             Some(cookie) => {
+                c.authentication_exposed = true;
                 args.push("--cookie-on-stdin".into());
                 c.fed = Credential::Cookie;
                 cookie
@@ -1578,7 +1591,8 @@ impl Shared {
             return;
         }
         if let Some(cookie) = capture_cookie(line) {
-            cookie_save(&c.config.cookie_store_path, &cookie, &c.config.server);
+            c.authentication_exposed = true;
+            cookie_save(&c.config.cookie_store_path, &cookie, &c.config.server, &c.config.username, &c.config.group);
             return;
         }
         if line.starts_with("> ") && line.contains("<password>") {
@@ -1600,6 +1614,7 @@ impl Shared {
         let pairs: Vec<(&str, &str)> = parts.filter_map(|p| p.split_once('=')).collect();
         match event {
             "connect" => {
+                c.authentication_exposed = true;
                 c.tunnel_dns.clear();
                 let mut tun = None;
                 let mut gateway = None;
@@ -1685,6 +1700,7 @@ impl Shared {
     // MARK: Approval wait (§30.9)
 
     fn credential_sent(self: &Arc<Self>, c: &mut Core) {
+        c.authentication_exposed = true;
         c.credential_sent_at = Some(Instant::now());
         c.last_credential_wait = 0.0;
         c.approval_waited = false;
@@ -2056,6 +2072,23 @@ fn wipe(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_cookie_is_scoped_to_gateway_and_login() {
+        let dir = std::env::temp_dir().join(format!("ac-cookie-scope-{}", std::process::id()));
+        let path = dir.join("session.json");
+        let path = path.to_str().unwrap();
+        cookie_save(path, "fixture-cookie", "https://vpn-a.example/", "user-a", "Staff");
+        assert_eq!(cookie_load(path, "https://vpn-a.example/", "user-a", "Staff").as_deref(), Some("fixture-cookie"));
+        assert!(cookie_load(path, "https://vpn-b.example/", "user-a", "Staff").is_none());
+        assert!(cookie_load(path, "https://vpn-a.example/", "user-b", "Staff").is_none());
+        assert!(cookie_load(path, "https://vpn-a.example/", "user-a", "Other").is_none());
+        let mut legacy: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("username");
+        std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(cookie_load(path, "https://vpn-a.example/", "user-a", "Staff").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn split_engine(name: &str) -> (Engine, PathBuf) {
         split_engine_with_hooks(name, Hooks {

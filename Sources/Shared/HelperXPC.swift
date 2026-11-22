@@ -29,6 +29,16 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     /// User-confirmed manual disconnect: stop the CLI, restore the
     /// local network, unload pf.
     func disconnect(withReply reply: @escaping () -> Void)
+    /// Additive, matching App/Helper only. Initial context belongs to this
+    /// credential entry; subsequent targets do not overwrite the saved entry.
+    func connectRelayed(server: String, group: String, username: String, password: String,
+                        context: String, withReply reply: @escaping (Bool) -> Void)
+    /// Stops retries/process while retaining the current protection hold.
+    /// The private event is never logged. Reply only after actual process exit.
+    func beginRelayHandover(_ event: String, withReply reply: @escaping (String) -> Void)
+    func commitRelayHandover(ticket: String, server: String, serverPin: String, listenerClosed: Bool,
+                             withReply reply: @escaping (Bool, Int) -> Void)
+    func cancelRelayHandover(session: String, withReply reply: @escaping () -> Void)
     /// Current state code + human-readable detail (reason + next step,
     /// never a raw error dump, never a credential).
     func getStatus(withReply reply: @escaping (Int, String) -> Void)
