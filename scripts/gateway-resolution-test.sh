@@ -122,7 +122,7 @@ final class Daemon {
             catch Relay.RelayError.unresolved { }
             precondition(Relay.dnsCalls == 0)
             precondition(RelayLog.lines.count == 2)
-            precondition(RelayLog.lines[0].contains("session=fixture-session stage=dns source=cache candidates=0 port=443"))
+            precondition(RelayLog.lines[0].contains("session=fixture-session attempt=0 stage=dns source=cache candidates=0 port=443"))
             precondition(RelayLog.lines[1].contains("source=resolved candidates=1"))
             precondition(!RelayLog.lines.contains { $0.contains("198.51.100.") || $0.contains("gw.example") })
         }

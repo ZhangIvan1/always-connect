@@ -311,6 +311,11 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         return queue.sync { engine?.authenticationExposed ?? true }
     }
 
+    func harnessEngineHolder() -> String? {
+        precondition(TestSeam.isActive)
+        return queue.sync { engine?.holder }
+    }
+
     /// Session harness only: an App attaching or vanishing, no XPC.
     func harnessOwner(attached: Bool, appPath: String? = nil) {
         queue.sync {
@@ -403,7 +408,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             if let session = request["session"] as? String {
                 Self.log("relay session=\(session) attempt=\(decision.attempt) stage=handover code=\(decision.code)")
             }
-            self.startGeneration += 1
+            self.startBarrier.cancel()
             if self.dropProtection, NetworkGuard.shared.isHolding {
                 NetworkGuard.shared.supersedeOwnHolders()
             }
@@ -447,7 +452,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     func cancelRelayHandover(session: String, withReply reply: @escaping () -> Void) {
         queue.async {
             if let (decision, _) = self.relayHandover.command(["op": "cancel", "session": session]), decision.ok {
-                self.startGeneration += 1
+                self.startBarrier.cancel()
                 if let current = self.engine {
                     if self.dropProtection, NetworkGuard.shared.isHolding {
                         NetworkGuard.shared.supersedeOwnHolders()
@@ -477,15 +482,14 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     /// the start that waits: a later connect or a disconnect bumps the
     /// generation, so a superseded start never runs.
     private var stoppingEngine: CLIOrchestrator?
-    private var startGeneration = 0
+    private let startBarrier = EngineStartBarrier()
 
     private func startEngine(
         server: String, group: String, username: String, password: String,
         parameters: [String], reply: @escaping (Bool) -> Void
     ) {
-        startGeneration += 1
+        let ticket = startBarrier.begin()
         userReleased = false
-        let generation = startGeneration
         // Replacing a running engine (new server, new relay): stop it
         // the whole way first — routes back, its own pf hold released —
         // then start the new one (§25.7). Starting at once left the old
@@ -506,22 +510,32 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             NetworkGuard.shared.supersedeOwnHolders()
         }
         if let stopping = stoppingEngine {
-            var started = false
             let begin: () -> Void = { [weak self] in
                 guard let self else { return }
                 self.queue.async {
-                    guard !started else { return }
-                    started = true
                     if self.stoppingEngine === stopping { self.stoppingEngine = nil }
-                    guard generation == self.startGeneration else { reply(false); return }
-                    self.startEngineNow(server: server, group: group, username: username,
-                                        password: password, parameters: parameters, reply: reply)
+                    switch ticket.complete(stopped: true) {
+                    case .start:
+                        self.startEngineNow(server: server, group: group, username: username,
+                                            password: password, parameters: parameters, reply: reply)
+                    case .cancelled: reply(false)
+                    case .ignore, .timedOut: break
+                    }
                 }
             }
             stopping.stop(keepSession: sameLogin, completion: begin)
-            // Fallback only: the old engine's own restore must not land
-            // on top of the new session's routes (§30.3).
-            queue.asyncAfter(deadline: .now() + 20) { begin() }
+            // A deadline is failure, never evidence of process/route cleanup.
+            queue.asyncAfter(deadline: .now() + 20) {
+                switch ticket.complete(stopped: false) {
+                case .timedOut:
+                    self.lastStateCode = 0
+                    self.lastDetail = "旧 VPN 连接尚未完成清理，请稍后重试"
+                    self.push(state: self.lastStateCode, detail: self.lastDetail)
+                    reply(false)
+                case .cancelled: reply(false)
+                case .ignore, .start: break
+                }
+            }
             return
         }
         startEngineNow(server: server, group: group, username: username,
@@ -638,7 +652,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
     private func releaseEverythingLocked(reason: String) {
         _ = relayHandover.command(["op": "reset"])
         relayCredentials = nil
-        startGeneration += 1 // a replacement waiting to start never does
+        startBarrier.cancel() // a replacement waiting to start never does
         if reason == NetworkGuard.Reason.user { userReleased = true }
         NetworkGuard.shared.release(holder: nil, reason: reason)
         // The Cisco kill switch, always: an own-connection engine

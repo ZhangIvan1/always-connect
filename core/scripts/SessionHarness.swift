@@ -312,8 +312,15 @@ struct SessionHarness {
                                        context: encoded, withReply: reply)
             }
             check(accepted == true, "initial relayed intent accepted")
-            check(waitFor(5) { [1, 2].contains(status(session)) && NetworkGuard.shared.holder?.hasPrefix("own:") == true },
-                  "pre-authentication engine owns the original hold")
+            // Adopting a blocking hold reports Reconnecting (5) even
+            // before HTTP authentication; approval (3) is possible only in the
+            // deliberately credential-exposed fixture.
+            check(waitFor(5) {
+                let state = status(session)
+                let eligible = [1, 2, 5].contains(state) || (scenario == "relay-handover-unsafe" && state == 3)
+                return eligible && session.harnessEngineHolder() != nil
+                    && session.harnessEngineHolder() == NetworkGuard.shared.holder
+            }, "pre-authentication/retrying engine owns the original hold")
             if scenario == "relay-handover-unsafe" {
                 check(waitFor(5) { session.harnessAuthenticationExposed() }, "helper independently observed a sent credential")
             }

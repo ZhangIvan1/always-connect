@@ -983,6 +983,11 @@ impl Shared {
             c.pending_stop_notices += 1;
         }
         if c.stop_requested {
+            if c.finished {
+                for _ in 0..std::mem::take(&mut c.pending_stop_notices) {
+                    (self.hooks.stopped)();
+                }
+            }
             return;
         }
         c.stop_requested = true;
@@ -2088,6 +2093,26 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert!(cookie_load(path, "https://vpn-a.example/", "user-a", "Staff").is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_stop_after_relay_cleanup_still_completes() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&count);
+        let (engine, support) = split_engine_with_hooks("relay-repeat-stop", Hooks {
+            state: Box::new(|_, _| {}), terminal: Box::new(|_| {}),
+            network_available: Box::new(|| true), physical_network: Box::new(|_| None),
+            local_dns: Box::new(|_| vec![]), system_roots: Box::new(|| None),
+            stopped: Box::new(move || { observed.fetch_add(1, Ordering::SeqCst); }),
+        });
+        for expected in 1..=2 {
+            engine.stop(false, true);
+            let (tx, rx) = mpsc::channel(); engine.send(Event::Barrier(tx));
+            rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), expected);
+        }
+        drop(engine);
+        std::fs::remove_dir_all(support).unwrap();
     }
 
     fn split_engine(name: &str) -> (Engine, PathBuf) {

@@ -1981,3 +1981,28 @@ pub extern "C" fn ac_relay_stream_set_context(s: *mut Stream, session: *const c_
         s.set_context(session, attempt);
     }
 }
+
+#[no_mangle]
+pub extern "C" fn ac_start_barrier_new() -> *mut std::sync::Arc<crate::start_barrier::Owner> {
+    Box::into_raw(Box::new(std::sync::Arc::new(crate::start_barrier::Owner::default())))
+}
+#[no_mangle]
+pub extern "C" fn ac_start_barrier_free(p: *mut std::sync::Arc<crate::start_barrier::Owner>) {
+    if !p.is_null() { drop(unsafe { Box::from_raw(p) }); }
+}
+#[no_mangle]
+pub extern "C" fn ac_start_barrier_cancel(p: *const std::sync::Arc<crate::start_barrier::Owner>) {
+    if let Some(p) = unsafe { p.as_ref() } { p.cancel(); }
+}
+#[no_mangle]
+pub extern "C" fn ac_start_barrier_begin(p: *const std::sync::Arc<crate::start_barrier::Owner>) -> *mut crate::start_barrier::Ticket {
+    (unsafe { p.as_ref() }).map(|p| Box::into_raw(Box::new(p.begin()))).unwrap_or(std::ptr::null_mut())
+}
+#[no_mangle]
+pub extern "C" fn ac_start_ticket_complete(p: *mut crate::start_barrier::Ticket, stopped: bool) -> u32 {
+    (unsafe { p.as_mut() }).map(|p| p.complete(stopped) as u32).unwrap_or(0)
+}
+#[no_mangle]
+pub extern "C" fn ac_start_ticket_free(p: *mut crate::start_barrier::Ticket) {
+    if !p.is_null() { drop(unsafe { Box::from_raw(p) }); }
+}

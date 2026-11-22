@@ -30,6 +30,7 @@ pub mod rules;
 pub mod session;
 pub mod split_policy;
 pub mod state_machine;
+pub mod start_barrier;
 pub mod traffic;
 pub mod update_check;
 
