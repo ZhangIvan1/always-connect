@@ -112,6 +112,8 @@ final class CertificateRelay {
     private var pairCount = 0
     private var stopped = false
     private let sessionId = UUID().uuidString
+    private let session = ac_relay_session_new()!
+    private var isActive: Bool { !stopped && ac_relay_session_active(session) }
 
     /// `upstreamPort` and `anchor` exist for the harness only (a mock
     /// gateway on another loopback port, trusted through its test CA);
@@ -129,6 +131,8 @@ final class CertificateRelay {
         self.upstreamPort = upstreamPort ?? port
         self.anchor = anchor
     }
+
+    deinit { ac_relay_session_cancel(session); ac_relay_session_free(session) }
 
     // MARK: - Keychain identities
 
@@ -238,7 +242,7 @@ final class CertificateRelay {
     /// (DER, from the Helper). Completion on the relay queue.
     func start(clientCertificate: Data, completion: @escaping (Error?) -> Void) {
         queue.async {
-            guard !self.stopped else { completion(RelayError.listener("连接已取消")); return }
+            guard self.isActive else { completion(RelayError.listener("连接已取消")); return }
             guard let identity = self.listenerIdentity, self.gatewayIp != nil else {
                 completion(RelayError.certificate)
                 return
@@ -264,7 +268,7 @@ final class CertificateRelay {
             }
             var reported = false
             listener.stateUpdateHandler = { [weak self] state in
-                guard let self, !self.stopped else { return }
+                guard let self, self.isActive else { return }
                 switch state {
                 case .ready:
                     if !reported { reported = true; completion(nil) }
@@ -283,7 +287,7 @@ final class CertificateRelay {
                 }
             }
             listener.newConnectionHandler = { [weak self] connection in
-                guard let self, !self.stopped else { connection.cancel(); return }
+                guard let self, self.isActive else { connection.cancel(); return }
                 self.accept(connection)
             }
             self.listener = listener
@@ -293,6 +297,7 @@ final class CertificateRelay {
     }
 
     func stop() {
+        ac_relay_session_cancel(session)
         queue.async { self.stopLocked() }
     }
 
@@ -316,7 +321,7 @@ final class CertificateRelay {
             monitor = NWPathMonitor()
         }
         monitor.pathUpdateHandler = { [weak self] path in
-            guard let self, !self.stopped else { return }
+            guard let self, self.isActive else { return }
             let signature = "\(path.status) \(path.availableInterfaces.map(\.name)) \(path.gateways.map(\.debugDescription))"
             defer { self.lastPath = signature }
             guard let last = self.lastPath, last != signature else { return }
@@ -329,6 +334,7 @@ final class CertificateRelay {
     }
 
     private func stopLocked() {
+        ac_relay_session_cancel(session)
         stopped = true
         pathMonitor?.cancel()
         pathMonitor = nil
@@ -362,7 +368,7 @@ final class CertificateRelay {
     }
 
     private func accept(_ incoming: NWConnection) {
-        guard !stopped, let ip = gatewayIp else { incoming.cancel(); return }
+        guard isActive, let ip = gatewayIp else { incoming.cancel(); return }
         pairCount += 1
         let pairId = "session=\(sessionId) pair=\(pairCount)"
         // Full targets stay in the local private system log. Exported relay
@@ -402,7 +408,7 @@ final class CertificateRelay {
             host: NWEndpoint.Host(ip), port: NWEndpoint.Port(rawValue: upstreamPort)!,
             using: parameters)
         let pair = Pair(incoming: incoming, outgoing: outgoing, queue: queue, number: pairCount,
-                        gatewayIp: ip, sessionId: sessionId, host: host, port: port)
+                        gatewayIp: ip, sessionId: sessionId, host: host, port: port, session: session)
         let key = ObjectIdentifier(pair)
         pair.onClose = { [weak self] outcome in
             guard let self else { return }
@@ -535,7 +541,7 @@ private final class Pair {
     private let opened = Date()
 
     init(incoming: NWConnection, outgoing: NWConnection, queue: DispatchQueue, number: Int,
-         gatewayIp: String, sessionId: String, host: String, port: UInt16) {
+         gatewayIp: String, sessionId: String, host: String, port: UInt16, session: OpaquePointer) {
         self.incoming = incoming
         self.outgoing = outgoing
         self.queue = queue
@@ -546,6 +552,7 @@ private final class Pair {
         stream = ac_relay_stream_new(UInt32(number), gatewayIp, nil)
             ?? ac_relay_stream_new(UInt32(number), "0.0.0.0", nil)!
         ac_relay_stream_set_target(stream, host, port)
+        ac_relay_stream_set_session(stream, session)
     }
 
     deinit { ac_relay_stream_free(stream) }
@@ -647,7 +654,15 @@ private final class Pair {
                                          raw.baseAddress?.assumingMemoryBound(to: UInt8.self), raw.count)
                 }
                 guard count >= 0 else {
-                    let why = count == -3 ? "cross-origin redirect blocked" : count == -2 ? "oversized" : "invalid"
+                    if count == -3, let raw = ac_relay_stream_take_redirect(self.stream) {
+                        defer { ac_string_free(raw) }
+                        // The Location stays private; only fixed metadata is logged.
+                        let data = Data(String(cString: raw).utf8)
+                        if let event = try? JSONDecoder().decode(RelayRedirect.self, from: data) {
+                            self.trace("pair \(self.number) stage=redirect status=\(event.status) replay_unsafe=\(event.replayUnsafe)")
+                        }
+                    }
+                    let why = count == -4 ? "session cancelled" : count == -3 ? "cross-origin redirect blocked" : count == -2 ? "oversized" : "invalid"
                     self.close("framing \(self.side(fromClient)) -> \(self.side(!fromClient)): \(why)")
                     return
                 }
@@ -736,3 +751,26 @@ func ac_string_free(_ s: UnsafeMutablePointer<CChar>?)
 
 @_silgen_name("ac_relay_stream_set_target")
 func ac_relay_stream_set_target(_ s: OpaquePointer, _ host: UnsafePointer<CChar>, _ port: UInt16)
+
+/// Private protocol event. Do not log Location or include it in public exports.
+private struct RelayRedirect: Decodable {
+    let status: UInt16
+    let location: String
+    let replayUnsafe: Bool
+    enum CodingKeys: String, CodingKey {
+        case status, location
+        case replayUnsafe = "replay_unsafe"
+    }
+}
+@_silgen_name("ac_relay_session_new")
+func ac_relay_session_new() -> OpaquePointer?
+@_silgen_name("ac_relay_session_cancel")
+func ac_relay_session_cancel(_ s: OpaquePointer)
+@_silgen_name("ac_relay_session_active")
+func ac_relay_session_active(_ s: OpaquePointer) -> Bool
+@_silgen_name("ac_relay_session_free")
+func ac_relay_session_free(_ s: OpaquePointer)
+@_silgen_name("ac_relay_stream_set_session")
+func ac_relay_stream_set_session(_ s: OpaquePointer, _ session: OpaquePointer)
+@_silgen_name("ac_relay_stream_take_redirect")
+func ac_relay_stream_take_redirect(_ s: OpaquePointer) -> UnsafeMutablePointer<CChar>?

@@ -897,7 +897,7 @@ pub extern "C" fn ac_dns_name_for(f: *const Forwarder, ip: *const c_char) -> *mu
 
 // MARK: - Certificate relay (DESIGN.md §32.7)
 
-use crate::relay::{self, Stream};
+use crate::relay::{self, RelaySession, Stream};
 
 /// One relay log line (the App writes relay.log).
 pub type AcRelayLog = extern "C" fn(line: *const c_char);
@@ -943,7 +943,41 @@ pub extern "C" fn ac_relay_stream_feed(s: *mut Stream, from_client: bool, data: 
         Err(relay::FramingError::Invalid) => -1,
         Err(relay::FramingError::Oversized) => -2,
         Err(relay::FramingError::Redirect) => -3,
+        Err(relay::FramingError::Cancelled) => -4,
     }
+}
+
+/// One logical relay login. Streams retain the shared state independently of
+/// the opaque handle, so closing the listener cannot invalidate live streams.
+#[no_mangle]
+pub extern "C" fn ac_relay_session_new() -> *mut std::sync::Arc<RelaySession> {
+    Box::into_raw(Box::new(std::sync::Arc::new(RelaySession::default())))
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_session_cancel(p: *const std::sync::Arc<RelaySession>) {
+    if let Some(p) = unsafe { p.as_ref() } { p.cancel(); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_session_active(p: *const std::sync::Arc<RelaySession>) -> bool {
+    (unsafe { p.as_ref() }).is_some_and(|p| p.active())
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_session_free(p: *mut std::sync::Arc<RelaySession>) {
+    if !p.is_null() { drop(unsafe { Box::from_raw(p) }); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_set_session(s: *mut Stream, p: *const std::sync::Arc<RelaySession>) {
+    if let (Some(s), Some(p)) = (unsafe { s.as_mut() }, unsafe { p.as_ref() }) {
+        s.set_session(std::sync::Arc::clone(p));
+    }
+}
+/// Private structured event, consumed exactly once. Never log its raw JSON:
+/// Location can contain authentication material. Caller frees via ac_string_free.
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_take_redirect(s: *mut Stream) -> *mut c_char {
+    let Some(s) = (unsafe { s.as_mut() }) else { return std::ptr::null_mut() };
+    s.take_redirect().and_then(|e| serde_json::to_string(&e).ok())
+        .map(|s| cstring(&s).into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 /// Bind the response guard to the actual upstream TLS authority.

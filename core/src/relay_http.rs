@@ -22,12 +22,17 @@ pub struct Responses {
     body: Body,
     authority: Option<(String, u16)>,
     blocked: bool,
+    redirect: Option<(u16, String)>,
     trailer_bytes: usize,
 }
 
 impl Responses {
     pub fn set_target(&mut self, host: &str, port: u16) {
         self.authority = Some((host.to_ascii_lowercase(), port));
+    }
+
+    pub fn take_redirect(&mut self) -> Option<(u16, String)> {
+        self.redirect.take()
     }
 
     fn safe_location(&self, location: &str) -> bool {
@@ -225,6 +230,7 @@ impl Responses {
         }
         if (300..400).contains(&code) && location.is_some_and(|l| !self.safe_location(l)) {
             self.blocked = true;
+            self.redirect = location.map(|l| (code, l.to_string()));
             return Err(FramingError::Redirect);
         }
         self.body = if (100..200).contains(&code) || code == 204 || code == 304 || length == Some(0)

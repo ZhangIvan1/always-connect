@@ -29,7 +29,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -43,6 +43,29 @@ pub enum FramingError {
     Invalid,
     Oversized,
     Redirect,
+    Cancelled,
+}
+
+/// Authentication and cancellation belong to the logical relay, not a TLS
+/// socket: openconnect may open several sockets during one login.
+#[derive(Default)]
+pub struct RelaySession {
+    sensitive: AtomicBool,
+    cancelled: AtomicBool,
+}
+
+impl RelaySession {
+    pub fn cancel(&self) { self.cancelled.store(true, Ordering::SeqCst); }
+    pub fn active(&self) -> bool { !self.cancelled.load(Ordering::SeqCst) }
+}
+
+#[derive(serde::Serialize)]
+pub struct RedirectEvent {
+    pub status: u16,
+    pub location: String,
+    /// Conservatively true for any credential header, query, body or
+    /// non-idempotent/unknown method. No secret is retained here.
+    pub replay_unsafe: bool,
 }
 
 const HEADER_LIMIT: usize = 131072;
@@ -160,6 +183,7 @@ pub fn edit_header(header: &[u8], mut edit: impl FnMut(&str, &str) -> Option<Str
 pub struct HttpRequests {
     header: Vec<u8>,
     body_remaining: usize,
+    session: Arc<RelaySession>,
 }
 
 impl HttpRequests {
@@ -187,6 +211,12 @@ impl HttpRequests {
             let mut head = whole[..boundary].to_vec();
             let text = String::from_utf8_lossy(&head).into_owned();
             let lines: Vec<&str> = text.split("\r\n").collect();
+            let mut request = lines.first().copied().unwrap_or("").split_whitespace();
+            let method = request.next().unwrap_or("");
+            let path = request.next().unwrap_or("");
+            if !matches!(method, "GET" | "HEAD" | "CONNECT") || path.contains('?') {
+                self.session.sensitive.store(true, Ordering::SeqCst);
+            }
             if lines.first().is_some_and(|l| l.starts_with("CONNECT ")) {
                 connect = true;
                 head = edit_header(&head, |name, value| {
@@ -202,13 +232,17 @@ impl HttpRequests {
             }
             for line in lines.iter().skip(1) {
                 let Some((name, value)) = line.split_once(':') else { continue };
-                let name = name.to_ascii_lowercase();
+                let name = name.trim().to_ascii_lowercase();
+                if matches!(name.as_str(), "cookie" | "authorization" | "proxy-authorization") {
+                    self.session.sensitive.store(true, Ordering::SeqCst);
+                }
                 if name == "content-length" {
                     let count: usize = value.trim_matches(|c| c == ' ' || c == '\t').parse().map_err(|_| FramingError::Invalid)?;
                     if count > 1_048_576 {
                         return Err(FramingError::Invalid);
                     }
                     self.body_remaining = count;
+                    if count > 0 { self.session.sensitive.store(true, Ordering::SeqCst); }
                 }
                 if name == "transfer-encoding" {
                     return Err(FramingError::Invalid);
@@ -533,6 +567,7 @@ pub struct Stream {
     log: Option<Log>,
     requests: HttpRequests,
     responses: crate::relay_http::Responses,
+    session: Arc<RelaySession>,
     auth: AuthTrace,
     connect_requested: bool,
     response_header: Vec<u8>,
@@ -548,14 +583,16 @@ pub struct Stream {
 
 impl Stream {
     pub fn new(pair: u32, gateway: Ipv4Addr, log: Option<Log>) -> Self {
+        let session = Arc::new(RelaySession::default());
         Stream {
             pair,
             gateway,
             interface: None,
             auth: AuthTrace::new(pair, log.clone()),
             log,
-            requests: HttpRequests::default(),
+            requests: HttpRequests { header: Vec::new(), body_remaining: 0, session: Arc::clone(&session) },
             responses: crate::relay_http::Responses::default(),
+            session,
             connect_requested: false,
             response_header: Vec::new(),
             cstp_since: None,
@@ -583,6 +620,17 @@ impl Stream {
             .or_else(|| interface.filter(|i| !i.is_empty()).map(str::to_string));
     }
 
+    pub fn set_session(&mut self, session: Arc<RelaySession>) {
+        self.requests.session = Arc::clone(&session);
+        self.session = session;
+    }
+
+    pub fn take_redirect(&mut self) -> Option<RedirectEvent> {
+        let (status, location) = self.responses.take_redirect()?;
+        Some(RedirectEvent { status, location,
+            replay_unsafe: self.session.sensitive.load(Ordering::SeqCst) })
+    }
+
     pub fn set_target(&mut self, host: &str, port: u16) {
         self.responses.set_target(host, port);
     }
@@ -596,7 +644,8 @@ impl Stream {
         let side = if from_client { 0 } else { 1 };
         let mut out = std::mem::take(&mut self.out[side]);
         out.clear();
-        let result = self.frame(data, from_client, &mut out);
+        let result = if self.session.active() { self.frame(data, from_client, &mut out) }
+            else { Err(FramingError::Cancelled) };
         if result.is_ok() && self.in_tunnel() {
             let counter = if from_client { &mut self.up } else { &mut self.down };
             counter.0 += out.len() as u64;
@@ -841,6 +890,48 @@ mod tests {
         assert_eq!(s.feed(response, false), Err(FramingError::Redirect));
         assert!(!s.in_tunnel());
         assert!(!String::from_utf8_lossy(&s.out[1].to_vecs().concat()).contains("Location"));
+    }
+
+    #[test]
+    fn authentication_boundary_survives_a_new_tls_pair() {
+        for request in [
+            "POST /auth HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+            "GET / HTTP/1.1\r\nCookie: webvpn=secret\r\n\r\n",
+            "GET / HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\n",
+            "GET /login?token=secret HTTP/1.1\r\n\r\n",
+            "GET / HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+        ] {
+            let session = Arc::new(RelaySession::default());
+            let mut first = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+            first.set_session(Arc::clone(&session));
+            for part in request.as_bytes().chunks(3) { first.feed(part, true).unwrap(); }
+            drop(first);
+            let mut next = Stream::new(2, Ipv4Addr::LOCALHOST, None);
+            next.set_target("vpn-a.example", 6443);
+            next.set_session(Arc::clone(&session));
+            assert_eq!(next.feed(b"HTTP/1.1 302 Found\r\nLocation: https://vpn-b.example:6443/\r\n\r\n", false), Err(FramingError::Redirect));
+            let event = next.take_redirect().unwrap();
+            assert!(event.replay_unsafe);
+            assert_eq!(event.status, 302);
+            assert!(next.take_redirect().is_none(), "a redirect event is consumed once");
+        }
+    }
+
+    #[test]
+    fn fresh_session_is_not_contaminated_and_cancel_stops_buffered_work() {
+        let mut s = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+        s.set_target("vpn-a.example", 6443);
+        s.feed(b"GET / HTTP/1.1\r\n\r\n", true).unwrap();
+        assert_eq!(s.feed(b"HTTP/1.1 302 Found\r\nLocation: https://vpn-b.example:6443/\r\n\r\n", false), Err(FramingError::Redirect));
+        assert!(!s.take_redirect().unwrap().replay_unsafe);
+        let session = Arc::new(RelaySession::default());
+        s.set_session(Arc::clone(&session));
+        s.feed(b"GET / HTTP/1.1\r\nHost:", true).unwrap();
+        session.cancel();
+        assert_eq!(s.feed(b" x\r\n\r\n", true), Err(FramingError::Cancelled));
+        assert!(s.out[0].is_empty());
+        assert_eq!(s.feed(b"response", false), Err(FramingError::Cancelled));
+        assert!(s.out[1].is_empty());
     }
 
 }
