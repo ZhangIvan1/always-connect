@@ -2006,3 +2006,43 @@ pub extern "C" fn ac_start_ticket_complete(p: *mut crate::start_barrier::Ticket,
 pub extern "C" fn ac_start_ticket_free(p: *mut crate::start_barrier::Ticket) {
     if !p.is_null() { drop(unsafe { Box::from_raw(p) }); }
 }
+
+#[no_mangle]
+pub extern "C" fn ac_relay_session_admit(p: *const std::sync::Arc<RelaySession>, pair: u32) -> *mut c_char {
+    let Some(p) = (unsafe { p.as_ref() }) else { return std::ptr::null_mut() };
+    serde_json::to_string(&p.admit(pair)).ok().map(|s| cstring(&s).into_raw()).unwrap_or(std::ptr::null_mut())
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_session_finish(p: *const std::sync::Arc<RelaySession>, pair: u32, outcome: u32) {
+    if let Some(p) = unsafe { p.as_ref() } { p.finish_handshake(pair, outcome); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_finish_handshake(s: *const Stream, outcome: u32) {
+    if let Some(s) = unsafe { s.as_ref() } { s.finish_handshake(outcome); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_active(s: *const Stream) -> bool {
+    (unsafe { s.as_ref() }).is_some_and(|s| s.active())
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_interface(s: *const Stream) -> *mut c_char {
+    (unsafe { s.as_ref() }).and_then(|s| s.interface()).map(|s| cstring(s).into_raw()).unwrap_or(std::ptr::null_mut())
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_diagnostic_write(event: *const c_char) {
+    if let Some(event) = c_str(event) { crate::relay_diagnostics::write(&event); }
+}
+#[no_mangle]
+pub extern "C" fn ac_relay_diagnostics_json() -> *mut c_char {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    let result = (|| -> Option<String> {
+        let mut file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
+            .open(crate::relay_log::path()?).ok()?;
+        let size = file.metadata().ok()?.len();
+        if size > 1_000_000 { file.seek(SeekFrom::End(-1_000_000)).ok()?; }
+        let mut bytes = Vec::new(); file.take(1_000_000).read_to_end(&mut bytes).ok()?;
+        Some(crate::relay_diagnostics::project(&String::from_utf8_lossy(&bytes)))
+    })().unwrap_or_else(|| "[]".into());
+    cstring(&result).into_raw()
+}

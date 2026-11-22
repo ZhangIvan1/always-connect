@@ -73,10 +73,10 @@ struct ApprovalPromptTest {
 
         // 5 own connection: logging in, honest wording
         var o = T()
-        guard case .show(let o1) = o.handle(.ownLogin, now: at(0)) else {
+        guard case .show(let o1) = o.handle(.authResponse, now: at(0)) else {
             check(false, "own login shows"); exit(1)
         }
-        check(o1.title == "正在登录 VPN" && o1.subtitle(now: at(9)) == "手机收到批准请求时请点批准 · 已等 0:09",
+        check(o1.title == "等待认证响应" && o1.subtitle(now: at(9)) == "正在等待网关响应，请留意手机通知 · 已等 0:09",
               "own wording: \(o1.subtitle(now: at(9)))")
         if case .update(let o2) = o.handle(.establishing, now: at(12)) {
             check(o2.title == "正在建立连接…", "own establishing: \(o2.title)")
@@ -85,7 +85,7 @@ struct ApprovalPromptTest {
 
         // 6 own connection: logging in, then the engine sees the approval wait
         var w = T()
-        _ = w.handle(.ownLogin, now: at(0))
+        _ = w.handle(.authResponse, now: at(0))
         if case .show(let w1) = w.handle(.approval, now: at(4)) {
             check(w1.kind == .approval && w1.request == 1, "login -> approval is still request 1 (got \(w1.request))")
         } else { check(false, "login -> approval shows the approval card") }
@@ -94,7 +94,7 @@ struct ApprovalPromptTest {
             check(w2.request == 2, "re-asked approval is request 2")
         } else { check(false, "re-ask shows") }
         var h = T()
-        _ = h.handle(.ownLogin, now: at(0))
+        _ = h.handle(.authResponse, now: at(0))
         h.hide()
         check(h.handle(.approval, now: at(4)) == .none, "hidden during login stays hidden for its approval")
 

@@ -29,6 +29,8 @@ a RelayHarness relay already listening on <relay-port> and forwarding to
 <dir> holds ca.pem, gateway.pem/.key (fixture identity) and
 relay-client.pem/.key (what the Helper hands openconnect).
 """
+import json
+import os
 import socket
 import ssl
 import sys
@@ -313,6 +315,89 @@ def presents(relay_port, fixture_port, d, expected):
     return good
 
 
+
+def tls_failure(relay_port, fixture_port, d, invalid_certificate):
+    """Exercise the real Network.framework verify/failure callbacks.
+    Test certificates and loopback only; transport codes are platform-specific.
+    """
+    log = Path(os.environ["ALWAYSCONNECT_RELAY_LOG"])
+    before = len(log.read_text().splitlines()) if log.exists() else 0
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", fixture_port))
+    listener.listen()
+    listener.settimeout(8)
+    seen = []
+    errors = []
+
+    def serve():
+        try:
+            conn, _ = listener.accept()
+            seen.append(True)
+            if invalid_certificate:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(d / "badgateway.pem", d / "badgateway.key")
+                try:
+                    with ctx.wrap_socket(conn, server_side=True) as peer:
+                        peer.settimeout(3)
+                        peer.recv(4096)
+                except (ssl.SSLError, ConnectionError, OSError):
+                    pass  # The relay must reject this hostname.
+            else:
+                conn.close()  # TCP accepted, TLS closed before a certificate.
+        except Exception as error:
+            errors.append(repr(error))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+    def request():
+        try:
+            with client_context(d, "relay-client").wrap_socket(
+                    socket.create_connection(("127.0.0.1", relay_port), timeout=5),
+                    server_hostname="localhost") as conn:
+                conn.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                return conn.recv(4096)
+        except (ssl.SSLError, ConnectionError, OSError):
+            return b""
+
+    response = request()
+    thread.join(timeout=8)
+    deadline = time.monotonic() + 3
+    events = []
+    while time.monotonic() < deadline:
+        rows = log.read_text().splitlines()[before:] if log.exists() else []
+        events = [json.loads(row.split("relay-event ", 1)[1])
+                  for row in rows if "relay-event " in row]
+        stage = "server_trust" if invalid_certificate else "upstream_tls"
+        if any(e["stage"] == stage and e.get("accepted") is False for e in events):
+            break
+        time.sleep(0.02)
+    rejected = any(e["stage"] == stage and e.get("accepted") is False
+                   and isinstance(e.get("code"), int) for e in events)
+    never_authenticated = not any(e["stage"] == "authentication" for e in events)
+    no_retry = True
+    if invalid_certificate:
+        # A terminal trust error cancels the relay synchronously; a new local
+        # connection cannot create another upstream even before App teardown.
+        request()
+        listener.settimeout(0.3)
+        try:
+            extra, _ = listener.accept()
+            extra.close()
+            no_retry = False
+        except socket.timeout:
+            pass
+    listener.close()
+    good = bool(seen) and not errors and not response and rejected and never_authenticated and no_retry
+    label = ("hostname rejection cancels future upstream connections" if invalid_certificate
+             else "peer TLS close is diagnosed before authentication with its native error code")
+    print(("PASS " if good else "FAIL ") + label)
+    if not good:
+        print("fixture errors:", errors, "events:", events, "extra upstream:", not no_retry)
+    return good
+
+
 def main():
     mode = sys.argv[1]
     if mode == "frames":
@@ -321,6 +406,8 @@ def main():
         ok = dtls(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]))
     elif mode == "access":
         ok = access(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), sys.argv[5])
+    elif mode in ("invalid-certificate", "tls-close"):
+        ok = tls_failure(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), mode == "invalid-certificate")
     elif mode == "presents":
         ok = presents(int(sys.argv[2]), int(sys.argv[3]), Path(sys.argv[4]), sys.argv[5])
     else:

@@ -64,7 +64,7 @@ check "approved: not taken as a rejected password" "$(hasnt 'TERMINAL auth-failu
 check "quick: an instant answer never shows as an approval wait" "$(hasnt 'awaiting-approval' quick)"
 
 check "expired: shown as waiting first" "$(has '^STATE awaiting-approval' expired)"
-check "expired: the approval is asked for again" "$(has '手机上的批准已超时' expired)"
+check "expired: the approval is asked for again" "$(has '认证响应等待已超时' expired)"
 check "expired: a second login follows" "$(has 'spawning openconnect (attempt 2' expired)"
 check "expired: never stopped as a rejected password" "$(hasnt 'TERMINAL auth-failure' expired)"
 
@@ -73,7 +73,7 @@ check "rejected: never shown as an approval wait" "$(hasnt 'awaiting-approval' r
 check "rejected: no second try (anti-lockout)" "$(hasnt 'attempt 2' rejected)"
 
 check "declined: shown as waiting first" "$(has '^STATE awaiting-approval' declined)"
-check "declined: asked once more" "$(has '手机上的登录确认没有通过，' declined)"
+check "declined: asked once more" "$(has '本次认证未通过，' declined)"
 check "declined: a second login follows" "$(has 'spawning openconnect (attempt 2' declined)"
 check "declined: stops after the second failure" "$(has 'TERMINAL approval-declined' declined)"
 check "declined: never called a wrong password" "$(hasnt 'TERMINAL auth-failure' declined)"

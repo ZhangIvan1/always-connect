@@ -38,7 +38,7 @@ let AlwaysConnectHelperMachService = "com.alwaysconnect.app.helper"
     func beginRelayHandover(_ event: String, withReply reply: @escaping (String) -> Void)
     func commitRelayHandover(ticket: String, server: String, serverPin: String, listenerClosed: Bool,
                              withReply reply: @escaping (Bool, Int) -> Void)
-    func cancelRelayHandover(session: String, withReply reply: @escaping () -> Void)
+    func cancelRelayHandover(session: String, reason: String, withReply reply: @escaping () -> Void)
     /// Current state code + human-readable detail (reason + next step,
     /// never a raw error dump, never a credential).
     func getStatus(withReply reply: @escaping (Int, String) -> Void)

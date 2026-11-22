@@ -337,7 +337,7 @@ struct SessionHarness {
             } else if let grant, grant.ok, let ticket = grant.ticket {
                 check(grant.code == "stop_listener", "reply proves actual engine stop")
                 if scenario == "relay-handover-cancel" {
-                    let _: Bool? = sync { reply in session.cancelRelayHandover(session: identity) { reply(true) } }
+                    let _: Bool? = sync { reply in session.cancelRelayHandover(session: identity, reason: "cancelled") { reply(true) } }
                 }
                 check(prepareRelay(session, gateway: "198.51.100.9", pinByte: 8), "new target has a fresh relay pin")
                 let unready: (Bool, Int)? = sync { reply in

@@ -48,7 +48,7 @@ struct DropHistoryTest {
               && r3b.summary == "断了 5 分钟，重新登录 4 次后停止重试：账号或密码被拒绝", "rejected: \(r3b.summary)")
         check(r3b.panelSummary == "断了 5 分钟，重新登录 4 次，没恢复", "panel: \(r3b.panelSummary)")
         check(r3!.applyingTerminal(3).failureReason == "重试次数用完", "attempts exhausted")
-        check(r3!.applyingTerminal(5).failureReason == "手机上的登录确认没有通过" && r3!.applyingTerminal(5).outcome == .failed,
+        check(r3!.applyingTerminal(5).failureReason == "本次认证未通过" && r3!.applyingTerminal(5).outcome == .failed,
               "phone confirmation failed (§43)")
         check(r3!.applyingTerminal(1).outcome == .stoppedByUser, "terminal manual stop = the user's")
 

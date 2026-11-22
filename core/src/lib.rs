@@ -25,6 +25,8 @@ pub mod relay;
 pub mod relay_http;
 pub mod relay_switch;
 pub mod relay_log;
+pub mod relay_handshake;
+pub mod relay_diagnostics;
 pub mod route_watch;
 pub mod rules;
 pub mod session;

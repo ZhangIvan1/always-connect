@@ -25,7 +25,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     private override init() { super.init() }
 
     func handleTransition(from old: HelperClient.State, to new: HelperClient.State,
-                          blocking: Bool = true) {
+                          blocking: Bool = true, ownConnection: Bool = false, authenticationTransportReady: Bool = true) {
         let aggregation = ProfileStore.loadAppSettings().notificationAggregation
         switch (old, new) {
         case (.connected, .reconnecting):
@@ -45,8 +45,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             // Action-required: posted every time, regardless of
             // aggregation — unless the approval card says it on screen
             // (DESIGN.md §29); a locked screen still gets the banner.
-            if !ApprovalPrompt.shared.takesOverApprovalNotice {
-                post(title: "AlwaysConnect", body: "等你在手机上确认登录")
+            if authenticationTransportReady && !ApprovalPrompt.shared.takesOverApprovalNotice {
+                post(title: "AlwaysConnect", body: ownConnection
+                     ? "已提交认证，正在等待响应；请留意手机通知" : "等你在手机上确认登录")
             }
         default:
             break
@@ -62,11 +63,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         switch reasonCode {
         case 2:
             post(title: "AlwaysConnect：登录被拒，已停止重连",
-                 body: "可能是密码错误，或没有在手机上点批准。网络如仍暂停，点「恢复直连」恢复。",
+                 body: "请检查登录凭据或认证确认结果。网络如仍暂停，点「恢复直连」恢复。",
                  held: true)
         case 5:
-            post(title: "AlwaysConnect：手机上的登录确认没有通过，已停止重连",
-                 body: "确认手机能上网后点「重新连接」。网络如仍暂停，点「恢复直连」恢复。",
+            post(title: "AlwaysConnect：认证未通过，已停止重连",
+                 body: "确认网络和认证状态后点「重新连接」。网络如仍暂停，点「恢复直连」恢复。",
                  held: true)
         case 3:
             post(title: "AlwaysConnect：多次重连失败",

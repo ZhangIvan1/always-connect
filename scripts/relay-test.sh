@@ -58,10 +58,11 @@ ssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Relay Test CA" \
 ssl x509 -in ca.pem -outform DER -out ca.der
 issue() { # name usage
     ssl req -newkey rsa:2048 -nodes -subj "/CN=$1" -keyout "$1.key" -out "$1.csr"
-    printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=%s\n' "$2" > "$1.ext"
+    printf 'subjectAltName=%s\nextendedKeyUsage=%s\n' "${3:-DNS:localhost,IP:127.0.0.1}" "$2" > "$1.ext"
     ssl x509 -req -in "$1.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 -extfile "$1.ext" -out "$1.pem"
 }
 issue gateway serverAuth
+issue badgateway serverAuth DNS:wrong.example
 issue company clientAuth
 issue stranger clientAuth
 for who in company stranger; do
@@ -111,6 +112,16 @@ grep -q "client certificate expired: switched" "$W/relay.log" &&
 # Control: a certificate that has not expired is kept.
 start_relay 4467 4468 stranger.p12
 python3 -I "$ROOT/core/scripts/relay-framing-check.py" presents 4467 4468 "$D" stranger || FAILS=$((FAILS + 1))
+
+# Native TLS failure stages: no HTTP or authentication is reached. Separate
+# relays keep the deterministic trust cancellation isolated from other cases.
+start_relay 4469 4470
+python3 -I "$ROOT/core/scripts/relay-framing-check.py" invalid-certificate 4469 4470 "$D" || FAILS=$((FAILS + 1))
+grep -q '^FATAL gateway_certificate' "$W/relay-4469.out" &&
+    pass "hostname rejection reports a terminal certificate issue" || fail "missing terminal certificate issue"
+start_relay 4471 4472
+python3 -I "$ROOT/core/scripts/relay-framing-check.py" tls-close 4471 4472 "$D" || FAILS=$((FAILS + 1))
+grep -q '^FATAL' "$W/relay-4471.out" && fail "TLS close guessed to be a certificate failure"
 
 # 4
 python3 -I "$ROOT/core/scripts/mock-anyconnect.py" 4464 gateway.pem gateway.key ca.pem \

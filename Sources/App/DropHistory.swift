@@ -137,7 +137,7 @@ extension DropRecord {
             text = "\(down)，\(relogins.map { $0 + "时" } ?? "重连中")退出了 App"
         }
         if let approvals, approvals > 0 {
-            text += "；其中 \(approvals) 次等你在手机上批准"
+            text += engine == "own" ? "；其中 \(approvals) 次等待认证响应" : "；其中 \(approvals) 次等你在手机上批准"
         }
         return text
     }
@@ -168,7 +168,7 @@ extension DropRecord {
                 : "，\(relogins.map { $0 + "时" } ?? "重连中")退出了 App"
         }
         if let approvals, approvals > 0 {
-            text += "；其中 \(approvals) 次等你在手机上批准"
+            text += engine == "own" ? "；其中 \(approvals) 次等待认证响应" : "；其中 \(approvals) 次等你在手机上批准"
         }
         return text
     }
@@ -213,7 +213,7 @@ extension DropRecord {
             record.failureReason = "重试次数用完"
         case 5:
             record.outcome = .failed
-            record.failureReason = "手机上的登录确认没有通过"
+            record.failureReason = "本次认证未通过"
         default:
             break
         }

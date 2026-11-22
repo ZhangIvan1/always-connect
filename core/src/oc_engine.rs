@@ -1738,7 +1738,7 @@ impl Shared {
         }
         if let DriverAction::WaitApproval { timeout } = c.driver.on_auth_outcome(AuthOutcome::NeedsApproval) {
             c.approval_waited = true;
-            self.report(c, "awaiting approval");
+            self.report(c, "awaiting authentication response");
             self.timer(c, Timer::ApprovalTimeout, timeout.as_secs_f64());
         }
     }
@@ -1807,12 +1807,12 @@ impl Shared {
             if c.declined_approvals == 0 {
                 c.declined_approvals += 1;
                 let delay = c.config.push_backoff.first().copied().unwrap_or(DECLINED_RETRY) * jitter();
-                self.report(c, &format!("手机上的登录确认没有通过，{} 秒后重新发起", delay.round() as i64));
+                self.report(c, &format!("本次认证未通过，{} 秒后重新发起", delay.round() as i64));
                 self.respawn_after(delay);
                 return;
             }
             c.driver.on_auth_outcome(AuthOutcome::Rejected);
-            let e = "手机上的登录确认没有通过，已停止重连。确认手机能上网后点「重新连接」".to_string();
+            let e = "本次认证未通过，已停止重连。确认网络和认证状态后点「重新连接」".to_string();
             c.last_error = Some(e.clone());
             self.report(c, &e);
             self.finish_terminal(c, Terminal::ApprovalDeclined, &e);
@@ -1866,7 +1866,7 @@ impl Shared {
         delay *= jitter();
         c.saw_login_failed = false;
         let when = if delay < 90.0 { format!("{} 秒", delay.round() as i64) } else { format!("{} 分钟", (delay / 60.0).round() as i64) };
-        self.report(c, &format!("手机上的批准已超时，{when}后重新发起批准"));
+        self.report(c, &format!("认证响应等待已超时，{when}后重新认证"));
         self.respawn_after(delay);
     }
 

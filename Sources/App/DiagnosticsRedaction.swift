@@ -5,8 +5,14 @@ import Foundation
 enum DiagnosticsRedaction {
     static let placeholder = "<已隐去>"
     enum Kind: String {
-        case state, detail, outcome, engine, rule, version, timeline
+        case state, ownState, detail, outcome, engine, rule, version, timeline
         case durationSeconds, isSleepRecord, sleepDropCount
+    }
+
+    static func relayTimeline() -> String {
+        guard let raw = ac_relay_diagnostics_json() else { return "[]" }
+        defer { diagnostics_string_free(raw) }
+        return String(cString: raw)
     }
 
     static func classify(_ kind: Kind, _ value: String) -> String {
@@ -22,3 +28,6 @@ private func ac_diagnostics_classify(
 ) -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_string_free")
 private func diagnostics_string_free(_ value: UnsafeMutablePointer<CChar>?)
+
+@_silgen_name("ac_relay_diagnostics_json")
+private func ac_relay_diagnostics_json() -> UnsafeMutablePointer<CChar>?

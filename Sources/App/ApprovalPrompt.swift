@@ -20,9 +20,6 @@ import SwiftUI
 final class ApprovalPrompt {
     static let shared = ApprovalPrompt()
 
-    /// Own connection: how long "logging in" must last before the
-    /// bubble shows, so a quick cookie resume never flashes it.
-    static let ownLoginDelay: TimeInterval = 3
     /// How long the green "已连接" stays before the bubble goes.
     static let successLinger: TimeInterval = 1.6
 
@@ -35,7 +32,6 @@ final class ApprovalPrompt {
     private let model = ApprovalCardModel()
     private var panel: ApprovalCardPanel?
     private var cancellable: AnyCancellable?
-    private var ownLoginItem: DispatchWorkItem?
     private var lingerItem: DispatchWorkItem?
 
     private init() {}
@@ -56,10 +52,10 @@ final class ApprovalPrompt {
 
     func start() {
         guard cancellable == nil else { return }
-        cancellable = HelperClient.shared.$state
-            .removeDuplicates()
+        cancellable = Publishers.CombineLatest(HelperClient.shared.$state, HelperClient.shared.$relayPhase)
+            .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in self?.stateChanged(state) }
+            .sink { [weak self] observation in self?.stateChanged(observation.0) }
     }
 
     /// Settings switched the card off: take it down now.
@@ -74,20 +70,13 @@ final class ApprovalPrompt {
     }
 
     private func stateChanged(_ state: HelperClient.State) {
-        ownLoginItem?.cancel()
-        ownLoginItem = nil
         guard ProfileStore.loadAppSettings().isApprovalCardOn else { return }
         switch state {
         case .awaitingApproval:
-            apply(.approval)
-        case .authenticating where !HelperClient.shared.usesCisco:
-            let item = DispatchWorkItem { [weak self] in
-                guard HelperClient.shared.state == .authenticating,
-                      !HelperClient.shared.usesCisco else { return }
-                self?.apply(.ownLogin)
-            }
-            ownLoginItem = item
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.ownLoginDelay, execute: item)
+            if HelperClient.shared.usesCisco { apply(.approval) }
+            else if ["local_tls", "upstream_tls", "backoff", "switching", "failed"].contains(HelperClient.shared.relayPhase ?? "") {
+                apply(.other)
+            } else { apply(.authResponse) }
         case .authenticating:
             apply(.other)
         case .connecting:

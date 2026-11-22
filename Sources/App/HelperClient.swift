@@ -88,6 +88,21 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             || KeychainStore.exists(server: ProfileStore.loadProfile().server, username: username)
     }
 
+    var relayProgressLine: String? {
+        guard !usesCisco, state != .connected, state != .disconnected else { return nil }
+        switch relayPhase {
+        case "local_tls": return "正在验证本机安全连接"
+        case "upstream_tls": return "正在建立 VPN 安全连接"
+        case "switching": return "正在切换 VPN 节点"
+        case "backoff":
+            guard let retry = relayRetryAfter else { return "本机转接繁忙，正在等待空闲" }
+            let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"
+            return "安全连接暂时失败，最早 \(formatter.string(from: retry)) 后允许重试"
+        case "authentication" where state != .awaitingApproval: return "正在认证"
+        default: return nil
+        }
+    }
+
     /// One-line status text (UI-DESIGN.md §三), shared by the panel,
     /// the Credentials page, and Diagnostics.
     var stateLine: String {
@@ -95,14 +110,12 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         case .disconnected:
             if onDemandPaused && !networkHeld { return "已断开 · 按需连接（规则：\(onDemandRuleName ?? "未命名")）" }
             return networkHeld ? "未连接，网络仍处暂停（断开即恢复直连）" : "未连接（直连网络）"
-        case .connecting: return "连接中…"
-        case .authenticating:
-            // The own connection's login waits on the phone silently
-            // (no approval line from openconnect yet, §二十三).
-            return usesCisco ? "认证中…" : "登录中…（手机收到批准请求时请点批准）"
-        case .awaitingApproval: return "等你在手机上确认登录"
+        case .connecting: return relayProgressLine ?? "连接中…"
+        case .authenticating: return relayProgressLine ?? "认证中…"
+        case .awaitingApproval: return usesCisco ? "等你在手机上确认登录" : (relayProgressLine ?? "已提交认证，正在等待网关响应")
         case .connected: return "已连接 · \(ProfileStore.loadProfile().server)"
         case .reconnecting:
+            if let progress = relayProgressLine { return progress }
             if detail == "等待网络恢复" { return detail }
             let retries = dropRetryCount > 0 ? "（第 \(dropRetryCount) 次）" : ""
             if !protectsDrops {
@@ -323,6 +336,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// disconnects give up.
     private var relay: CertificateRelay?
     private var relayGeneration = 0
+    @Published private(set) var relayPhase: String?
+    @Published private(set) var relayRetryAfter: Date?
     private var relayPin: String?
     private var relayConnectionContext: RelayConnectionContext?
     private var relayAttempt = 0
@@ -458,7 +473,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                                      password: password, context: text) { accepted in
                     DispatchQueue.main.async {
                         guard !finished else { return }; finished = true
-                        acceptedReply(accepted)
+                        guard accepted else {
+                            self.failRelayHandover(session: context.session, message: "后台服务未接受转接连接", reason: "relay_rejected")
+                            return
+                        }
+                        acceptedReply(true)
                     }
                 }
             } else {
@@ -699,12 +718,14 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         if !preservingHandover {
             _ = relayHandover.command(["op": "reset"])
             if let context = relayConnectionContext, HelperInstaller.installedHelperMatchesBundle {
-                ensureConnection { $0.cancelRelayHandover(session: context.session) {} }
+                ensureConnection { $0.cancelRelayHandover(session: context.session, reason: "cancelled") {} }
             }
             relayConnectionContext = nil
             relayAttempt = 0
         }
         relayPin = nil
+        relayPhase = nil
+        relayRetryAfter = nil
         relayGeneration += 1
         let current = relay
         relay = nil
@@ -1174,13 +1195,29 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     DispatchQueue.global(qos: .userInitiated).async {
                         let prepared: CertificateRelay.Prepared
                         do {
-                            prepared = try relay.prepare(prefer: memory.last, avoid: avoid, known: memory.addresses, resolved: addresses)
+                            prepared = try relay.prepare(prefer: memory.last, avoid: avoid, known: memory.addresses, resolved: addresses,
+                                resolutionSource: IPv4Address(address.host) != nil ? "literal" : (resolved != nil ? "preflight" : (addresses == nil ? "system" : "physical_dns")))
                         } catch {
                             finish(error.localizedDescription)
                             return
                         }
                         GatewayMemory.save(address.host, last: prepared.gatewayIp,
                                            addresses: prepared.addresses.isEmpty ? memory.addresses : prepared.addresses)
+                        relay.onProgress = { [weak self] progress in
+                            DispatchQueue.main.async {
+                                guard let self, generation == self.relayGeneration else { return }
+                                self.relayPhase = progress.stage.rawValue
+                                self.relayRetryAfter = progress.retryAfterMs == 0 ? nil
+                                    : Date(timeIntervalSinceNow: Double(progress.retryAfterMs) / 1000)
+                            }
+                        }
+                        relay.onFatalIssue = { [weak self] issue in
+                            DispatchQueue.main.async {
+                                guard let self, generation == self.relayGeneration,
+                                      let context = self.relayConnectionContext else { return }
+                                self.failRelayHandover(session: context.session, message: issue.message, reason: issue.rawValue)
+                            }
+                        }
                         relay.onRedirect = { [weak self] event in
                             DispatchQueue.main.async {
                                 self?.handleRelayRedirect(event, source: server, pin: prepared.serverPin, generation: generation)
@@ -1224,14 +1261,16 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         }
     }
 
-    private func failRelayHandover(session: String, message: String) {
+    private func failRelayHandover(session: String, message: String, reason: String = "handover_failed") {
         guard relayConnectionContext?.session == session else { return }
         _ = relayHandover.command(["op": "cancel", "session": session])
         relay?.stop()
+        relayPhase = "failed"
+        relayRetryAfter = nil
         lastError = message
         detail = message
         if HelperInstaller.installedHelperMatchesBundle {
-            ensureConnection { $0.cancelRelayHandover(session: session) {} }
+            ensureConnection { $0.cancelRelayHandover(session: session, reason: reason) {} }
         }
     }
 
@@ -1262,6 +1301,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
               let local = try? JSONDecoder().decode(RelayHandover.Reply.self, from: Data(text.utf8)),
               let data = try? JSONSerialization.data(withJSONObject: request),
               let encoded = String(data: data, encoding: .utf8) else { return }
+        relayPhase = "switching"
         let begin: ([String]) -> Void = { [weak self] addresses in
             guard let self, generation == self.relayGeneration,
                   self.relayConnectionContext?.session == context.session else { return }
@@ -1283,7 +1323,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                         default: message = "当前认证流程发生节点跳转，无法安全继续"
                         }
                     }
-                    self.failRelayHandover(session: context.session, message: message)
+                    self.failRelayHandover(session: context.session, message: message, reason: response?.code ?? "handover_failed")
                     return
                 }
                 var listenerStopped = false
@@ -1611,7 +1651,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         } else {
             networkHeld = false
         }
-        Notifier.shared.handleTransition(from: old, to: parsed, blocking: protectsDrops)
+        Notifier.shared.handleTransition(from: old, to: parsed, blocking: protectsDrops, ownConnection: !usesCisco,
+            authenticationTransportReady: usesCisco || !["local_tls", "upstream_tls", "backoff", "switching", "failed"].contains(relayPhase ?? ""))
         updateHoldReminder()
         // Session info (DESIGN.md §十九): the retry count is live
         // during a drop episode; the terminal reason is fetched once

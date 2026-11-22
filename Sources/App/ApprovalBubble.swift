@@ -103,7 +103,7 @@ struct ApprovalBubble: View {
         let shape = CalloutShape(arrowX: arrowX, arrowHeight: ApprovalBubbleMetrics.arrowHeight)
         let ink: Color = scheme == .dark ? .white : .black
         HStack(spacing: 10) {
-            ApprovalCardIcon(stage: card.stage, tint: Self.iconColor(card.stage))
+            ApprovalCardIcon(stage: card.stage, tint: Self.iconColor(card.stage), awaitingResponse: card.kind == .authResponse)
             VStack(alignment: .leading, spacing: 1) {
                 Text(card.title)
                     .font(.system(size: 13, weight: .semibold))
@@ -223,20 +223,21 @@ struct CalloutShape: Shape {
     }
 }
 
-/// Phone with a ring rippling out while waiting; dots, then a check.
+/// Phone for an approval request, hourglass for an unconfirmed response wait.
 struct ApprovalCardIcon: View {
     var stage: ApprovalPromptTracker.Stage
     var tint: Color
+    var awaitingResponse = false
 
     var body: some View {
         ZStack {
             Circle().fill(tint.opacity(0.18))
-            if stage == .waiting, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            if stage == .waiting, !awaitingResponse, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
                 RippleRing(tint: tint)
             }
             switch stage {
             case .waiting:
-                Image(systemName: "iphone.radiowaves.left.and.right")
+                Image(systemName: awaitingResponse ? "hourglass" : "iphone.radiowaves.left.and.right")
                     .font(.system(size: 14, weight: .semibold))
             case .establishing:
                 Image(systemName: "ellipsis")

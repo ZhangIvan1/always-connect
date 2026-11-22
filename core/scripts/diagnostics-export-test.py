@@ -44,6 +44,7 @@ final class HelperClient {
     var state = State.disconnected
     var detail = ""
     var helperAvailable = true
+    var usesCisco = true
     var dropHistory = [DropRecord(droppedAt: Date(timeIntervalSince1970: 0),
         recoveredAt: Date(timeIntervalSince1970: 60), outcome: .failed, retries: 2,
         approvals: 1, engine: "ENGINE_CANARY_8", failureReason: "HISTORY_CANARY_8 USER_CANARY_7 203.0.113.73 backup-canary.example")]
@@ -54,9 +55,13 @@ enum CiscoProfiles {
     static func hostEntries() -> [String: String] { [:] }
 }
 @_silgen_name("ac_string_free") func ac_string_free(_ value: UnsafeMutablePointer<CChar>?)
+@_silgen_name("ac_relay_diagnostic_write") func ac_relay_diagnostic_write(_ value: UnsafePointer<CChar>)
 @main struct FullExportTest {
     static func main() {
         let client = HelperClient()
+        let log = URL(fileURLWithPath: CommandLine.arguments[1]).deletingLastPathComponent().appendingPathComponent("relay-fixture.log").path
+        setenv("ALWAYSCONNECT_RELAY_LOG", log, 1)
+        ac_relay_diagnostic_write(#"{"session":"00000000-0000-4000-8000-000000000001","attempt":0,"pair":1,"stage":"upstream_tls","domain":"ssl","code":-9816,"port":6443,"host":"gateway-canary.example","sni":"backup-canary.example","ip":"203.0.113.73","password":"TLS_TOKEN_CANARY_9"}"#)
         let profile = Profile()
         CiscoEngine.cliPath = CommandLine.arguments[1]
         CiscoEngine.physicalAvailability = { true }
@@ -78,7 +83,7 @@ enum CiscoProfiles {
         let tokens = ["gateway-canary.example", "GROUP_CANARY_7", "USER_CANARY_7", "203.0.113.73",
             "RAW_CANARY_7", "backup-canary.example", "SERVER_NAME_CANARY_8", "CISCO_NAME_CANARY_8",
             "RULE_TYPE_CANARY_8", "RULE_TARGET_CANARY_8.example", "STATE_DESCRIPTION_CANARY_8",
-            "ENGINE_CANARY_8", "HISTORY_CANARY_8", "TIMELINE_CANARY_8"]
+            "ENGINE_CANARY_8", "HISTORY_CANARY_8", "TIMELINE_CANARY_8", "TLS_TOKEN_CANARY_9"]
         let leaks = tokens.filter { exported.contains($0) || malformed.contains($0) }
         // Verify's two-hour sleep fixture: equal spans do not imply equal downtime.
         let start = Date(timeIntervalSince1970: 0)
@@ -123,6 +128,7 @@ enum CiscoProfiles {
         print("fake error delivered=\(got); local stop completed=\(done); full bundle leaks=\(leaks)")
         let useful = exported.contains("Cisco 引擎时间线：") && exported.contains("request-connect")
             && exported.contains("重试 2 次") && exported.contains("认证中")
+            && exported.contains("upstream_tls") && exported.contains("-9816") && exported.contains("6443")
         exit(got && done && useful && leaks.isEmpty && distinguishable && subsecond && bounded && historySafe ? 0 : 1)
     }
 }

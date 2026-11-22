@@ -4,6 +4,8 @@
 /// This intentionally does not redact and then return the original string.
 pub fn classify(kind: &str, value: &str) -> String {
     match kind {
+        "ownState" if value.parse::<i32>().ok() == Some(3) => "等待认证响应".into(),
+        "ownState" => classify("state", value),
         "state" => match value.parse::<i32>() {
             Ok(0) => "已断开",
             Ok(1) => "连接中",
@@ -97,6 +99,13 @@ fn version(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn own_wait_state_does_not_assert_phone_approval() {
+        assert_eq!(classify("ownState", "3"), "等待认证响应");
+        assert_eq!(classify("ownState", "2"), "认证中");
+        assert_eq!(classify("state", "3"), "等待批准");
+    }
+
     #[test]
     fn unknown_fields_cannot_echo_arbitrary_payloads() {
         let raw = "RAW_CANARY_7 USER_CANARY_7 203.0.113.73 backup-canary.example GROUP_CANARY_7";

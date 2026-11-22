@@ -31,7 +31,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -53,11 +53,19 @@ pub enum FramingError {
 pub struct RelaySession {
     sensitive: AtomicBool,
     cancelled: AtomicBool,
+    handshakes: Mutex<crate::relay_handshake::Budget>,
 }
 
 impl RelaySession {
     pub fn cancel(&self) { self.cancelled.store(true, Ordering::SeqCst); }
     pub fn active(&self) -> bool { !self.cancelled.load(Ordering::SeqCst) }
+    pub fn finish_handshake(&self, pair: u32, outcome: u32) {
+        self.handshakes.lock().unwrap().finish(pair, outcome, Instant::now());
+    }
+    pub fn admit(&self, pair: u32) -> crate::relay_handshake::Admission {
+        if !self.active() { return crate::relay_handshake::Admission { allowed: false, retry_after_ms: 0, notify: false }; }
+        self.handshakes.lock().unwrap().admit(pair, Instant::now())
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -627,6 +635,12 @@ impl Stream {
             .or_else(|| interface.filter(|i| !i.is_empty()).map(str::to_string));
     }
 
+    pub fn finish_handshake(&self, outcome: u32) {
+        self.session.handshakes.lock().unwrap().finish(self.pair, outcome, Instant::now());
+    }
+    pub fn active(&self) -> bool { self.session.active() }
+    pub fn interface(&self) -> Option<&str> { self.interface.as_deref() }
+
     pub fn set_context(&mut self, session: String, attempt: u32) {
         if let Some(log) = self.log.clone() {
             let log: Log = Arc::new(move |line| log(&format!("session={session} attempt={attempt} {line}")));
@@ -911,6 +925,16 @@ mod tests {
         assert_eq!(s.feed(response, false), Err(FramingError::Redirect));
         assert!(!s.in_tunnel());
         assert!(!String::from_utf8_lossy(&s.out[1].to_vecs().concat()).contains("Location"));
+    }
+
+    #[test]
+    fn cancelled_session_never_admits_after_a_late_ready_callback() {
+        let session = Arc::new(RelaySession::default());
+        assert!(session.admit(1).allowed);
+        let mut stream = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+        stream.set_session(Arc::clone(&session));
+        session.cancel(); stream.finish_handshake(0);
+        assert!(!stream.active()); assert!(!session.admit(2).allowed);
     }
 
     #[test]

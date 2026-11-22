@@ -4,11 +4,9 @@ import Foundation
 /// alone (DESIGN.md §29.1). Foundation only, so the contract runs in
 /// scripts/approval-prompt-test.sh without AppKit or a Helper.
 ///
-/// - approval: the engine knows a login is waiting on the phone (the
-///   Cisco engine, right after the password went in).
-/// - ownLogin: the own connection is logging in; openconnect gives no
-///   approval signal yet (§16.5), so the card says "when the request
-///   arrives on the phone" instead of claiming one is pending.
+/// - approval: the existing explicit approval presentation (Cisco adapter).
+/// - authResponse: credentials were submitted and the response is outstanding;
+///   this does not assert that a phone request was sent or is pending.
 /// - establishing: the login went through, the tunnel is being set up.
 /// - connected / ended / other: the wait is over one way or another.
 ///
@@ -17,10 +15,10 @@ import Foundation
 /// only, the next request shows it again.
 struct ApprovalPromptTracker {
     enum Signal: Equatable {
-        case approval, ownLogin, establishing, connected, ended, other
+        case approval, authResponse, establishing, connected, ended, other
     }
 
-    enum Kind: Equatable { case approval, ownLogin }
+    enum Kind: Equatable { case approval, authResponse }
     enum Stage: Equatable { case waiting, establishing, connected }
 
     struct Card: Equatable {
@@ -50,18 +48,18 @@ struct ApprovalPromptTracker {
 
     mutating func handle(_ signal: Signal, now: Date = Date()) -> Effect {
         switch signal {
-        case .approval, .ownLogin:
-            let kind: Kind = signal == .approval ? .approval : .ownLogin
+        case .approval, .authResponse:
+            let kind: Kind = signal == .approval ? .approval : .authResponse
             if let card, card.kind == kind, card.stage == .waiting {
                 return .none  // the same state pushed again
             }
-            // Only phone requests count: "logging in" turning into a
-            // real approval wait is still the first request.
+            // An outstanding response does not establish a phone request.
+            // Only the approval adapter advances that request counter.
             if kind == .approval { requests += 1 }
-            let wasHidden = card?.kind == .ownLogin && hidden
+            let wasHidden = card?.kind == .authResponse && hidden
             let next = Card(kind: kind, request: max(requests, 1), since: now)
             card = next
-            // Hidden while logging in = hidden for this login's approval too.
+            // Hiding the response wait also hides its following approval card.
             hidden = wasHidden
             return wasHidden ? .none : .show(next)
         case .establishing:
@@ -102,9 +100,9 @@ extension ApprovalPromptTracker.Card {
         switch (stage, kind) {
         case (.connected, _): return "已连接"
         case (.establishing, .approval): return "已批准，正在连接…"
-        case (.establishing, .ownLogin): return "正在建立连接…"
+        case (.establishing, .authResponse): return "正在建立连接…"
         case (.waiting, .approval): return "请在手机上批准 VPN 登录"
-        case (.waiting, .ownLogin): return "正在登录 VPN"
+        case (.waiting, .authResponse): return "等待认证响应"
         }
     }
 
@@ -118,8 +116,8 @@ extension ApprovalPromptTracker.Card {
             switch kind {
             case .approval:
                 return request > 1 ? "第 \(request) 次请求 · \(waited)" : "登录请求已发到手机 · \(waited)"
-            case .ownLogin:
-                return "手机收到批准请求时请点批准 · \(waited)"
+            case .authResponse:
+                return "正在等待网关响应，请留意手机通知 · \(waited)"
             }
         }
     }

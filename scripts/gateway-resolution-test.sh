@@ -19,7 +19,7 @@ resolve=resolve.replace('DispatchQueue.main.asyncAfter(deadline: .now() + 3)','C
 prepare=method('Sources/App/CertificateRelay.swift','func prepare(prefer:')
 daemon=method('Sources/Helper/HelperDaemon.swift','func resolveGatewayIPv4(').replace('DispatchQueue.global(qos: .utility).async','Clock.enqueue')
 source=(root/'Sources/App/HelperClient.swift').read_text()
-assert 'known: memory.addresses, resolved: addresses)' in source
+assert 'known: memory.addresses, resolved: addresses,' in source
 assert 'connection.setCodeSigningRequirement(requirement)' in (root/'Sources/Helper/HelperDaemon.swift').read_text()
 text='''import Foundation
 @_silgen_name("ac_gateway_system_bootstrap") func ac_gateway_system_bootstrap(_ held: Int32) -> Bool
@@ -47,6 +47,7 @@ final class Client {
 enum RelayLog {
     static var lines: [String] = []
     static func write(_ line: String) { lines.append(line) }
+    static func event(session: String, attempt: Int, pair: Int, fields: [String: Any]) {}
 }
 final class Relay {
     let sessionId = "fixture-session"

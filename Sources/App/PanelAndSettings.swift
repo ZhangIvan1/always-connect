@@ -41,7 +41,8 @@ struct PanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             let look = StatusLook.of(manager.state, held: manager.networkHeld,
-                                     hasCredentials: manager.hasCredentials, onDemand: manager.onDemandPaused)
+                                     hasCredentials: manager.hasCredentials, onDemand: manager.onDemandPaused,
+                                     ownConnection: !manager.usesCisco, progress: manager.relayProgressLine)
             HStack(spacing: 12) {
                 Image(nsImage: GlobeIcon.image(
                     GlobeIcon.badge(for: manager.state, held: manager.networkHeld), size: 36))

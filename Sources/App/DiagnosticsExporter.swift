@@ -37,7 +37,7 @@ enum DiagnosticsExporter {
         let version = DiagnosticsRedaction.classify(
             .version, Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")
         let os = ProcessInfo.processInfo.operatingSystemVersion
-        let state = DiagnosticsRedaction.classify(.state, String(manager.state.rawValue))
+        let state = DiagnosticsRedaction.classify(manager.usesCisco ? .state : .ownState, String(manager.state.rawValue))
         let detail = DiagnosticsRedaction.classify(.detail, manager.detail)
         let rules = ProfileStore.loadRules()
         var lines = [
@@ -75,12 +75,15 @@ enum DiagnosticsExporter {
                 DiagnosticsRedaction.classify(.isSleepRecord, String(drop.isSleepRecord)),
                 DiagnosticsRedaction.classify(.sleepDropCount, String(drop.sleepDropCount)),
             ].filter { !$0.isEmpty }.joined(separator: "，")
-            lines.append("- \(timeFormatter.string(from: drop.droppedAt)) → \(timeFormatter.string(from: drop.recoveredAt))：\(outcome)，\(engine)，重试 \(retries) 次，等待批准 \(approvals) 次；原因：\(reason)")
+            lines.append("- \(timeFormatter.string(from: drop.droppedAt)) → \(timeFormatter.string(from: drop.recoveredAt))：\(outcome)，\(engine)，重试 \(retries) 次，认证等待 \(approvals) 次；原因：\(reason)")
             if !metadata.isEmpty { lines[lines.count - 1] += "；\(metadata)" }
         }
         lines.append("")
         lines.append("Cisco 引擎时间线：")
         lines.append(DiagnosticsRedaction.classify(.timeline, ciscoTimeline))
+        lines.append("")
+        lines.append("自建连接诊断事件（目标/SNI/IP 已隐去，最近 200 条）：")
+        lines.append(DiagnosticsRedaction.relayTimeline())
         return lines.joined(separator: "\n") + "\n"
     }
 }

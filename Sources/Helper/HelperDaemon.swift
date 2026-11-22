@@ -449,7 +449,7 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
         }
     }
 
-    func cancelRelayHandover(session: String, withReply reply: @escaping () -> Void) {
+    func cancelRelayHandover(session: String, reason: String, withReply reply: @escaping () -> Void) {
         queue.async {
             if let (decision, _) = self.relayHandover.command(["op": "cancel", "session": session]), decision.ok {
                 self.startBarrier.cancel()
@@ -469,7 +469,13 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 }
                 self.relayCredentials = nil
                 self.lastStateCode = 0
-                self.lastDetail = "VPN 节点切换已停止"
+                switch reason {
+                case "gateway_certificate": self.lastDetail = "无法验证 VPN 网关证书，连接已停止"
+                case "identity_expired": self.lastDetail = "客户端证书已过期，连接已停止"
+                case "identity_unavailable": self.lastDetail = "客户端证书身份不可用，连接已停止"
+                case "relay_unavailable", "relay_rejected": self.lastDetail = "本机安全转接未就绪，连接已停止"
+                default: self.lastDetail = "VPN 连接已停止"
+                }
                 self.push(state: self.lastStateCode, detail: self.lastDetail)
             }
             reply()

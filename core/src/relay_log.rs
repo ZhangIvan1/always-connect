@@ -1,13 +1,15 @@
 //! The relay log (~/Library/Logs/AlwaysConnect/relay.log; DESIGN.md
 //! §28.1, §30.9; moved to Rust in §32.9): why relayed connections end
 //! and the login's shape, readable without administrator rights (the
-//! background service's own log is root-only). Reasons and counts only:
-//! no addresses, no content. Bounded: over 1 MB the file starts afresh.
+//! background service's own log is root-only). Owner-only local metadata may
+//! include targets; the public relay_diagnostics projection removes them.
+//! No credentials or raw HTTP content. Over 1 MB the file starts afresh.
 //! Harnesses log elsewhere (ALWAYSCONNECT_RELAY_LOG), never into the
 //! user's file.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,12 +48,17 @@ pub fn write(line: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if std::fs::metadata(&path).map(|m| m.len() > LIMIT).unwrap_or(false) {
-        let _ = std::fs::remove_file(&path);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(text.as_bytes());
-    }
+    append(&path, &text);
+}
+
+fn append(path: &Path, text: &str) {
+    // Work through the opened descriptor, never follow a log symlink or
+    // chmod/truncate its target. Existing older logs become owner-only too.
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path) else { return };
+    if file.set_permissions(std::fs::Permissions::from_mode(0o600)).is_err() { return; }
+    if file.metadata().is_ok_and(|m| m.len() > LIMIT) && file.set_len(0).is_err() { return; }
+    let _ = file.write_all(text.as_bytes());
 }
 
 #[cfg(test)]
@@ -64,4 +71,18 @@ mod tests {
         assert_eq!(stamp(1_793_958_259), "2026-11-06T09:44:19Z");
         assert_eq!(stamp(951_782_400), "2000-02-29T00:00:00Z");
     }
+    #[test]
+    fn relay_log_is_private_and_does_not_follow_symlinks() {
+        let dir = std::env::temp_dir().join(format!("ac-relay-log-permissions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("relay.log"); std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        append(&file, "metadata");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        let link = dir.join("link.log"); let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&file, &link).unwrap(); append(&link, "not-appended");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "oldmetadata");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
 }
