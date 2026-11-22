@@ -121,7 +121,7 @@ struct DropHistoryTest {
         check(history.count == 2 && history.last!.sleepDropCount == 4 && history.last!.retries == 2
               && history.last!.approvals == 1 && history.last!.durationSeconds == 64,
               "drop within the wake grace folds in with its re-logins and approval")
-        check(history.last!.summary == "电脑睡眠时断了 4 次，合计 1 分 4 秒，共重新登录 2 次，都已恢复；其中 1 次等你在手机上批准",
+        check(history.last!.summary == "电脑睡眠时断了 4 次，合计 1 分 4 秒，共重新登录 2 次，都已恢复；其中 1 次等待认证响应",
               "sleep summary with re-logins: \(history.last!.summary)")
         drop(15_200, 15_201)
         check(history.count == 3 && history.last!.sleepSince == nil, "after the grace: an ordinary record")

@@ -161,5 +161,9 @@ printf 'testpass\n' | "$HELPER" run-once --server https://127.0.0.1:4464 --user 
 grep -q "credential password" "$W/direct.out" && ! grep -q mockcookie123 "$W/direct.json" 2>/dev/null &&
     pass "without the relay the gateway refuses openconnect" || fail "direct login unexpectedly worked"
 
+# Production App handover methods are extracted unchanged. Only the initial
+# pre-authentication CLI is a controlled GET; destination auth uses OpenConnect.
+python3 -I "$ROOT/core/scripts/relay-handover-test.py" "$D" || FAILS=$((FAILS + 1))
+
 echo "relay FAILS=$FAILS"
 [ "$FAILS" = 0 ]
