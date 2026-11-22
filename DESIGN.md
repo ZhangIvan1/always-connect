@@ -3766,7 +3766,7 @@ App、转接和后台服务按 session/attempt 关联事件，TLS Pair 另有编
 
 Rust 的握手预算最多容纳 4 条未完成连接；上游 TLS 连续失败按 1/2/4/8/16/30 秒限制新连接准入，成功清零，本机认证拒绝和网络切换不计网关失败。重复关闭不重复释放或增加退避。此限制只管转接准入，OpenConnect 的进程重试与现有认证拒绝策略保持；界面写“最早某时后允许重试”，不承诺届时必定重试。
 
-typed relay-event 记录端口、解析来源、目标/SNI/IP、证书身份是否配置、已知有效期、信任结果、原始 NWError 域/代码和握手耗时；物理路径在系统提供时记录。监听、上游 TLS、信任、认证、跳转、退避和取消分阶段。SecIdentity 配置成功与 TLS ready 均不能单独证明私钥操作发生；Network.framework 未暴露的客户端证书交换/签名阶段仍需真机证据。没有信任回调的 TLS 关闭不猜成证书错误。
+typed relay-event 记录端口、解析来源、目标/SNI/IP、证书身份是否配置、已知有效期、信任结果、原始 NWError 域（tls/posix/dns）/代码和握手耗时；物理路径在系统提供时记录。监听、上游 TLS、信任、认证、跳转、退避和取消分阶段。SecIdentity 配置成功与 TLS ready 均不能单独证明私钥操作发生；Network.framework 未暴露的客户端证书交换/签名阶段仍需真机证据。没有信任回调的 TLS 关闭不猜成证书错误。
 
 本机 relay.log 上限 1 MB，写入时设 0600、不跟随符号链接，包含目标元数据但没有密码、Cookie、Token、原始 HTTP 或 Location。诊断导出按需读取最多 1 MB，只重新生成最近 200 条通过类型与长度校验的事件：删除目标/SNI/IP，接口只保留系统形式，未知字段和原始行均不复制。诊断栏目通过同一 Rust FFI 生成，无需改 launchd。实现 PR：[认证转接修复](https://github.com/weiazm/always-connect/pull/8)。
 

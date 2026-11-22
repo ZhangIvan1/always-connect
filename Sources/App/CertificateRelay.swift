@@ -771,7 +771,7 @@ private final class Pair {
             let domain: String
             let code: Int32?
             switch error {
-            case .ssl(let value): domain = "ssl"; code = value
+            case .tls(let value): domain = "tls"; code = value
             case .posix(let value): domain = "posix"; code = value.rawValue
             case .dns(let value): domain = "dns"; code = value
             @unknown default: domain = "unknown"; code = nil

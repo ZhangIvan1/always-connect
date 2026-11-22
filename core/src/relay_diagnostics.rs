@@ -19,7 +19,7 @@ pub enum Stage {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Domain {
-    Ssl,
+    Tls,
     Posix,
     Dns,
     Trust,
@@ -171,7 +171,7 @@ mod tests {
     use super::*;
     #[test]
     fn public_export_drops_targets_unknown_text_and_unbounded_fields() {
-        let row = r#"{"session":"00000000-0000-4000-8000-000000000001","attempt":1,"pair":2,"stage":"upstream_tls","domain":"ssl","code":-9816,"port":6443,"host":"vpn.example","ip":"198.51.100.7","sni":"vpn.example","interface":"personal-interface","password":"secret-value"}"#;
+        let row = r#"{"session":"00000000-0000-4000-8000-000000000001","attempt":1,"pair":2,"stage":"upstream_tls","domain":"tls","code":-9816,"port":6443,"host":"vpn.example","ip":"198.51.100.7","sni":"vpn.example","interface":"personal-interface","password":"secret-value"}"#;
         let out = project(&format!(
             "2026-01-01T00:00:00Z relay-event {row}\nraw gateway secret-value\n"
         ));
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(
             project(&format!(
                 "stamp relay-event {}",
-                row.replace("\"ssl\"", "\"unknown-secret\"")
+                row.replace("\"tls\"", "\"unknown-secret\"")
             )),
             "[]"
         );

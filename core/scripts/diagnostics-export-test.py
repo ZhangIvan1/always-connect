@@ -61,7 +61,7 @@ enum CiscoProfiles {
         let client = HelperClient()
         let log = URL(fileURLWithPath: CommandLine.arguments[1]).deletingLastPathComponent().appendingPathComponent("relay-fixture.log").path
         setenv("ALWAYSCONNECT_RELAY_LOG", log, 1)
-        ac_relay_diagnostic_write(#"{"session":"00000000-0000-4000-8000-000000000001","attempt":0,"pair":1,"stage":"upstream_tls","domain":"ssl","code":-9816,"port":6443,"host":"gateway-canary.example","sni":"backup-canary.example","ip":"203.0.113.73","password":"TLS_TOKEN_CANARY_9"}"#)
+        ac_relay_diagnostic_write(#"{"session":"00000000-0000-4000-8000-000000000001","attempt":0,"pair":1,"stage":"upstream_tls","domain":"tls","code":-9816,"port":6443,"host":"gateway-canary.example","sni":"backup-canary.example","ip":"203.0.113.73","password":"TLS_TOKEN_CANARY_9"}"#)
         let profile = Profile()
         CiscoEngine.cliPath = CommandLine.arguments[1]
         CiscoEngine.physicalAvailability = { true }
