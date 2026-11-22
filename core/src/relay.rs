@@ -42,6 +42,7 @@ pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
 pub enum FramingError {
     Invalid,
     Oversized,
+    Redirect,
 }
 
 const HEADER_LIMIT: usize = 131072;
@@ -531,6 +532,7 @@ pub struct Stream {
     interface: Option<String>,
     log: Option<Log>,
     requests: HttpRequests,
+    responses: crate::relay_http::Responses,
     auth: AuthTrace,
     connect_requested: bool,
     response_header: Vec<u8>,
@@ -553,6 +555,7 @@ impl Stream {
             auth: AuthTrace::new(pair, log.clone()),
             log,
             requests: HttpRequests::default(),
+            responses: crate::relay_http::Responses::default(),
             connect_requested: false,
             response_header: Vec::new(),
             cstp_since: None,
@@ -578,6 +581,10 @@ impl Stream {
             .and_then(|l| Ipv4Addr::from_str(l).ok())
             .and_then(interface_of)
             .or_else(|| interface.filter(|i| !i.is_empty()).map(str::to_string));
+    }
+
+    pub fn set_target(&mut self, host: &str, port: u16) {
+        self.responses.set_target(host, port);
     }
 
     pub fn in_tunnel(&self) -> bool {
@@ -611,14 +618,14 @@ impl Stream {
             return Ok(());
         }
         if !self.connect_requested {
-            out.push(data);
-            return Ok(());
+            return self.responses.feed(data, out);
         }
         self.response_header.extend_from_slice(data);
-        if self.response_header.len() > HEADER_LIMIT {
+        let boundary = find(&self.response_header, b"\r\n\r\n").map(|i| i + 4);
+        if boundary.unwrap_or(self.response_header.len()) > HEADER_LIMIT {
             return Err(FramingError::Oversized);
         }
-        let Some(boundary) = find(&self.response_header, b"\r\n\r\n").map(|i| i + 4) else { return Ok(()) };
+        let Some(boundary) = boundary else { return Ok(()) };
         let whole = std::mem::take(&mut self.response_header);
         let mut header = whole[..boundary].to_vec();
         let status_line = String::from_utf8_lossy(&header).split("\r\n").next().unwrap_or("").to_string();
@@ -627,16 +634,18 @@ impl Stream {
             self.cstp_since = Some(Instant::now());
             header = self.open_datagrams(&header);
         }
-        self.connect_requested = false;
-        out.push(&header);
+        let interim = status_line.split_whitespace().nth(1)
+            .and_then(|s| s.parse::<u16>().ok()).is_some_and(|s| (100..200).contains(&s));
+        self.connect_requested = interim;
         let tail = &whole[boundary..];
         if ok {
+            out.push(&header);
             self.server_frames.feed(tail, out)
+        } else if interim {
+            self.responses.feed(&header, out)?;
+            self.frame(tail, false, out)
         } else {
-            if !tail.is_empty() {
-                out.push(tail);
-            }
-            Ok(())
+            self.responses.feed(&whole, out)
         }
     }
 
@@ -823,4 +832,15 @@ mod tests {
         let summary = s.close();
         assert!(summary.contains("udp up 1 pkts/13 B, down 1 pkts/17 B"), "{summary}");
     }
+    #[test]
+    fn connect_redirect_is_also_guarded_after_interim() {
+        let mut s = Stream::new(1, Ipv4Addr::LOCALHOST, None);
+        s.set_target("vpn-a.example", 6443);
+        s.feed(b"CONNECT /CSCOSSLC/tunnel HTTP/1.1\r\n\r\n", true).unwrap();
+        let response = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 302 Found\r\nLocation: https://vpn-b.example:6443/\r\n\r\n";
+        assert_eq!(s.feed(response, false), Err(FramingError::Redirect));
+        assert!(!s.in_tunnel());
+        assert!(!String::from_utf8_lossy(&s.out[1].to_vecs().concat()).contains("Location"));
+    }
+
 }

@@ -1100,6 +1100,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                     return
                 }
                 DispatchQueue.main.async {
+                    guard generation == self.relayGeneration else { return }
                     self.sendPrepareRelay(gatewayIp: "", serverPin: "") { _ in finish(nil) }
                 }
                 return
@@ -1135,6 +1136,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                             guard generation == self.relayGeneration else { return }
                             self.sendPrepareRelay(gatewayIp: prepared.gatewayIp,
                                                   serverPin: prepared.serverPin) { pem in
+                                guard generation == self.relayGeneration else { relay.stop(); return }
                                 guard let pem, let der = Self.certificateDER(pem: pem) else {
                                     finish("后台服务需要更新：在菜单栏面板里点「更新」")
                                     return

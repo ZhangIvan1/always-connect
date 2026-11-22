@@ -487,8 +487,8 @@ mod tests {
         let app = c("com.example.app");
         let dom = c("a.video.example");
         let ip = c("1.2.3.4");
-        let mut buf = vec![0i8; 64];
-        let reason = |buf: &[i8]| unsafe {
+        let mut buf = vec![0 as c_char; 64];
+        let reason = |buf: &[c_char]| unsafe {
             CStr::from_ptr(buf.as_ptr()).to_str().unwrap().to_owned()
         };
         // No rule yet: secure default.
@@ -558,7 +558,7 @@ mod tests {
         assert_eq!(reason(&buf), "app-conflict->vpn");
         // Short buffer truncates the reason but keeps the direction
         // and the NUL terminator.
-        let mut small = vec![0i8; 4];
+        let mut small = vec![0 as c_char; 4];
         assert_eq!(
             ac_engine_resolve_detail(
                 e,
@@ -942,7 +942,15 @@ pub extern "C" fn ac_relay_stream_feed(s: *mut Stream, from_client: bool, data: 
         Ok(n) => n as c_int,
         Err(relay::FramingError::Invalid) => -1,
         Err(relay::FramingError::Oversized) => -2,
+        Err(relay::FramingError::Redirect) => -3,
     }
+}
+
+/// Bind the response guard to the actual upstream TLS authority.
+#[no_mangle]
+pub extern "C" fn ac_relay_stream_set_target(s: *mut Stream, host: *const c_char, port: u16) {
+    let Some(s) = (unsafe { s.as_mut() }) else { return };
+    if let Some(host) = c_str(host) { s.set_target(&host, port); }
 }
 
 /// Chunk `index` of the last feed in that direction; its length, with

@@ -110,6 +110,8 @@ final class CertificateRelay {
     private var listener: NWListener?
     private var pairs: [ObjectIdentifier: Pair] = [:]
     private var pairCount = 0
+    private var stopped = false
+    private let sessionId = UUID().uuidString
 
     /// `upstreamPort` and `anchor` exist for the harness only (a mock
     /// gateway on another loopback port, trusted through its test CA);
@@ -215,6 +217,7 @@ final class CertificateRelay {
         let resolved = resolved ?? Self.resolveAllIPv4(host, port: upstreamPort)
         guard let ip = Self.pick(resolved.isEmpty ? known : resolved, prefer: prefer, avoid: avoid)
         else { throw RelayError.unresolved }
+        RelayLog.write("session=\(sessionId) stage=dns source=\(resolved.isEmpty ? "cache" : "resolved") candidates=\(resolved.count) port=\(upstreamPort)")
         queue.sync {
             listenerIdentity = identity
             gatewayIp = ip
@@ -235,6 +238,7 @@ final class CertificateRelay {
     /// (DER, from the Helper). Completion on the relay queue.
     func start(clientCertificate: Data, completion: @escaping (Error?) -> Void) {
         queue.async {
+            guard !self.stopped else { completion(RelayError.listener("连接已取消")); return }
             guard let identity = self.listenerIdentity, self.gatewayIp != nil else {
                 completion(RelayError.certificate)
                 return
@@ -260,6 +264,7 @@ final class CertificateRelay {
             }
             var reported = false
             listener.stateUpdateHandler = { [weak self] state in
+                guard let self, !self.stopped else { return }
                 switch state {
                 case .ready:
                     if !reported { reported = true; completion(nil) }
@@ -267,18 +272,19 @@ final class CertificateRelay {
                     Self.log.error("relay listener failed: \(String(describing: error), privacy: .public)")
                     let reason: String
                     if case .posix(let code) = error, code == .EADDRINUSE {
-                        reason = "本机 \(self?.port ?? 0) 端口被其他程序占用，转接无法启动"
+                        reason = "本机 \(self.port) 端口被其他程序占用，转接无法启动"
                     } else {
                         reason = "本机转接启动失败"
                     }
                     if !reported { reported = true; completion(RelayError.listener(reason)) }
-                    self?.stopLocked()
+                    self.stopLocked()
                 default:
                     break
                 }
             }
             listener.newConnectionHandler = { [weak self] connection in
-                self?.accept(connection)
+                guard let self, !self.stopped else { connection.cancel(); return }
+                self.accept(connection)
             }
             self.listener = listener
             listener.start(queue: self.queue)
@@ -310,7 +316,7 @@ final class CertificateRelay {
             monitor = NWPathMonitor()
         }
         monitor.pathUpdateHandler = { [weak self] path in
-            guard let self else { return }
+            guard let self, !self.stopped else { return }
             let signature = "\(path.status) \(path.availableInterfaces.map(\.name)) \(path.gateways.map(\.debugDescription))"
             defer { self.lastPath = signature }
             guard let last = self.lastPath, last != signature else { return }
@@ -323,13 +329,15 @@ final class CertificateRelay {
     }
 
     private func stopLocked() {
+        stopped = true
         pathMonitor?.cancel()
         pathMonitor = nil
         lastPath = nil
         listener?.cancel()
         listener = nil
-        for pair in pairs.values { pair.close("relay stopped") }
+        let closing = Array(pairs.values)
         pairs.removeAll()
+        for pair in closing { pair.close("relay stopped") }
     }
 
     /// The certificate for the next gateway connection (§45). The relay
@@ -354,22 +362,33 @@ final class CertificateRelay {
     }
 
     private func accept(_ incoming: NWConnection) {
-        guard let ip = gatewayIp else { incoming.cancel(); return }
+        guard !stopped, let ip = gatewayIp else { incoming.cancel(); return }
+        pairCount += 1
+        let pairId = "session=\(sessionId) pair=\(pairCount)"
+        // Full targets stay in the local private system log. Exported relay
+        // diagnostics identify the session, never an address.
+        Self.log.info("session=\(self.sessionId, privacy: .public) pair=\(self.pairCount) relay target host=\(self.host, privacy: .private) port=\(self.upstreamPort) ip=\(ip, privacy: .private) sni=\(self.host, privacy: .private)")
+        let identity = identityForNextConnection()
+        RelayLog.write("\(pairId) stage=upstream_tls port=\(upstreamPort) certificate_expired=\(clientExpires.map { $0 <= Date() } ?? false)")
         let tls = NWProtocolTLS.Options()
         let options = tls.securityProtocolOptions
-        sec_protocol_options_set_local_identity(options, sec_identity_create(identityForNextConnection())!)
+        sec_protocol_options_set_local_identity(options, sec_identity_create(identity)!)
         sec_protocol_options_set_tls_server_name(options, host)
         let anchor = self.anchor
+        let expectedHost = host
         sec_protocol_options_set_verify_block(options, { _, trust, complete in
             let object = sec_trust_copy_ref(trust).takeRetainedValue()
-            var configured = true
+            var configured = SecTrustSetPolicies(object, SecPolicyCreateSSL(true, expectedHost as CFString)) == errSecSuccess
             if let anchor {
-                configured = SecTrustSetAnchorCertificates(object, [anchor] as CFArray) == errSecSuccess
+                configured = configured && SecTrustSetAnchorCertificates(object, [anchor] as CFArray) == errSecSuccess
                     && SecTrustSetAnchorCertificatesOnly(object, true) == errSecSuccess
                     && SecTrustSetNetworkFetchAllowed(object, false) == errSecSuccess
             }
             // System trust and the gateway's host name, as any client.
-            let accepted = configured && SecTrustEvaluateWithError(object, nil)
+            var trustError: CFError?
+            let accepted = configured && SecTrustEvaluateWithError(object, &trustError)
+            let code = trustError.map { CFErrorGetCode($0) } ?? 0
+            RelayLog.write("\(pairId) stage=server_trust accepted=\(accepted) code=\(code)")
             if !accepted { Self.log.error("relay: gateway certificate rejected") }
             complete(accepted)
         }, queue)
@@ -382,13 +401,13 @@ final class CertificateRelay {
         let outgoing = NWConnection(
             host: NWEndpoint.Host(ip), port: NWEndpoint.Port(rawValue: upstreamPort)!,
             using: parameters)
-        pairCount += 1
         let pair = Pair(incoming: incoming, outgoing: outgoing, queue: queue, number: pairCount,
-                        gatewayIp: ip)
+                        gatewayIp: ip, sessionId: sessionId, host: host, port: port)
         let key = ObjectIdentifier(pair)
         pair.onClose = { [weak self] outcome in
             guard let self else { return }
             self.pairs.removeValue(forKey: key)
+            guard !self.stopped else { return }
             switch outcome {
             case .carried: self.silentHandshakes = 0
             case .gatewaySilent:
@@ -501,6 +520,7 @@ private final class Pair {
     let queue: DispatchQueue
     let number: Int
     let gatewayIp: String
+    let sessionId: String
     enum Outcome { case carried, gatewaySilent, other }
     var onClose: ((Outcome) -> Void)?
     /// The plaintext side — request and answer headers, CSTP packets,
@@ -515,21 +535,28 @@ private final class Pair {
     private let opened = Date()
 
     init(incoming: NWConnection, outgoing: NWConnection, queue: DispatchQueue, number: Int,
-         gatewayIp: String) {
+         gatewayIp: String, sessionId: String, host: String, port: UInt16) {
         self.incoming = incoming
         self.outgoing = outgoing
         self.queue = queue
         self.number = number
         self.gatewayIp = gatewayIp
+        self.sessionId = sessionId
         // gatewayIp is always a resolved IPv4 address.
         stream = ac_relay_stream_new(UInt32(number), gatewayIp, nil)
             ?? ac_relay_stream_new(UInt32(number), "0.0.0.0", nil)!
+        ac_relay_stream_set_target(stream, host, port)
     }
 
     deinit { ac_relay_stream_free(stream) }
 
+    private func trace(_ line: String) {
+        RelayLog.write("session=\(sessionId) \(line)")
+    }
+
     func start() {
-        RelayLog.write("pair \(number) opened")
+        guard !closed else { return }
+        trace("pair \(number) opened")
         // A network change or sleep leaves the gateway connection dead
         // while openconnect's link to us stays healthy, so openconnect
         // kept waiting on it (half an hour once, §28.1). When the path
@@ -537,8 +564,8 @@ private final class Pair {
         // over, end the pair: openconnect reconnects at once, and its
         // attempt-reconnect moves the gateway route first.
         outgoing.viabilityUpdateHandler = { [weak self] viable in
-            guard let self else { return }
-            RelayLog.write("pair \(self.number) gateway connection viable=\(viable)")
+            guard let self, !self.closed else { return }
+            self.trace("pair \(self.number) gateway connection viable=\(viable)")
             self.viable = viable
             guard !viable else { return }
             self.queue.asyncAfter(deadline: .now() + 8) { [weak self] in
@@ -547,8 +574,8 @@ private final class Pair {
             }
         }
         outgoing.betterPathUpdateHandler = { [weak self] better in
-            guard let self, better else { return }
-            RelayLog.write("pair \(self.number) gateway connection: better path available")
+            guard let self, !self.closed, better else { return }
+            self.trace("pair \(self.number) gateway connection: better path available")
             self.queue.asyncAfter(deadline: .now() + 3) { [weak self] in
                 guard let self, !self.closed else { return }
                 self.close("another network took over")
@@ -561,11 +588,11 @@ private final class Pair {
         // The gateway answers within a second or two (relay log); one that
         // has not after 10 s while openconnect is there is not going to.
         queue.asyncAfter(deadline: .now() + 10) { [weak self] in
-            guard let self, !self.started, self.incomingReady, !self.outgoingReady else { return }
+            guard let self, !self.closed, !self.started, self.incomingReady, !self.outgoingReady else { return }
             self.close("handshake timeout (openconnect ready: true, gateway ready: false)")
         }
         queue.asyncAfter(deadline: .now() + 20) { [weak self] in
-            guard let self, !self.started else { return }
+            guard let self, !self.closed, !self.started else { return }
             self.close("handshake timeout (openconnect ready: \(self.incomingReady), gateway ready: \(self.outgoingReady))")
         }
     }
@@ -576,8 +603,10 @@ private final class Pair {
     private func side(_ incoming: Bool) -> String { incoming ? "openconnect" : "gateway" }
 
     private func state(_ state: NWConnection.State, incoming: Bool) {
+        guard !closed else { return }
         switch state {
         case .ready:
+            trace("pair \(number) stage=\(incoming ? "local_tls" : "upstream_tls") ready elapsed_ms=\(Int(Date().timeIntervalSince(opened) * 1000))")
             if incoming { incomingReady = true } else {
                 outgoingReady = true
                 // The DTLS channel leaves through the interface this TLS
@@ -618,7 +647,7 @@ private final class Pair {
                                          raw.baseAddress?.assumingMemoryBound(to: UInt8.self), raw.count)
                 }
                 guard count >= 0 else {
-                    let why = count == -2 ? "oversized" : "invalid"
+                    let why = count == -3 ? "cross-origin redirect blocked" : count == -2 ? "oversized" : "invalid"
                     self.close("framing \(self.side(fromClient)) -> \(self.side(!fromClient)): \(why)")
                     return
                 }
@@ -644,6 +673,7 @@ private final class Pair {
 
     private func send(_ chunks: [Data], at index: Int, to destination: NWConnection, end: Bool,
                       completion: @escaping (NWError?) -> Void) {
+        guard !closed else { return }
         guard index < chunks.count else { completion(nil); return }
         let last = end && index == chunks.count - 1
         // One TLS write per chunk: after CONNECT a chunk is one packet.
@@ -663,7 +693,7 @@ private final class Pair {
             counters = String(cString: raw)
             ac_string_free(raw)
         }
-        RelayLog.write("pair \(number) closed after \(age)s (\(counters)): \(reason)")
+        trace("pair \(number) closed after \(age)s (\(counters)): \(reason)")
         incoming.cancel()
         outgoing.cancel()
         let outcome: Outcome = started ? .carried
@@ -703,3 +733,6 @@ func ac_relay_pick(_ addresses: UnsafePointer<CChar>, _ prefer: UnsafePointer<CC
 func ac_relay_log(_ line: UnsafePointer<CChar>)
 @_silgen_name("ac_string_free")
 func ac_string_free(_ s: UnsafeMutablePointer<CChar>?)
+
+@_silgen_name("ac_relay_stream_set_target")
+func ac_relay_stream_set_target(_ s: OpaquePointer, _ host: UnsafePointer<CChar>, _ port: UInt16)
