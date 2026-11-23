@@ -7,15 +7,29 @@ import Security
 
 enum HelperInstaller { static let installedHelperMatchesBundle = true }
 struct FixtureDemand { func permitsConnection() -> Bool { true } }
+enum ProfileStore {
+    struct Settings { let clientCertificate: String? = "fixture" }
+    static func loadAppSettings() -> Settings { Settings() }
+}
 
 final class FixtureClient {
     let helper: HelperSession
     let identity: SecIdentity
     let anchor: SecCertificate
-    let relayHandover = RelayHandover()
+    let relayHandover: RelayHandover
+    let scenario = ProcessInfo.processInfo.environment["FIXTURE_SCENARIO"] ?? "success"
+    var lateDNS: (([String]?) -> Void)?
+    var latePrepare: ((String?) -> Void)?
     let onDemand = FixtureDemand()
     var usesCisco = false
     var relay: CertificateRelay?
+    var preparingRelay: CertificateRelay?
+    var retiringRelay: CertificateRelay?
+    var resumedOwnSession = false
+    var orphanRestarts = 0
+    enum State: Int { case disconnected = 0 }
+    func connectWithStoredCredentials() -> Bool { orphanRestarts += 1; return true }
+    func simulateOldState() { resumeOwnSessionIfOrphaned(stateCode: 5) }
     var relayGeneration = 0
     var relayConnectionContext: RelayConnectionContext?
     var relayAttempt = 0
@@ -29,20 +43,28 @@ final class FixtureClient {
 
     init(helper: HelperSession, identity: SecIdentity, anchor: SecCertificate) {
         self.helper = helper; self.identity = identity; self.anchor = anchor
+        relayHandover = RelayHandover(budgetMilliseconds: (ProcessInfo.processInfo.environment["FIXTURE_SCENARIO"] ?? "success") == "success" ? 60_000 : 5000)
     }
     func ensureConnection(_ body: (HelperSession) -> Void) { body(helper) }
     func resolveGatewayIPv4(_ host: String, completion: @escaping ([String]?) -> Void) {
+        if scenario == "dns-stall" { lateDNS = completion; return }
         completion(["127.0.0.1"]) // fixed loopback fixture, no system DNS
     }
     func prepareRelay(server: String, preservingHandover: Bool = false,
                       sessionId: String, attempt: Int, resolved: [String]? = nil,
                       completion: @escaping (String?) -> Void) {
-        relayGeneration += 1
+        takeRelay(preservingHandover: preservingHandover)?.stop()
+        if !preservingHandover {
+            _ = relayHandover.command(["op": "preparing", "session": sessionId])
+            armRelayDeadline(session: sessionId)
+        }
         let generation = relayGeneration
+        if preservingHandover && scenario == "prepare-stall" { latePrepare = completion; return }
         guard let address = GatewayAddress(server) else { completion("bad fixture target"); return }
         let next = CertificateRelay(host: address.host, port: address.port, identity: identity,
             upstreamPort: address.host == "localhost" ? 4474 : 4476, anchor: anchor,
             sessionId: sessionId, attempt: attempt)
+        preparingRelay = next
         DispatchQueue.global().async {
             do {
                 let prepared = try next.prepare(resolved: ["127.0.0.1"])
@@ -67,6 +89,7 @@ final class FixtureClient {
                         DispatchQueue.main.async {
                             guard generation == self.relayGeneration else { next.stop(); return }
                             guard error == nil else { completion(error!.localizedDescription); return }
+                            self.preparingRelay = nil
                             self.relay = next
                             self.relayPin = prepared.serverPin
                             self.pinnedTargets.append(server)
@@ -142,14 +165,29 @@ enum HandoverAppFixture {
             print("\(ok ? "PASS" : "FAIL") \(label)")
             if !ok { failures += 1 }
         }
-        check(app.lastError.isEmpty, "production App handover accepted: \(app.lastError)")
-        check(authenticated, "destination OpenConnect authenticated through its fresh relay pin")
-        check(app.redirects == 1 && app.relayAttempt == 1 && app.pinnedTargets == [a, b],
-              "fragmented redirect caused exactly one same-port target replacement")
+        if app.scenario == "success" {
+            check(app.lastError.isEmpty, "production App handover accepted: \(app.lastError)")
+            check(authenticated, "destination OpenConnect authenticated through its fresh relay pin")
+            check(app.redirects == 1 && app.relayAttempt == 1 && app.pinnedTargets == [a, b],
+                  "fragmented redirect caused exactly one same-port target replacement")
+            check(helper.harnessEngineHolder() == NetworkGuard.shared.holder,
+                  "current destination engine owns retained protection")
+        } else {
+            check(app.lastError.contains("超时") && app.relayPhase == "failed" && app.redirects == 1,
+                  "\(app.scenario): missing callback is actively ended by the total deadline")
+            app.lateDNS?(["127.0.0.1"]); app.latePrepare?(nil)
+            let lateDeadline = Date().addingTimeInterval(0.3)
+            while Date() < lateDeadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+            app.simulateOldState()
+            check(app.relayConnectionContext == nil && app.relay == nil && app.pinnedTargets == [a]
+                  && helper.harnessEngineHolder() == nil && app.orphanRestarts == 0,
+                  "\(app.scenario): late DNS/preparation cannot restart or commit")
+            check(NetworkGuard.shared.held?.inputs.gatewayIps.isEmpty == true
+                  && NetworkGuard.shared.held?.inputs.tunnelDNSServers.isEmpty == true,
+                  "\(app.scenario): failure revoked gateway and tunnel DNS permits")
+        }
         check(NetworkGuard.shared.isHolding && !calls.split(separator: "\n").contains { $0.hasPrefix("-X ") },
               "protected handover did not release the adopted firewall reference")
-        check(helper.harnessEngineHolder() == NetworkGuard.shared.holder,
-              "current destination engine owns retained protection")
         var stopped = false
         helper.disconnect { DispatchQueue.main.async { stopped = true } }
         let stopDeadline = Date().addingTimeInterval(12)

@@ -64,6 +64,14 @@ def extract_methods(root):
     methods = source[start:end]
     assert all(methods.count("private func " + name + "(") == 1
                for name in ("failRelayHandover", "beginRelayHandover", "handleRelayRedirect"))
+    start = source.index("    private func takeRelay(")
+    end = source.index("    /// Switch between Cisco", start)
+    methods += source[start:end]
+    start = source.index("    private func resumeOwnSessionIfOrphaned(")
+    end = source.index("    /// Launch:", start)
+    methods += source[start:end]
+    assert "armRelayDeadline(session: sessionId)" in source
+    assert "armRelayDeadline(session: context.session)" in methods
     return methods
 
 
@@ -165,7 +173,17 @@ exit 0
                             break
                     except OSError:
                         time.sleep(0.03)
-                result = subprocess.run([str(work / "fixture"), str(pki)], env=environment, timeout=55)
+                results = []
+                for scenario in ("success", "dns-stall", "prepare-stall"):
+                    case_root = work / scenario
+                    case_root.mkdir()
+                    for tool in ("openconnect", "pfctl"):
+                        shutil.copy2(work / tool, case_root / tool)
+                    case_env = dict(environment, ALWAYSCONNECT_TEST_ROOT=str(case_root),
+                                    ALWAYSCONNECT_RELAY_LOG=str(case_root / "relay.log"),
+                                    FIXTURE_SCENARIO=scenario)
+                    results.append(subprocess.run([str(work / "fixture"), str(pki)], env=case_env, timeout=55))
+                    assert not (case_root / "location-leaked").exists(), "Location escaped to the initial CLI"
             finally:
                 gateway.terminate()
                 gateway.wait(timeout=5)
@@ -173,10 +191,9 @@ exit 0
                 thread.join(timeout=3)
             output.seek(0)
             destination = output.read()
-        assert result.returncode == 0, "production handover chain failed"
-        assert len(seen) == 1 and not errors, ("initial node connection count/errors", len(seen), errors)
+        assert all(result.returncode == 0 for result in results), "production handover/deadline chain failed"
+        assert len(seen) == 3 and not errors, ("initial node connection count/errors", len(seen), errors)
         assert "MOCK client certificate verified" in destination and "MOCK POST /auth" in destination
-        assert not (work / "location-leaked").exists(), "Location escaped to the initial CLI"
         print("PASS fragmented 302 -> production App/Helper handover -> same-port relay -> destination certificate authentication")
         return 0
 

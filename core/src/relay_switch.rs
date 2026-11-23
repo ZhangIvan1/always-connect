@@ -12,6 +12,16 @@ pub enum Command {
         session: String,
     },
     Status,
+    Prepared {
+        session: String,
+    },
+    Watch {
+        session: String,
+    },
+    Expire {
+        session: String,
+        epoch: String,
+    },
     Register {
         session: String,
         target: String,
@@ -36,6 +46,9 @@ pub enum Command {
         pin: String,
         listener_closed: bool,
     },
+    Fail {
+        session: String,
+    },
     Cancel {
         session: String,
     },
@@ -49,6 +62,8 @@ pub struct Reply {
     pub ticket: Option<String>,
     pub target: Option<String>,
     pub attempt: u32,
+    pub epoch: Option<String>,
+    pub remaining_ms: Option<u32>,
 }
 
 impl Reply {
@@ -57,6 +72,8 @@ impl Reply {
             ok: false,
             code,
             ticket: None,
+            epoch: None,
+            remaining_ms: None,
             target: None,
             attempt: 0,
         }
@@ -78,6 +95,7 @@ enum Phase {
         target: String,
     },
     Failed,
+    TimedOut,
 }
 
 /// Only exact configured HTTPS authorities are eligible. No suffix matching,
@@ -115,6 +133,7 @@ pub struct Handover {
     visited: BTreeSet<String>,
     attempt: u32,
     since: Instant,
+    budget: Duration,
 }
 
 impl Default for Handover {
@@ -129,11 +148,35 @@ impl Default for Handover {
             visited: BTreeSet::new(),
             attempt: 0,
             since: Instant::now(),
+            budget: Duration::from_secs(60),
         }
     }
 }
 
 impl Handover {
+    /// Shorter budgets are useful to adapters testing a missing callback.
+    /// No caller can increase the production maximum.
+    pub fn with_budget(milliseconds: u32) -> Self {
+        Self {
+            budget: Duration::from_millis(milliseconds.clamp(1, 60_000) as u64),
+            ..Self::default()
+        }
+    }
+
+    fn waiting(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Preparing | Phase::Stopping { .. } | Phase::Ready { .. } | Phase::TimedOut
+        )
+    }
+
+    fn remaining_ms(&self, now: Instant) -> u32 {
+        let remaining = self
+            .budget
+            .saturating_sub(now.saturating_duration_since(self.since));
+        remaining.as_nanos().div_ceil(1_000_000) as u32
+    }
+
     pub fn command(&mut self, command: Command) -> Reply {
         self.command_at(command, Instant::now())
     }
@@ -141,6 +184,12 @@ impl Handover {
     fn command_at(&mut self, command: Command, now: Instant) -> Reply {
         match command {
             Command::Preparing { session } => {
+                let Some(sequence) = self.sequence.checked_add(1) else {
+                    self.phase = Phase::Failed;
+                    return Reply::error("ticket_exhausted");
+                };
+                self.sequence = sequence;
+                self.since = now;
                 self.phase = Phase::Preparing;
                 self.session = session;
                 self.target = String::new();
@@ -152,23 +201,65 @@ impl Handover {
                     ok: true,
                     code: "preparing",
                     ticket: None,
+                    epoch: None,
+                    remaining_ms: None,
                     target: None,
                     attempt: 0,
                 }
             }
+            Command::Prepared { session } => {
+                if self.session != session || !matches!(self.phase, Phase::Preparing) {
+                    return Reply::error("stale_context");
+                }
+                if self.remaining_ms(now) == 0 {
+                    self.phase = Phase::TimedOut;
+                    return Reply::error("redirect_deadline");
+                }
+                self.command_at(Command::Cancel { session }, now)
+            }
+            Command::Watch { session } => {
+                if self.session != session || !self.waiting() {
+                    return Reply::error("stale_context");
+                }
+                let mut reply = Reply::error("watch_deadline");
+                reply.ok = true;
+                reply.epoch = Some(self.sequence.to_string());
+                reply.remaining_ms = Some(self.remaining_ms(now));
+                reply
+            }
+            Command::Expire { session, epoch } => {
+                if self.session != session || self.sequence.to_string() != epoch || !self.waiting()
+                {
+                    return Reply::error("stale_context");
+                }
+                if self.remaining_ms(now) != 0 {
+                    return Reply::error("deadline_not_reached");
+                }
+                self.phase = Phase::Failed;
+                Reply::error("redirect_deadline")
+            }
             Command::Status => {
-                let code = match &self.phase {
-                    Phase::Inactive => "inactive",
-                    Phase::Preparing => "preparing",
-                    Phase::Active => "active",
-                    Phase::Stopping { .. } => "stopping",
-                    Phase::Ready { .. } => "ready",
-                    Phase::Failed => "failed",
+                // Observing status must not consume the deadline notification.
+                let code = if self.waiting() && self.remaining_ms(now) == 0 {
+                    "expired"
+                } else {
+                    match &self.phase {
+                        Phase::Inactive => "inactive",
+                        Phase::Preparing => "preparing",
+                        Phase::Active => "active",
+                        Phase::Stopping { .. } => "stopping",
+                        Phase::Ready { .. } => "ready",
+                        Phase::Failed => "failed",
+                        Phase::TimedOut => "expired",
+                    }
                 };
+
                 Reply {
                     ok: true,
                     code,
                     ticket: None,
+                    epoch: None,
+                    remaining_ms: None,
                     target: None,
                     attempt: self.attempt,
                 }
@@ -179,6 +270,12 @@ impl Handover {
                 pin,
                 allowed,
             } => {
+                // Registering the prepared relay retains its original budget.
+                let prepared = matches!(self.phase, Phase::Preparing) && self.session == session;
+                if prepared && self.remaining_ms(now) == 0 {
+                    self.phase = Phase::TimedOut;
+                    return Reply::error("redirect_deadline");
+                }
                 // A new intent revokes the previous ticket even if malformed.
                 self.phase = Phase::Inactive;
                 if session.is_empty()
@@ -207,12 +304,16 @@ impl Handover {
                 self.allowed = allowed;
                 self.visited = BTreeSet::from([target.clone()]);
                 self.attempt = 0;
-                self.since = now;
+                if !prepared {
+                    self.since = now;
+                }
                 self.phase = Phase::Active;
                 Reply {
                     ok: true,
                     code: "registered",
                     ticket: None,
+                    epoch: None,
+                    remaining_ms: None,
                     target: Some(target),
                     attempt: 0,
                 }
@@ -238,7 +339,7 @@ impl Handover {
                     Some("unsupported_redirect")
                 } else if replay_unsafe {
                     Some("authentication_replay_unsafe")
-                } else if now.saturating_duration_since(self.since) >= Duration::from_secs(60) {
+                } else if now.saturating_duration_since(self.since) >= self.budget {
                     Some("redirect_deadline")
                 } else if self.attempt >= 3 {
                     Some("redirect_limit")
@@ -246,7 +347,11 @@ impl Handover {
                     None
                 };
                 if let Some(code) = rejection {
-                    self.phase = Phase::Failed;
+                    self.phase = if code == "redirect_deadline" {
+                        Phase::TimedOut
+                    } else {
+                        Phase::Failed
+                    };
                     return Reply::error(code);
                 }
                 let Some(target) = endpoint(&location) else {
@@ -277,6 +382,8 @@ impl Handover {
                     ok: true,
                     code: "stop_engine",
                     ticket: Some(ticket),
+                    epoch: None,
+                    remaining_ms: None,
                     target: Some(target),
                     attempt: self.attempt,
                 }
@@ -292,8 +399,8 @@ impl Handover {
                 if *expected != ticket {
                     return Reply::error("stale_ticket");
                 }
-                if now.saturating_duration_since(self.since) >= Duration::from_secs(60) {
-                    self.phase = Phase::Failed;
+                if now.saturating_duration_since(self.since) >= self.budget {
+                    self.phase = Phase::TimedOut;
                     return Reply::error("redirect_deadline");
                 }
                 let target = target.clone();
@@ -305,6 +412,8 @@ impl Handover {
                     ok: true,
                     code: "stop_listener",
                     ticket: Some(ticket),
+                    epoch: None,
+                    remaining_ms: None,
                     target: Some(target),
                     attempt: self.attempt,
                 }
@@ -328,8 +437,8 @@ impl Handover {
                 if !listener_closed || pin.is_empty() || pin == self.pin {
                     return Reply::error("relay_not_ready");
                 }
-                if now.saturating_duration_since(self.since) >= Duration::from_secs(60) {
-                    self.phase = Phase::Failed;
+                if now.saturating_duration_since(self.since) >= self.budget {
+                    self.phase = Phase::TimedOut;
                     return Reply::error("redirect_deadline");
                 }
                 self.target = next.clone();
@@ -341,9 +450,19 @@ impl Handover {
                     ok: true,
                     code: "start_engine",
                     ticket: None,
+                    epoch: None,
+                    remaining_ms: None,
                     target: Some(self.target.clone()),
                     attempt: self.attempt,
                 }
+            }
+            Command::Fail { session } => {
+                let mut reply = self.command_at(Command::Cancel { session }, now);
+                if reply.ok {
+                    self.phase = Phase::Failed;
+                    reply.code = "failed";
+                }
+                reply
             }
             Command::Cancel { session } => {
                 if session != self.session {
@@ -359,6 +478,8 @@ impl Handover {
                     ok: true,
                     code: "cancelled",
                     ticket: None,
+                    epoch: None,
+                    remaining_ms: None,
                     target: None,
                     attempt: self.attempt,
                 }
@@ -374,6 +495,8 @@ impl Handover {
                     ok: true,
                     code: "cancelled",
                     ticket: None,
+                    epoch: None,
+                    remaining_ms: None,
                     target: None,
                     attempt: self.attempt,
                 }
@@ -385,6 +508,276 @@ impl Handover {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deadline_covers_silent_preparation_and_each_handover_wait() {
+        let now = Instant::now();
+        for phase in 0..3 {
+            let mut s = Handover::with_budget(100);
+            if phase == 0 {
+                s.command_at(
+                    Command::Preparing {
+                        session: "test-session".into(),
+                    },
+                    now,
+                );
+            } else {
+                register(&mut s, now);
+                let ticket = begin(&mut s, 1, now).ticket.unwrap();
+                if phase == 2 {
+                    assert!(s.command_at(Command::EngineStopped { ticket }, now).ok);
+                }
+            }
+            let watch = s.command_at(
+                Command::Watch {
+                    session: "test-session".into(),
+                },
+                now,
+            );
+            assert_eq!(watch.remaining_ms, Some(100));
+            let epoch = watch.epoch.unwrap();
+            assert_eq!(
+                s.command_at(
+                    Command::Expire {
+                        session: "test-session".into(),
+                        epoch: epoch.clone()
+                    },
+                    now + Duration::from_millis(99)
+                )
+                .code,
+                "deadline_not_reached"
+            );
+            // A status observation cannot eat the one-shot timeout delivery.
+            assert_eq!(
+                s.command_at(Command::Status, now + Duration::from_millis(100))
+                    .code,
+                "expired"
+            );
+            assert_eq!(
+                s.command_at(
+                    Command::Expire {
+                        session: "test-session".into(),
+                        epoch
+                    },
+                    now + Duration::from_millis(100)
+                )
+                .code,
+                "redirect_deadline"
+            );
+            assert_eq!(
+                s.command_at(Command::Status, now + Duration::from_millis(100))
+                    .code,
+                "failed"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_registration_or_direct_readiness_cannot_reset_an_expired_preparation() {
+        let now = Instant::now();
+        let mut s = Handover::with_budget(100);
+        s.command_at(
+            Command::Preparing {
+                session: "test-session".into(),
+            },
+            now,
+        );
+        register(&mut s, now + Duration::from_millis(50));
+        begin(&mut s, 1, now + Duration::from_millis(75));
+        assert_eq!(
+            s.command_at(
+                Command::Watch {
+                    session: "test-session".into()
+                },
+                now + Duration::from_millis(75)
+            )
+            .remaining_ms,
+            Some(25)
+        );
+        let mut direct = Handover::with_budget(100);
+        direct.command_at(
+            Command::Preparing {
+                session: "test-session".into(),
+            },
+            now,
+        );
+        assert_eq!(
+            direct
+                .command_at(
+                    Command::Prepared {
+                        session: "test-session".into()
+                    },
+                    now + Duration::from_millis(100)
+                )
+                .code,
+            "redirect_deadline"
+        );
+        assert!(
+            direct
+                .command_at(
+                    Command::Fail {
+                        session: "test-session".into()
+                    },
+                    now
+                )
+                .ok
+        );
+        assert_eq!(direct.command_at(Command::Status, now).code, "failed");
+    }
+
+    #[test]
+    fn late_commit_rejection_does_not_consume_the_cleanup_deadline() {
+        let now = Instant::now();
+        let mut s = Handover::with_budget(100);
+        register(&mut s, now);
+        let ticket = begin(&mut s, 1, now).ticket.unwrap();
+        let epoch = s
+            .command_at(
+                Command::Watch {
+                    session: "test-session".into(),
+                },
+                now,
+            )
+            .epoch
+            .unwrap();
+        assert!(
+            s.command_at(
+                Command::EngineStopped {
+                    ticket: ticket.clone()
+                },
+                now
+            )
+            .ok
+        );
+        let late = now + Duration::from_millis(100);
+        assert_eq!(
+            s.command_at(
+                Command::Commit {
+                    ticket,
+                    target: target(1),
+                    pin: "fresh".into(),
+                    listener_closed: true
+                },
+                late
+            )
+            .code,
+            "redirect_deadline"
+        );
+        assert_eq!(
+            s.command_at(
+                Command::Expire {
+                    session: "test-session".into(),
+                    epoch: epoch.clone()
+                },
+                late
+            )
+            .code,
+            "redirect_deadline"
+        );
+        assert_eq!(
+            s.command_at(
+                Command::Expire {
+                    session: "test-session".into(),
+                    epoch
+                },
+                late
+            )
+            .code,
+            "stale_context"
+        );
+    }
+
+    #[test]
+    fn stale_deadlines_never_cancel_a_new_intent_or_committed_engine() {
+        let now = Instant::now();
+        let mut s = Handover::with_budget(100);
+        s.command_at(
+            Command::Preparing {
+                session: "test-session".into(),
+            },
+            now,
+        );
+        let old = s
+            .command_at(
+                Command::Watch {
+                    session: "test-session".into(),
+                },
+                now,
+            )
+            .epoch
+            .unwrap();
+        s.command_at(
+            Command::Preparing {
+                session: "test-session".into(),
+            },
+            now + Duration::from_millis(50),
+        );
+        assert_eq!(
+            s.command_at(
+                Command::Expire {
+                    session: "test-session".into(),
+                    epoch: old
+                },
+                now + Duration::from_millis(100)
+            )
+            .code,
+            "stale_context"
+        );
+        assert_eq!(
+            s.command_at(Command::Status, now + Duration::from_millis(100))
+                .code,
+            "preparing"
+        );
+        register(&mut s, now);
+        let ticket = begin(&mut s, 1, now).ticket.unwrap();
+        let epoch = s
+            .command_at(
+                Command::Watch {
+                    session: "test-session".into(),
+                },
+                now,
+            )
+            .epoch
+            .unwrap();
+        assert!(
+            s.command_at(
+                Command::EngineStopped {
+                    ticket: ticket.clone()
+                },
+                now
+            )
+            .ok
+        );
+        assert!(
+            s.command_at(
+                Command::Commit {
+                    ticket,
+                    target: target(1),
+                    pin: "fresh".into(),
+                    listener_closed: true
+                },
+                now
+            )
+            .ok
+        );
+        assert_eq!(
+            s.command_at(
+                Command::Expire {
+                    session: "test-session".into(),
+                    epoch
+                },
+                now + Duration::from_secs(1)
+            )
+            .code,
+            "stale_context"
+        );
+        assert_eq!(
+            s.command_at(Command::Status, now + Duration::from_secs(1))
+                .code,
+            "active"
+        );
+        assert!(Handover::with_budget(u32::MAX).budget <= Duration::from_secs(60));
+    }
+
     fn target(n: u8) -> String {
         format!("https://vpn-{n}.example:6443/")
     }

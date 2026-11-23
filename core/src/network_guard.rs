@@ -107,7 +107,7 @@ pub fn text(connected: bool, i: &Inputs) -> Option<String> {
     let clean = |v: &Vec<String>| -> Vec<String> {
         v.iter().map(|x| x.trim().to_string()).filter(|x| !x.is_empty() && !x.contains(',')).collect()
     };
-    pf::generate(&pf::PfInput {
+    let input = pf::PfInput {
         physical_if: i.physical_if.clone(),
         tunnel_if: i.tunnel_if.clone(),
         gateway_ips: clean(&i.gateway_ips),
@@ -119,8 +119,10 @@ pub fn text(connected: bool, i: &Inputs) -> Option<String> {
         direct_table: i.direct_table,
         strict_dns: i.strict_dns,
         block_direct: i.block_direct,
-    })
-    .ok()
+    };
+    if !connected && i.block_direct && i.gateway_ips.is_empty() && i.tunnel_if.is_empty() {
+        pf::generate_closed(&input).ok()
+    } else { pf::generate(&input).ok() }
 }
 
 // MARK: - pfctl
@@ -369,6 +371,35 @@ impl Guard {
     /// engine so far goes stale; the record stays.
     pub fn supersede_own_holders(&self) {
         self.state.lock().unwrap().own_generation += 1;
+    }
+
+    /// Terminal relay failure retains protection but has no live gateway
+    /// requiring an exception. Revoke old holders before loading the base
+    /// blocking set; only a new engine may introduce gateway/tunnel permits again.
+    pub fn fail_own_handover(self: &Arc<Self>) -> Option<String> {
+        let mut s = self.state.lock().unwrap();
+        let Some(current) = s.record.clone() else { return None };
+        if current.holder == CISCO_HOLDER { return None; }
+        s.own_generation += 1;
+        s.active_own = None;
+        let holder = format!("own:{}", s.own_generation);
+        let mut inputs = current.inputs;
+        inputs.gateway_ips.clear();
+        inputs.tunnel_if.clear();
+        inputs.allow_dns = false;
+        // Known physical DNS stays root-only so a subsequent explicit
+        // reconnect can resolve a new gateway while protection is held.
+        inputs.tunnel_dns_servers.clear();
+        inputs.strict_dns = true;
+        inputs.block_direct = true;
+        if self.apply_locked(&mut s, &holder, false, &inputs).is_some() {
+            return Some("连接已停止，但网关临时许可撤销未确认；请恢复网络后重试".into());
+        }
+        s.direct.clear();
+        // The newly loaded rules already deny this table; flushing is cleanup.
+        if inputs.direct_table { let _ = s.pf.table("flush", &[]); }
+        self.persist(&s);
+        None
     }
 
     pub fn own_engine_started(&self,holder:&str) {
@@ -663,6 +694,66 @@ impl Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_handover_revokes_transient_permits_without_releasing_protection() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ac-terminal-handover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("pfctl");
+        std::fs::write(&tool, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.calls\"\n[ ! -e \"$0.fail\" ] || exit 1\n[ \"$1\" != -E ] || echo 'Token : 123' >&2\ncat >/dev/null\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = Arc::new(Guard::new(Settings { support_dir: dir.clone(), boot: Some("B1".into()),
+            grace: Duration::from_secs(120), pfctl: Some(tool.to_string_lossy().into()) }));
+        guard.owner_attached();
+        assert!(guard.fail_own_handover().is_none());
+        assert!(!guard.is_holding(), "protection-off is not turned on");
+        let old = guard.new_own_holder();
+        let input = Inputs { tunnel_if: "utun5".into(), gateway_ips: vec!["198.51.100.7".into()],
+            physical_if: "en0".into(), allow_networks: vec!["192.168.1.0/24".into()], allow_dns: true,
+            local_dns_servers: vec!["192.168.1.1".into()], tunnel_dns_servers: vec!["10.9.0.1".into()],
+            direct_table: true, strict_dns: true, ..Default::default() };
+        assert!(guard.apply(&old, false, &input).is_none());
+        guard.own_engine_started(&old);
+        assert!(guard.add_direct(&["203.0.113.9".into()]));
+        std::fs::write(tool.with_extension("fail"), "").unwrap();
+        assert!(guard.fail_own_handover().is_some(), "failed PF load must be reported");
+        assert!(guard.is_holding());
+        std::fs::remove_file(tool.with_extension("fail")).unwrap();
+        assert!(guard.fail_own_handover().is_none());
+        let (_, held) = guard.held().unwrap();
+        assert!(held.gateway_ips.is_empty() && held.tunnel_if.is_empty());
+        assert_eq!(held.local_dns_servers, input.local_dns_servers);
+        assert!(held.strict_dns && held.tunnel_dns_servers.is_empty() && !held.allow_dns);
+        assert_eq!(held.allow_networks, input.allow_networks);
+        assert!(held.block_direct && guard.direct_addresses().is_empty());
+        assert!(guard.bootstrap_context().is_none());
+        let rules = guard.expected_rules().unwrap();
+        assert!(!rules.contains("198.51.100.7") && !rules.contains("utun"));
+        let malformed_closed = Inputs { allow_dns: true, ..held.clone() };
+        assert!(text(false, &malformed_closed).is_none(), "closed generation cannot preserve a broad DNS permit");
+        assert!(guard.refresh_bootstrap_dns("en7", &["192.168.7.1".into()]),
+                "a new explicit resolution can prepare while protection is held");
+        let refreshed = guard.expected_rules().unwrap();
+        assert!(!refreshed.contains("198.51.100.7") && refreshed.contains("192.168.7.1 port 53 user root"));
+        guard.release(Some(&old), reason::USER);
+        assert!(guard.is_holding(), "old engine cannot release tightened protection");
+        guard.apply(&old, true, &input);
+        assert!(guard.held().unwrap().1.gateway_ips.is_empty(), "old callbacks cannot restore permits");
+        let calls = std::fs::read_to_string(tool.with_extension("calls")).unwrap();
+        assert!(!calls.lines().any(|s| s.starts_with("-X ")));
+        let new = guard.new_own_holder();
+        let next = Inputs { gateway_ips: vec!["198.51.100.9".into()], ..input };
+        assert!(guard.apply(&new, false, &next).is_none());
+        assert_eq!(guard.held().unwrap().1.gateway_ips, vec!["198.51.100.9"]);
+        guard.release(None, reason::USER);
+        assert!(guard.apply(CISCO_HOLDER, false, &next).is_none());
+        assert!(guard.fail_own_handover().is_none());
+        assert_eq!(guard.holder().as_deref(), Some(CISCO_HOLDER), "Cisco protection is not changed");
+        assert_eq!(guard.held().unwrap().1.gateway_ips, next.gateway_ips);
+        guard.release(None, reason::USER);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn failed_table_removal_is_not_reported_as_clean() {

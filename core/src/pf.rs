@@ -170,10 +170,26 @@ fn valid_cidr(s: &str) -> bool {
 /// Generate the anchor text. Deterministic: same input, same output
 /// byte for byte (tests pin the exact text).
 pub fn generate(input: &PfInput) -> Result<String, PfError> {
-    if !valid_iface(&input.physical_if) || !valid_iface(&input.tunnel_if) {
+    generate_mode(input, false)
+}
+
+/// A terminal own connection has no gateway or tunnel left to permit. This
+/// separate entry point only accepts closed gateway/tunnel permissions;
+/// ordinary generation retains its non-empty gateway/interface contract.
+pub fn generate_closed(input: &PfInput) -> Result<String, PfError> {
+    if !input.gateway_ips.is_empty() || !input.tunnel_if.is_empty()
+        || input.allow_direct_egress || !input.block_direct || input.allow_dns
+        || !input.strict_dns || !input.tunnel_dns_servers.is_empty() {
+        return Err(PfError::EmptyGateway);
+    }
+    generate_mode(input, true)
+}
+
+fn generate_mode(input: &PfInput, terminal: bool) -> Result<String, PfError> {
+    if !valid_iface(&input.physical_if) || (!terminal && !valid_iface(&input.tunnel_if)) {
         return Err(PfError::EmptyInterface);
     }
-    if input.gateway_ips.is_empty() {
+    if input.gateway_ips.is_empty() && !terminal {
         return Err(PfError::EmptyGateway);
     }
     for ip in &input.gateway_ips {
@@ -239,12 +255,14 @@ pub fn generate(input: &PfInput) -> Result<String, PfError> {
     // all — had its next packet fall through to the final block. The
     // split set ends in a block, so connecting cut the tunnel's own
     // carrier and the Mac went offline (measured 2026-11-05).
-    out.push_str(&format!("pass out quick on {} all no state\n", input.tunnel_if));
-    // Legacy compatibility for reconnecting and parallel tunnel interfaces.
-    // Diagnostics report this broader permission; it does not prove exclusive
-    // company-VPN egress. Strict DNS has already met its separate barrier.
-    let tuns: Vec<String> = (0..64).map(|n| format!("utun{n}")).collect();
-    out.push_str(&format!("pass out quick on {{ {} }} all no state\n", tuns.join(" ")));
+    if !terminal {
+        out.push_str(&format!("pass out quick on {} all no state\n", input.tunnel_if));
+        // Legacy compatibility for reconnecting and parallel tunnel interfaces.
+        // Diagnostics report this broader permission; it does not prove exclusive
+        // company-VPN egress. Strict DNS has already met its separate barrier.
+        let tuns: Vec<String> = (0..64).map(|n| format!("utun{n}")).collect();
+        out.push_str(&format!("pass out quick on {{ {} }} all no state\n", tuns.join(" ")));
+    }
     out.push_str("pass out quick on lo0 all no state\n");
     out.push_str("pass out quick inet proto udp from any port 68 to any port 67\n");
     // Passes and the final block apply to EVERY interface (DESIGN.md

@@ -417,6 +417,14 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
             self.stoppingEngine = current
             self.lastStateCode = decision.ok ? 1 : 0
             self.lastDetail = decision.ok ? "正在切换 VPN 节点" : "当前认证流程发生节点跳转，无法安全继续"
+            if !decision.ok {
+                self.relayCredentials = nil
+                if self.dropProtection, let error = NetworkGuard.shared.failOwnHandover() { self.lastDetail = error }
+            } else if let session = request["session"] as? String {
+                self.relayHandover.watchDeadline(session: session, queue: self.queue) { [weak self] in
+                    self?.cancelRelayHandover(session: session, reason: "redirect_deadline") {}
+                }
+            }
             self.push(state: self.lastStateCode, detail: self.lastDetail)
             current.stop { [weak self, weak current] in
                 guard let self, let current else { reply(""); return }
@@ -424,6 +432,9 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                     if self.stoppingEngine === current { self.stoppingEngine = nil }
                     guard decision.ok, let ticket = decision.ticket else { reply(result); return }
                     let stopped = self.relayHandover.command(["op": "engine_stopped", "ticket": ticket])
+                    if stopped?.0.ok != true, let session = request["session"] as? String {
+                        self.cancelRelayHandover(session: session, reason: "redirect_deadline") {}
+                    }
                     reply(stopped?.1 ?? "")
                 }
             }
@@ -444,6 +455,14 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                               relay.gatewayIp, relay.serverPin]
             self.startEngineNow(server: server, group: credentials.group, username: credentials.username,
                                 password: credentials.password, parameters: parameters) { accepted in
+                if !accepted {
+                    self.relayCredentials = nil
+                    self.relay = nil
+                    _ = self.relayHandover.command(["op": "reset"])
+                    self.lastStateCode = 0
+                    self.lastDetail = self.dropProtection ? (NetworkGuard.shared.failOwnHandover() ?? "新 VPN 引擎启动失败，连接已停止") : "新 VPN 引擎启动失败，连接已停止"
+                    self.push(state: self.lastStateCode, detail: self.lastDetail)
+                }
                 reply(accepted, Int(decision.attempt))
             }
         }
@@ -468,14 +487,17 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                     }
                 }
                 self.relayCredentials = nil
+                self.relay = nil
                 self.lastStateCode = 0
                 switch reason {
                 case "gateway_certificate": self.lastDetail = "无法验证 VPN 网关证书，连接已停止"
                 case "identity_expired": self.lastDetail = "客户端证书已过期，连接已停止"
                 case "identity_unavailable": self.lastDetail = "客户端证书身份不可用，连接已停止"
                 case "relay_unavailable", "relay_rejected": self.lastDetail = "本机安全转接未就绪，连接已停止"
+                case "redirect_deadline": self.lastDetail = "VPN 连接准备或节点切换超时，连接已停止"
                 default: self.lastDetail = "VPN 连接已停止"
                 }
+                if self.dropProtection, let error = NetworkGuard.shared.failOwnHandover() { self.lastDetail = error }
                 self.push(state: self.lastStateCode, detail: self.lastDetail)
             }
             reply()
@@ -612,6 +634,8 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 self.engine = nil
                 self.activeParameters = nil
                 self.relayCredentials = nil
+                let protectionError = self.relay != nil && self.dropProtection && reason != .stoppedManual
+                    ? NetworkGuard.shared.failOwnHandover() : nil
                 _ = self.relayHandover.command(["op": "reset"])
                 switch reason {
                 case .stoppedManual: self.lastReasonCode = 1
@@ -623,7 +647,10 @@ final class HelperSession: NSObject, AlwaysConnectHelperProtocol {
                 self.lastRetryCount = retries
                 // Terminal state is already reflected by the last pushed
                 // state + detail; the App maps authFailure to its error row.
-                if reason == .authFailure || reason == .approvalDeclined, let error {
+                if let protectionError {
+                    self.lastDetail = protectionError
+                    self.push(state: self.lastStateCode, detail: protectionError)
+                } else if reason == .authFailure || reason == .approvalDeclined, let error {
                     self.push(state: self.lastStateCode, detail: error)
                 }
             }

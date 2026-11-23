@@ -335,6 +335,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     /// relayGeneration makes a relay still being prepared when the user
     /// disconnects give up.
     private var relay: CertificateRelay?
+    private var preparingRelay: CertificateRelay?
     private var relayGeneration = 0
     @Published private(set) var relayPhase: String?
     @Published private(set) var relayRetryAfter: Date?
@@ -723,6 +724,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             relayConnectionContext = nil
             relayAttempt = 0
         }
+        preparingRelay?.stop()
+        preparingRelay = nil
         relayPin = nil
         relayPhase = nil
         relayRetryAfter = nil
@@ -1079,10 +1082,11 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
             if self.relay != nil, let target = RelayHandover.target(server), let pin = self.relayPin {
                 let allowed = Array(Set(profile.servers.compactMap { RelayHandover.target($0.address) } + [target])).sorted()
                 let context = RelayConnectionContext(session: session, target: target, pin: pin, allowed: allowed)
-                guard self.relayHandover.command(["op": "register", "session": session,
-                    "target": target, "pin": pin, "allowed": allowed])?.0.ok == true else {
-                    self.lastError = "VPN 节点配置无效"
-                    self.relay?.stop()
+                let registered = self.relayHandover.command(["op": "register", "session": session,
+                    "target": target, "pin": pin, "allowed": allowed])?.0
+                guard registered?.ok == true else {
+                    self.failRelayHandover(session: session, message: registered?.code == "redirect_deadline"
+                        ? "VPN 连接准备超时，连接已停止" : "VPN 节点配置无效", reason: registered?.code ?? "relay_unavailable")
                     return
                 }
                 self.relayConnectionContext = context
@@ -1147,7 +1151,10 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                               sessionId: String = UUID().uuidString, attempt: Int = 0, resolved: [String]? = nil,
                               completion: @escaping (String?) -> Void) {
         takeRelay(preservingHandover: preservingHandover)?.stop()
-        if !preservingHandover { _ = relayHandover.command(["op": "preparing", "session": sessionId]) }
+        if !preservingHandover {
+            _ = relayHandover.command(["op": "preparing", "session": sessionId])
+            armRelayDeadline(session: sessionId)
+        }
         retiringRelay?.stop()
         retiringRelay = nil
         let generation = relayGeneration
@@ -1156,6 +1163,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
         let finish: (String?) -> Void = { error in
             DispatchQueue.main.async {
                 guard generation == self.relayGeneration else { return }
+                if let error { self.failRelayHandover(session: sessionId, message: error, reason: "relay_unavailable") }
                 completion(error)
             }
         }
@@ -1173,7 +1181,13 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 }
                 DispatchQueue.main.async {
                     guard generation == self.relayGeneration else { return }
-                    self.sendPrepareRelay(gatewayIp: "", serverPin: "") { _ in finish(nil) }
+                    self.sendPrepareRelay(gatewayIp: "", serverPin: "") { _ in
+                        guard generation == self.relayGeneration else { return }
+                        guard self.relayHandover.command(["op": "prepared", "session": sessionId])?.0.ok == true else {
+                            finish("VPN 连接准备超时，连接已停止"); return
+                        }
+                        finish(nil)
+                    }
                 }
                 return
             }
@@ -1190,7 +1204,8 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                 return self.gatewayToAvoid
             }
             DispatchQueue.main.async {
-                guard generation == self.relayGeneration else { return }
+                guard generation == self.relayGeneration else { relay.stop(); return }
+                self.preparingRelay = relay
                 let prepare: ([String]?) -> Void = { addresses in
                     DispatchQueue.global(qos: .userInitiated).async {
                         let prepared: CertificateRelay.Prepared
@@ -1243,9 +1258,10 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
                                         }
                                         if let error {
                                             relay.stop()
-                                            completion(error.localizedDescription)
+                                            finish(error.localizedDescription)
                                             return
                                         }
+                                        self.preparingRelay = nil
                                         self.relay = relay
                                         self.relayPin = prepared.serverPin
                                         completion(nil)
@@ -1262,15 +1278,22 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
     }
 
     private func failRelayHandover(session: String, message: String, reason: String = "handover_failed") {
-        guard relayConnectionContext?.session == session else { return }
-        _ = relayHandover.command(["op": "cancel", "session": session])
-        relay?.stop()
+        guard relayHandover.command(["op": "fail", "session": session])?.0.ok == true else { return }
+        takeRelay(preservingHandover: true)?.stop()
+        relayConnectionContext = nil
+        relayAttempt = 0
         relayPhase = "failed"
         relayRetryAfter = nil
         lastError = message
         detail = message
         if HelperInstaller.installedHelperMatchesBundle {
             ensureConnection { $0.cancelRelayHandover(session: session, reason: reason) {} }
+        }
+    }
+
+    private func armRelayDeadline(session: String) {
+        relayHandover.watchDeadline(session: session, queue: .main) { [weak self] in
+            self?.failRelayHandover(session: session, message: "VPN 连接准备或节点切换超时，连接已停止", reason: "redirect_deadline")
         }
     }
 
@@ -1302,6 +1325,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
               let data = try? JSONSerialization.data(withJSONObject: request),
               let encoded = String(data: data, encoding: .utf8) else { return }
         relayPhase = "switching"
+        armRelayDeadline(session: context.session)
         let begin: ([String]) -> Void = { [weak self] addresses in
             guard let self, generation == self.relayGeneration,
                   self.relayConnectionContext?.session == context.session else { return }
@@ -1463,7 +1487,7 @@ final class HelperClient: NSObject, ObservableObject, AlwaysConnectHelperClientP
 
     private func resumeOwnSessionIfOrphaned(stateCode: Int) {
         let relayPhase = relayHandover.command(["op": "status"])?.0.code ?? "inactive"
-        guard !["preparing", "stopping", "ready"].contains(relayPhase),
+        guard !["preparing", "stopping", "ready", "expired", "failed"].contains(relayPhase),
               !resumedOwnSession, stateCode != State.disconnected.rawValue,
               relay == nil, retiringRelay == nil,
               ProfileStore.loadAppSettings().clientCertificate != "none"

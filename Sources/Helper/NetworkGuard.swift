@@ -104,6 +104,7 @@ final class NetworkGuard {
     }
 
     func supersedeOwnHolders() { ac_guard_supersede_own_holders() }
+    func failOwnHandover() -> String? { Self.take(ac_guard_fail_own_handover()) }
 
     func updateHeldAllowNetworks(_ networks: [String]) {
         ac_guard_update_held_allow_networks(networks.joined(separator: ","))
@@ -202,6 +203,7 @@ func ac_guard_apply(_ holder: UnsafePointer<CChar>, _ connected: Bool, _ inputs:
 @_silgen_name("ac_gateway_context") func ac_gateway_context() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_guard_holder") func ac_guard_holder() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_guard_supersede_own_holders") func ac_guard_supersede_own_holders()
+@_silgen_name("ac_guard_fail_own_handover") private func ac_guard_fail_own_handover() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("ac_guard_update_held_allow_networks") func ac_guard_update_held_allow_networks(_ n: UnsafePointer<CChar>)
 @_silgen_name("ac_guard_add_direct") func ac_guard_add_direct(_ ips: UnsafePointer<CChar>) -> Bool
 @_silgen_name("ac_guard_remove_direct") func ac_guard_remove_direct(_ ips: UnsafePointer<CChar>)

@@ -281,23 +281,10 @@ pub fn attribute(name: &str, tag: &str, text: &str) -> Option<String> {
     rest.find('"').map(|end| rest[..end].to_string())
 }
 
-pub fn element(tag: &str, text: &str) -> Option<String> {
-    let open = text.find(&format!("<{tag}"))? + tag.len() + 1;
-    let rest = &text[open..];
-    let gt = rest.find('>')?;
-    let close = rest.find(&format!("</{tag}>"))?;
-    if gt >= close {
-        return None;
-    }
-    let value = rest[gt + 1..close].trim();
-    (!value.is_empty()).then(|| value.to_string())
-}
-
 /// The login's shape, for the relay log: which kind of request went to
 /// the gateway (POST, whether it carried the password), how long the
-/// gateway took to answer, its status and the auth form's id and
-/// message. The answer to the password arrives only after the phone
-/// approval, so the wait is visible without administrator rights.
+/// gateway took to answer, its numeric status and fixed auth-form categories.
+/// Gateway-provided messages and arbitrary identifiers are never copied.
 pub struct AuthTrace {
     pair: u32,
     log: Option<Log>,
@@ -343,7 +330,8 @@ impl AuthTrace {
         }
         if self.answer.is_none() {
             let status = if text.starts_with("HTTP/") {
-                text.split("\r\n").next().and_then(|l| l.split(' ').filter(|s| !s.is_empty()).nth(1)).unwrap_or("?").to_string()
+                text.split("\r\n").next().and_then(|l| l.split(' ').filter(|s| !s.is_empty()).nth(1))
+                    .filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or("?").to_string()
             } else {
                 "?".to_string()
             };
@@ -372,12 +360,11 @@ impl AuthTrace {
         self.logged = true;
         let mut form = String::new();
         if let Some(id) = attribute("id", "auth", &body) {
-            form += &format!(" auth={id}");
+            let category = match id.as_str() { "main" => "main", "success" => "success", _ => "other" };
+            form += &format!(" auth={category}");
         }
-        if let Some(message) = element("message", &body).or_else(|| element("error", &body)) {
-            let short: String = message.chars().take(60).collect();
-            form += &format!(" message=\"{short}\"");
-        }
+        if body.contains("<message") { form += " message=present"; }
+        if body.contains("<error") { form += " error=present"; }
         let password = if self.password { " (password)" } else { "" };
         self.write(format!("pair {} login: {}{} answered after {}s: {}{}", self.pair, self.request, password, wait, status, form));
     }
@@ -856,12 +843,27 @@ mod tests {
     }
 
     #[test]
+    fn login_trace_never_copies_gateway_text_or_unknown_status_tokens() {
+        for status in ["200", "STATUS_CANARY_123"] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let target = seen.clone();
+            let mut trace = AuthTrace::new(1, Some(Arc::new(move |line| target.lock().unwrap().push(line.into()))));
+            trace.observe(b"POST / HTTP/1.1\r\n\r\n<password>PASS_CANARY_123</password>", true);
+            let response = format!("HTTP/1.1 {status} OK\r\nContent-Type: text/xml\r\n\r\n<config-auth><auth id=\"ID_CANARY_123\"><message>MSG_CANARY_123</message><error>ERR_CANARY_123</error></auth></config-auth>");
+            trace.observe(response.as_bytes(), false);
+            let text = seen.lock().unwrap().join("\n");
+            for canary in ["PASS_CANARY_123", "ID_CANARY_123", "MSG_CANARY_123", "ERR_CANARY_123", "STATUS_CANARY_123"] {
+                assert!(!text.contains(canary), "{text}");
+            }
+            assert!(text.contains("auth=other message=present error=present"), "{text}");
+        }
+    }
+
+    #[test]
     fn login_trace() {
         let form = "HTTP/1.1 200 OK\r\n\r\n<config-auth><auth id=\"main\"><message>Login failed.</message>\
                     <input type=\"password\" name=\"password\"/></auth></config-auth>";
         assert_eq!(attribute("id", "auth", form).as_deref(), Some("main"));
-        assert_eq!(element("message", form).as_deref(), Some("Login failed."));
-        assert_eq!(element("error", form), None);
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let l = Arc::clone(&lines);
         let mut t = AuthTrace::new(3, Some(Arc::new(move |s: &str| l.lock().unwrap().push(s.to_string()))));

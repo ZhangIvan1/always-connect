@@ -1462,6 +1462,11 @@ pub extern "C" fn ac_guard_supersede_own_holders() {
 }
 
 #[no_mangle]
+pub extern "C" fn ac_guard_fail_own_handover() -> *mut c_char {
+    guard().and_then(|g| g.fail_own_handover()).map(owned).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
 pub extern "C" fn ac_guard_update_held_allow_networks(networks: *const c_char) {
     if let Some(g) = guard() {
         g.update_held_allow_networks(&c_list(networks, ','));
@@ -1952,6 +1957,11 @@ pub extern "C" fn ac_loopback_dns_busy(port:u16,timeout_milliseconds:u32)->bool 
     crate::dns_forwarder::loopback_dns_busy(port,std::time::Duration::from_millis(timeout_milliseconds.min(500) as u64))
 }
 
+
+#[no_mangle]
+pub extern "C" fn ac_relay_switch_new_with_budget(milliseconds: u32) -> *mut crate::relay_switch::Handover {
+    Box::into_raw(Box::new(crate::relay_switch::Handover::with_budget(milliseconds)))
+}
 
 #[no_mangle]
 pub extern "C" fn ac_relay_switch_new() -> *mut crate::relay_switch::Handover {
